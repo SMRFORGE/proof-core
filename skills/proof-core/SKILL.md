@@ -79,9 +79,9 @@ only when a real production trust root is pinned (`--pubkey HEX` / a dialect pro
 Re-runs the work on the bundle's sealed inputs and checks the result re-derives.
 
 ```
-# with your own tool as a subprocess:
+# with your own tool as a subprocess (the tool reads the two env vars itself):
 PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core reproduce bundle.json \
-  --command "mytool --from \"$PROOF_INPUTS\" --out \"$PROOF_OUTPUT\"" --json
+  --command "python recompute.py" --json
 
 # or with a Python ReproduceRunner / @sealed function:
 PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core reproduce bundle.json \
@@ -90,8 +90,15 @@ PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core reproduce bundle.jso
 
 The `--command` contract: proof-core writes the sealed case `{capability, inputs}` as JSON
 to a temp path given in the env var **`PROOF_INPUTS`**; your command reads it, recomputes,
-and writes the recomputed outputs as a JSON object to the path in **`PROOF_OUTPUT`**. The
-runner/command is ALWAYS supplied here on the command line, never read from the bundle.
+and writes the recomputed outputs as a JSON object to the path in **`PROOF_OUTPUT`**. Have
+the command read those two variables from the environment itself (e.g. Python
+`os.environ["PROOF_INPUTS"]` / `["PROOF_OUTPUT"]`), not by interpolating them into the
+command string. `--command` runs under the host shell, so `$PROOF_INPUTS` expands on POSIX
+but NOT under Windows `cmd.exe` (there it is `%PROOF_INPUTS%`); reading from the environment
+works on both. The command runs in a fresh temporary working directory, so reference your
+tool by an ABSOLUTE path (or have it on PATH); a bare relative script name will not be
+found. The runner/command is ALWAYS supplied here on the command line, never read from
+the bundle.
 
 Exit codes: `0` reproduced, `1` not reproduced (or integrity failed, so it was never
 re-run), `2` usage / unreadable bundle. `--json` emits a parseable verdict with the same
@@ -109,4 +116,7 @@ the bundle's `bundle_sha256` with it so the record can be found and checked.
 
 - Runs fully offline: standard library only, no third-party dependencies, no network, no
   account.
+- Needs Python 3 on PATH. If `python` is not Python 3 on this host, use `py -3` (Windows)
+  or `python3`. `PYTHONPATH` must be the ABSOLUTE plugin path; the host supplies
+  `${CLAUDE_PLUGIN_ROOT}` for you, so prefer it over a relative `bin/`.
 - proof-core is MIT and not on PyPI; the source is vendored under this plugin's `bin/`.

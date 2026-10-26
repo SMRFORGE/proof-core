@@ -1,6 +1,7 @@
 {
   "name": "proof-core-marketplace",
   "owner": { "name": "SMRFORGE LLC" },
+  "description": "proof-core: seal, verify, and reproduce a computed result as a re-runnable, tamper-evident evidence bundle. Offline, no install, no account.",
   "plugins": [
     {
       "name": "proof-core",
