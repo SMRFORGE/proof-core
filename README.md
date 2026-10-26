@@ -19,7 +19,7 @@ A seal proves the record is **unaltered** and that it **re-derives** from its se
 ## Install (self-serve, any git host)
 
 ```
-claude plugin marketplace add proof-core/proof-core-plugin
+claude plugin marketplace add https://gitlab.com/proof-core/skill
 claude plugin install proof-core@proof-core-marketplace
 ```
 
