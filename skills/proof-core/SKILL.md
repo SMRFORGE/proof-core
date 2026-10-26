@@ -93,9 +93,10 @@ to a temp path given in the env var **`PROOF_INPUTS`**; your command reads it, r
 and writes the recomputed outputs as a JSON object to the path in **`PROOF_OUTPUT`**. Have
 the command read those two variables from the environment itself (e.g. Python
 `os.environ["PROOF_INPUTS"]` / `["PROOF_OUTPUT"]`), not by interpolating them into the
-command string. `--command` runs under the host shell, so `$PROOF_INPUTS` expands on POSIX
-but NOT under Windows `cmd.exe` (there it is `%PROOF_INPUTS%`); reading from the environment
-works on both. The command runs in a fresh temporary working directory, so reference your
+command string. `--command` runs under the OS default shell (`/bin/sh` on POSIX; `cmd.exe`
+on Windows, even when you invoked proof-core from Git Bash or PowerShell), so `$PROOF_INPUTS`
+expands on POSIX but NOT on Windows (there it is `%PROOF_INPUTS%`); reading from the
+environment works on both. The command runs in a fresh temporary working directory, so reference your
 tool by an ABSOLUTE path (or have it on PATH); a bare relative script name will not be
 found. The runner/command is ALWAYS supplied here on the command line, never read from
 the bundle.
@@ -116,7 +117,7 @@ the bundle's `bundle_sha256` with it so the record can be found and checked.
 
 - Runs fully offline: standard library only, no third-party dependencies, no network, no
   account.
-- Needs Python 3 on PATH. If `python` is not Python 3 on this host, use `py -3` (Windows)
-  or `python3`. `PYTHONPATH` must be the ABSOLUTE plugin path; the host supplies
+- Needs Python 3.11+ on PATH. If `python` is not 3.11+ on this host, use `py -3.11` (Windows)
+  or `python3.11`. `PYTHONPATH` must be the ABSOLUTE plugin path; the host supplies
   `${CLAUDE_PLUGIN_ROOT}` for you, so prefer it over a relative `bin/`.
 - proof-core is MIT and not on PyPI; the source is vendored under this plugin's `bin/`.

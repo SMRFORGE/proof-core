@@ -12,7 +12,7 @@ plugin — fixes go upstream, then re-vendor.
 ## Why vendored
 
 proof-core is intentionally not on PyPI (air-gap-native distribution), and
-Claude plugins may not run a package install at load time. Carrying the source
+Claude plugins cannot run a package install at load time. Carrying the source
 keeps the plugin self-contained: it imports from `bin/` via
 `PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin"` and needs no install and no network.
 
@@ -24,7 +24,9 @@ rm -rf bin/proof_core bin/proof_verify
 cp -r <proof-core>/proof_core  bin/proof_core
 cp -r <proof-core>/proof_verify bin/proof_verify
 find bin -name __pycache__ -type d -prune -exec rm -rf {} + ; find bin -name '*.pyc' -delete
-# then bump the Version/commit/date above and the version note in README/plugin.json.
+# then bump the Version/commit/date above AND the version string in README.md,
+# .claude-plugin/plugin.json, .claude-plugin/marketplace.json, and
+# skills/proof-core/SKILL.md (the `wraps:` frontmatter line).
 ```
 
 The vendored packages are pure Python standard library (no third-party runtime

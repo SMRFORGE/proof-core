@@ -22,5 +22,5 @@ SOFTWARE.
 
 ---
 
-This plugin vendors the proof-core and proof_verify packages (under bin/),
+This plugin vendors the proof_core and proof_verify packages (under bin/),
 which are themselves MIT-licensed by SMRFORGE LLC. See VENDORED.md.
