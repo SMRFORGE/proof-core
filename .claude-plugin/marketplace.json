@@ -1,0 +1,11 @@
+{
+  "name": "proof-core-marketplace",
+  "owner": { "name": "SMRFORGE LLC" },
+  "plugins": [
+    {
+      "name": "proof-core",
+      "source": "./",
+      "description": "Seal/verify/reproduce an agent's computed result into a re-runnable, tamper-evident evidence bundle. Vendored open proof-core v0.16.0; offline, no install, no account."
+    }
+  ]
+}

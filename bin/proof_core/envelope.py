@@ -1,0 +1,358 @@
+"""The evidence envelope: embeds the evidence.result.v1 core UNCHANGED and adds a canonical-JSON
+SHA-256 manifest of (inputs, result, provenance), then SIGNS the manifest digest. The bundle is the
+unit of evidence; the producer's computed result -- a simulation output, a model score, an AI
+pipeline's answer, any number a decision rests on -- is its input.
+
+Three tamper-evidence layers, strongest last:
+  hashes      -- the bundle wasn't edited
+  provenance  -- WHAT produced it (code + data + seed), folded into the signed manifest
+  signature   -- it came from the pinned signer's key (non-repudiation; a reviewer trusts the key)
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+from typing import Any
+
+from . import provenance as prov
+from . import signing
+from .contract import Case, Result
+from .result import build_result_core
+
+#: A well-formed content digest, the only shape a sealed `data_library_sha256` may take (mirrors the
+#: verifier's S6 rule; restated here so the MINT refuses what the verifier would reject).
+_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def normalize_floats(obj: Any) -> Any:
+    """Return `obj` with every float ``-0.0`` replaced by ``0.0`` (recursively; dicts/lists copied).
+
+    ``-0.0 == 0.0`` in Python and IEEE-754, but ``json.dumps`` writes them as different bytes
+    (``-0.0`` vs ``0.0``), so a sealed delta that happened to round to ``-0.0`` would fail an exact
+    re-derivation that landed on ``0.0`` -- a false-fail on a value that is numerically identical.
+    Applied to the sealed sections at MINT (so the bundle carries ``0.0`` and any strict verifier's
+    plain canonical JSON agrees) and inside `canon` (so comparisons see one spelling). No shipped
+    pack contains ``-0.0``, so no existing seal moves."""
+    if isinstance(obj, float):
+        return 0.0 if obj == 0.0 else obj          # -0.0 == 0.0 -> the positive spelling; NaN != NaN untouched
+    if isinstance(obj, dict):
+        return {k: normalize_floats(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [normalize_floats(v) for v in obj]
+    return obj
+
+
+def canon(obj: Any) -> bytes:
+    """Canonical JSON bytes (sorted keys, no whitespace) -- the bytes every digest is taken over.
+
+    RFC 8259 strict: ``allow_nan=False`` so a NaN/Infinity raises ``ValueError`` at MINT instead of
+    sealing ``NaN`` tokens that strict and browser JSON parsers reject (a bundle that verifies in
+    Python but not in the in-browser checker is a false-fail off-Python). A card with an undefined
+    value emits ``None`` (JSON ``null``) instead. ``-0.0`` is normalized to ``0.0`` (see
+    `normalize_floats`)."""
+    return json.dumps(normalize_floats(obj), sort_keys=True, separators=(",", ":"),
+                      allow_nan=False).encode()
+
+
+def sha(b: bytes) -> str:
+    return "sha256:" + hashlib.sha256(b).hexdigest()
+
+
+def _assert_sealed_provenance_honest(capability: str, core: dict, repro: dict, *, profile=None,
+                                     inputs_value: dict | None = None) -> None:
+    """BELT: refuse to MINT a bundle whose sealed provenance contradicts its own signed result -- the
+    "seal what actually ran" invariant, enforced at build time so a regressing producer FAILS to produce
+    a bundle instead of silently shipping a false attestation. Mechanical checks only (no domain
+    knowledge): a placeholder that slips back in stops the mint here rather than reaching a reviewer.
+
+    `profile` (domain-neutral, additive) supplies the dialect's own open-engine sentinel, accepted
+    `reproduce` prefixes and placeholder seed, so the belt reads the SAME constants the mint sealed with;
+    None resolves to the neutral profile, whose values equal the module constants, leaving behaviour
+    identical to the pre-seam belt.
+
+    `inputs_value` is the sealed inputs section (`{"capability", "inputs"}`); it is consulted whenever the
+    provenance carries a `derived_from` chain claim, to enforce the BINDING belt (a link must cite a value
+    this run actually took as input). ADR-049: binding is the one chain shape, so this always runs for a
+    bundle that seals a `derived_from`; a bundle that seals none is unaffected."""
+    from .profile import NEUTRAL
+    p = profile or NEUTRAL
+    outputs = (core.get("result") or {}).get(capability) or {}
+    tol = core.get("reproduce_tolerance") or {}
+    seed = outputs.get("seed") if isinstance(outputs, dict) else None
+    rng_seed = repro.get("rng_seed")
+    if seed is not None and rng_seed != seed:
+        raise ValueError(
+            f"{capability}: sealed rng_seed {rng_seed!r} != the seed in the signed result ({seed!r}); "
+            "a bundle must not attest a seed it did not run")
+    if tol.get("kind") == "stat" and rng_seed == p.rng_seed_placeholder:
+        raise ValueError(
+            f"{capability}: a stochastic result (stat reproduce_tolerance) sealed rng_seed={p.rng_seed_placeholder} "
+            "(the placeholder); record the seed actually used")
+    # DATA-LIBRARY pin honesty (the producer-side twin of the verifier's S6 rule): a NAMED data library --
+    # any non-empty string, INCLUDING the honest `unpinned` marker -- must carry a well-formed
+    # `sha256:<64 hex>` digest. A name with a null/malformed digest is a claim with nothing committing to
+    # the bytes; the verifier rejects it, so the mint refuses it first.
+    dl, dls = repro.get("data_library"), repro.get("data_library_sha256")
+    if dl is not None and not (isinstance(dl, str) and dl):
+        raise ValueError(f"{capability}: data_library must be a non-empty string, got {dl!r}")
+    if isinstance(dl, str) and dl and not (isinstance(dls, str) and _SHA256_RE.fullmatch(dls)):
+        raise ValueError(
+            f"{capability}: data_library {dl!r} is named but data_library_sha256 is not a well-formed "
+            f"sha256:<64 hex> digest ({dls!r}); a named library must be pinned by content digest")
+    # ORIGIN honesty (the false-attestation belt): a bundle claiming the OPEN engine produced it must be
+    # OPEN-reproducible, i.e. its sealed `reproduce` path starts with `reproduce`. If `reproduce` instead
+    # names an EXTERNAL engine (a run of some out-of-tree code whose output was merely recorded), the number
+    # was NOT produced by the open engine -- refuse to seal the open-engine claim over it. The fix at the
+    # call site is to set provenance["produced_by"]="external:<code>", which names the real producer and
+    # clears this belt. Mechanical + domain-agnostic: it reads only the two fields already in the signed
+    # manifest.
+    produced_by = repro.get("produced_by")
+    reproduce = repro.get("reproduce") or ""
+    # the open-engine reproduce path names the re-run of the open engine: the `proof-reproduce` CLI, or a
+    # bare `reproduce ...` phrasing. An EXTERNAL command (a vendor tool, an out-of-tree run) must not ride
+    # under the open-engine label.
+    if produced_by == p.produced_by_open and not reproduce.startswith(p.reproduce_open_prefixes):
+        raise ValueError(
+            f"{capability}: produced_by claims the open engine ({p.produced_by_open!r}) but the sealed "
+            f"reproduce path is external ({reproduce!r}); an externally-produced result must set "
+            f"provenance['produced_by']='{p.produced_by_external_prefix}<code>' -- do not seal it as open-engine-derived")
+    # produced_by must be UNAMBIGUOUS: either the exact open sentinel or an explicit `external:<code>`.
+    # A near-miss ("open", "open-engin") would slip past the check above (it is not
+    # the exact sentinel) yet read to a human as open-engine-derived, letting an external number be
+    # sealed under an open-looking label. `verify` never inspects produced_by, so this mint-time belt
+    # is the only guard.
+    if produced_by != p.produced_by_open and not str(produced_by).startswith(p.produced_by_external_prefix):
+        raise ValueError(
+            f"{capability}: produced_by {produced_by!r} is neither the open sentinel "
+            f"({p.produced_by_open!r}) nor an explicit '{p.produced_by_external_prefix}<code>'; set one so the "
+            "sealed origin cannot read as open-engine-derived when it is not")
+    # STAT-TOLERANCE honesty: a sealed statistical band is only as honest as the sigma it is built on.
+    # `reproduce` bounds the re-run by `sigmas * hypot(sealed_sigma, fresh_sigma)`, so a sealed sigma that
+    # is absurd (sigma == the value; sigma_key pointing at the quantity or at an unrelated count) would
+    # make ANY fresh value "reproduce". The consumer side falls back to an exact match on such a band
+    # (certify._stat_match); this belt refuses to MINT one in the first place. Same bounds both sides.
+    if tol.get("kind") == "stat":
+        problem = stat_tolerance_problem(tol, outputs)
+        if problem:
+            raise ValueError(f"{capability}: refusing to seal a stat reproduce_tolerance: {problem}")
+    # CHAIN belt (ADR-049: binding is the one chain shape): a sealed `derived_from` link must be BINDING,
+    # not decoration -- the producer-end twin of the verifier's shape rule. Two refusals, mechanical +
+    # domain-agnostic: (1) the link must pass the verifier's OWN closed shape rule (no second copy), so the
+    # producer can never seal a link the verifier would reject; (2) `consumed.sha256` MUST equal the digest
+    # of this bundle's OWN sealed input named by `consumed.input` -- i.e. the run actually TOOK that value.
+    # Binding only against own inputs; the UPSTREAM end is the chain walker's job.
+    if "derived_from" in repro:
+        from proof_verify.verify import derived_from_problems  # the verifier's rule, not a second copy
+        links = repro["derived_from"]
+        problems = derived_from_problems(links, p.derived_from_keys)
+        if problems:
+            raise ValueError(f"{capability}: refusing to seal a malformed derived_from chain claim: {problems}")
+        own_inputs = inputs_value.get("inputs") if isinstance(inputs_value, dict) else None
+        if not isinstance(own_inputs, dict):
+            raise ValueError(f"{capability}: derived_from needs the sealed inputs to bind against; none were given")
+        for i, link in enumerate(links):
+            key = link["consumed"]["input"]
+            if key not in own_inputs:
+                raise ValueError(
+                    f"{capability}: derived_from[{i}] says it consumed input {key!r}, but the sealed inputs carry "
+                    "no such key -- a chain link must name a value this run actually took as input")
+            got = sha(canon(own_inputs[key]))
+            if got != link["consumed"]["sha256"]:
+                raise ValueError(
+                    f"{capability}: derived_from[{i}] consumed.sha256 {link['consumed']['sha256']} != the digest of "
+                    f"the sealed input {key!r} ({got}); the link cites an upstream value this run did not consume -- "
+                    "decoration, not binding; refusing to mint")
+
+
+#: Fields a stat tolerance may NEVER declare `derived` (excluded from the bit-identical remainder):
+#: the integrity pins a reviewer relies on to know the SAME model/generator/engine ran. Blanking them
+#: would let a re-run of a different model "reproduce" a sealed number (see result.stat_tolerance).
+INTEGRITY_FIELDS = frozenset({"engine", "benchmark_id", "generator_sha256", "model_sha256"})
+
+#: Upper bound on the sealed RELATIVE 1-sigma of a stat-tolerance quantity. A converged stochastic
+#: estimate (a sampling-based tally, a bootstrapped model score) carries a sigma of order 1e-4..1e-2 of its
+#: value; a sealed sigma of 5% or more of the value is not a statistical band, it is a hole (a score of
+#: 1.0 +/- 1.0 "reproduces" anything).
+MAX_RELATIVE_SIGMA = 0.05
+
+
+def is_integrity_field(name: str) -> bool:
+    return name in INTEGRITY_FIELDS or name.endswith("_sha256")
+
+
+def stat_tolerance_problem(tol: dict, outputs: dict) -> str | None:
+    """Why a sealed stat tolerance is unusable against `outputs` (None = it is sound). Shared by the
+    mint-time belt (refuse to seal) and the reproduce side (fall back to an exact match), so the two
+    can never disagree about what a plausible band is."""
+    q, sigma_key = tol.get("quantity"), tol.get("sigma_key")
+    if not isinstance(q, str) or not isinstance(sigma_key, str):
+        return "quantity/sigma_key must be output-key strings"
+    if sigma_key == q:
+        return f"sigma_key {sigma_key!r} names the quantity itself (a self-referential band)"
+    derived = tol.get("derived", [])
+    if not isinstance(derived, (list, tuple)):
+        return "derived must be a list of output keys"
+    bad = sorted(d for d in derived if not isinstance(d, str) or is_integrity_field(d))
+    if bad:
+        return f"derived names integrity fields {bad} (never excluded from the remainder check)"
+    if not isinstance(outputs, dict) or q not in outputs or sigma_key not in outputs:
+        return f"outputs lack {q!r} and/or {sigma_key!r}"
+    try:
+        val, sig = float(outputs[q]), float(outputs[sigma_key])
+    except (TypeError, ValueError):
+        return f"{q!r}/{sigma_key!r} are not numeric"
+    if not (math.isfinite(val) and math.isfinite(sig)) or sig <= 0 or val == 0:
+        return f"sigma {sig!r} must be finite and > 0 over a finite, non-zero value {val!r}"
+    rel = sig / abs(val)
+    if rel >= MAX_RELATIVE_SIGMA:
+        return (f"relative sigma {rel:.3g} >= {MAX_RELATIVE_SIGMA:g} ({sigma_key}={sig!r} over {q}={val!r}) "
+                "is not a statistical band")
+    return None
+
+
+def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str,
+                 reproduce: str | None = None,
+                 data_library: tuple[str, str] | None = None,
+                 lineage: list | None = None,
+                 applicability: dict | None = None,
+                 completeness: dict | None = None,
+                 derived_from: list | None = None,
+                 solver: dict | None = None,
+                 profile=None) -> dict:
+    # `profile` (domain-neutral, ADDITIVE) brands the on-disk dialect -- schema tags, the open-engine
+    # sentinel, the default `reproduce` phrasing, the unpinned-data marker, the attestation scope, and
+    # whether a `host` block is emitted. None resolves to the neutral profile, whose values ARE the
+    # constants this function read before the seam, so the default path's bytes are byte-identical.
+    # EVERYTHING profile-invariant (canon, sha, signing, the manifest/sha256sums/bundle_sha256 math)
+    # stays below, untouched by the profile -- a profile can never weaken the seal.
+    from .profile import NEUTRAL
+    p = profile or NEUTRAL
+    # the sealed sections carry the NORMALIZED spelling (-0.0 -> 0.0), so the digest a strict, plain
+    # canonical-JSON verifier recomputes over the stored value equals the one taken here.
+    core = normalize_floats(build_result_core(case, result, profile=p))
+    inputs_value = normalize_floats({"capability": case.capability, "inputs": case.inputs})
+    # run-scoped provenance (e.g. a data-snapshot or reference-library digest) OVERRIDES the module
+    # placeholders and lands in the signed manifest, so a bundle claiming one data set that actually ran
+    # on another cannot exist without breaking the signature. Only OS-independent facts belong here.
+    run_prov = dict(result.provenance or {})
+    # the data library is passed in by the caller (the data set THIS run actually read); a direct
+    # caller that passes nothing gets the honest `unpinned` default -- the envelope never reads a
+    # process-global, so a stray recording elsewhere cannot leak into this bundle's signed claim.
+    _run_data_id, _run_data_sha = data_library or (p.data_library_unpinned_id, p.data_library_unpinned_sha256)
+    repro = {
+        "engine": engine,
+        "engine_version": engine_version,
+        # git HEAD by default; PINNABLE via provenance so an evidence bundle assembled from RECORDED data
+        # (not a live git-tracked run) stays bit-reproducible regardless of the working tree's commit
+        "code_version": run_prov.pop("code_version", prov.code_version()),          # what code
+        # what data: the run records what it actually read (an in-tree table, a staged reference
+        # library, a plant data snapshot); a producer can still override via its Result.provenance; a
+        # producer that touched no data falls back to the honest `unpinned` marker -- never a fake claim.
+        "data_library": run_prov.pop("data_library", _run_data_id),
+        "data_library_sha256": run_prov.pop("data_library_sha256", _run_data_sha),
+        "rng_seed": run_prov.pop("rng_seed", p.rng_seed_placeholder),                 # what seed
+        # WHO produced/reproduced this number: the open engine by DEFAULT (so `reproduce`
+        # re-derives it from the recorded inputs). A producer that PACKAGES an externally-computed result
+        # (a simulation run out of tree, a vendor model's output, a third-party service's answer)
+        # sets Result.provenance["produced_by"]="external:<code>", so the seal names the true producer
+        # instead of letting an as-received number read as open-engine-derived. Folded into the SIGNED
+        # manifest -> the origin claim is tamper-evident, not decorative.
+        "produced_by": run_prov.pop("produced_by", p.produced_by_open),              # who produced it
+        # what TOOLCHAIN produced it (python / platform / engine-image digest). Signed so `reproduced-exact`
+        # is honest below the version string; ADVISORY (certify surfaces a diff, never blocks -- a reviewer on
+        # a different toolchain is expected and the result CORE re-derives regardless). This IS environment-
+        # specific by design (unlike the OS-independent pins above): it records the minting toolchain so a
+        # reproduction mismatch is visible, not mysterious -- the signed twin of the diagnostic `host` block.
+        # Cross-OS determinism is unaffected: that guarantee is on the RESULT CORE, not the provenance digest.
+        # `solver` (default None) threads an EXTERNAL solver record into the signed toolchain (see
+        # provenance.toolchain / solver_record); solver=None emits the same toolchain dict as before, so the
+        # neutral golden/packs are byte-identical. An explicit Result.provenance["toolchain"] still wins via
+        # the run_prov.pop precedence below.
+        "toolchain": run_prov.pop("toolchain", prov.toolchain(solver=solver)),
+        # reproducible GIVEN these pinned facts, ACROSS operating systems. The RESULT CORE is
+        # OS-independent (that is what reproduce compares); the signed PROVENANCE deliberately is not --
+        # code_version and the `toolchain` axis above name the minting environment on purpose -- so
+        # full-BUNDLE byte identity is NOT cross-OS (code_version/toolchain/host differ -> bundle_sha
+        # differs by design), only the result core is. A consumer that ships committed packs should keep
+        # a cross-OS canary (re-derive a pack sealed on one OS on another and assert a bit-exact result
+        # core). The host block below stays diagnostic-only (unsigned) so any divergence is findable.
+        # Reflect what the producer actually delivers: a stochastic result (a `stat` reproduce_tolerance
+        # in the signed core) is reproducible only within that sealed band, NOT bit-for-bit -- claiming
+        # bit-determinism there would contradict the producer's own tolerance.
+        "deterministic": (
+            "reproducible within the sealed reproduce_tolerance given (data_library_sha256, rng_seed, code_version)"
+            if (result.reproduce_tolerance or {}).get("kind") == "stat"
+            else "bit-identical given (data_library_sha256, rng_seed, code_version)"),
+        # how a reviewer re-derives this number: `reproduce` re-runs the open engine on the
+        # bundle's OWN recorded inputs (no args to retype -- they are in the sealed manifest) and checks
+        # the result core re-derives. Override for evidence whose value came from an EXTERNAL engine (an
+        # out-of-tree simulation run, a vendor model) so the string names that path instead of a command
+        # that can't reproduce it.
+        "reproduce": reproduce if reproduce is not None else p.reproduce_default,
+        # the signed CLAIM BOUNDARY: what this seal does and does NOT attest, in the signed manifest so it is
+        # tamper-evident, not implied. Makes "seal what ran" cryptographic -- an integrity+origin seal can
+        # never be mistaken for proof the run happened (that is `reproduce`) or that the number is correct
+        # (that is the benchmark/closure evidence). Static + general by design (see prov.ATTESTATION_SCOPE).
+        # Coerced to a plain dict so a read-only MappingProxyType profile view seals to identical bytes.
+        "attestation_scope": dict(p.attestation_scope),
+    }
+    # OPTIONAL frontier assertion slots, sealed into provenance (the signed manifest) so they are
+    # tamper-evident PRODUCER claims the verifier carries and shape-checks, never evaluates. Absent is the
+    # honest default (not asserted). `applicability` is a domain adapter's in-distribution verdict (never a
+    # correctness claim the seal makes); `completeness` is an honest declaration of what the record
+    # captured; `derived_from` binds this record to the exact seal(s) of prior ones (the transitive chain).
+    # See proof_verify.verify._check_frontier_slots for the shape the verifier enforces.
+    if applicability is not None:
+        repro["applicability"] = applicability
+    if completeness is not None:
+        repro["completeness"] = completeness
+    if derived_from is not None:
+        repro["derived_from"] = derived_from
+    if run_prov:                                       # remaining run-scoped facts (pack_id, temperature, ...)
+        repro["data"] = run_prov
+    if lineage:                                        # composed-derivation lineage: the ordered sub-cards
+        # this result was built from (run_step), each with its input/output digests. In the SIGNED
+        # provenance, so the derivation is tamper-evident; a leaf card composes nothing -> no lineage.
+        repro["lineage"] = {"count": len(lineage), "steps": lineage}
+    repro = normalize_floats(repro)
+    manifest = {
+        "inputs": {"sha256": sha(canon(inputs_value)), "value": inputs_value},
+        "result": {"sha256": sha(canon(core)), "value": core},   # the result.v1 core, unchanged
+        "provenance": {"sha256": sha(canon(repro)), "value": repro},  # signed, not just informational
+    }
+    # The signed seal commits to the LIST of section digests, NOT their contents. Each value is
+    # still pinned (manifest[s].sha256 == sha(canon(value)) and equals its entry here), so the
+    # seal transitively covers everything -- but a section's value can be WITHHELD (redacted)
+    # while its digest keeps the commitment intact and the signature stays valid. See
+    # proof_core.redaction.
+    sha256sums = {s: manifest[s]["sha256"] for s in ("inputs", "result", "provenance")}
+    # BELT (don't mint a self-contradicting bundle): runs BEFORE signing, so the signing key is never
+    # invoked on a bundle that would then be discarded when the belt raises. It reads only core/repro/
+    # profile/inputs_value (all finalized above), never the signature, so the ordering is clean. Belts run
+    # before signing; emitted bytes and verdicts are identical to the old belt-last order: a passing bundle
+    # signs exactly as before; a failing one raises and emits NOTHING either way -- the only difference is
+    # that the key is never touched on a refused mint.
+    _assert_sealed_provenance_honest(case.capability, core, repro, profile=p, inputs_value=inputs_value)
+    bundle = {
+        "schema": p.envelope_schema,
+        "result": core,                       # the envelope is a superset that embeds the result core shape
+        "reproducibility": repro,             # readable copy of the signed provenance block
+        "manifest": manifest,
+        "sha256sums": sha256sums,             # the sealed digest-list (redaction-safe)
+    }
+    bundle["bundle_sha256"] = sha(canon(sha256sums))
+    bundle["signature"] = signing.sign_bundle_digest(bundle["bundle_sha256"])
+    # BELT (S1/S2, producer side): the block just minted is exactly {alg, public_key, signature, message}
+    # with message == "bundle_sha256". Anything else rides UNSIGNED and every conforming verifier rejects
+    # it, so a producer whose signing backend drifted must fail HERE, not at a reviewer's desk.
+    sig_problems = signing.signature_block_problems(bundle["signature"])
+    if sig_problems:
+        raise ValueError(f"{case.capability}: refusing to mint a non-conforming signature block: "
+                         + "; ".join(sig_problems))
+    # ADR-049 (one strict dialect): the diagnostic (unsigned) `host` block is RETIRED. Its structured
+    # replacement is the SIGNED `toolchain` axis above (which always carries `machine`), and a stapled
+    # `host` now FAILs the verifier's top-level allowlist. The spine never emits host -- host was unsigned,
+    # so dropping it leaves the seal (`bundle_sha256`) unchanged; only the on-disk bundle shape loses the key.
+    return bundle
