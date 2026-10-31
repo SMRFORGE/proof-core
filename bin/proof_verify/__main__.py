@@ -15,20 +15,29 @@ import sys
 # that reach for them on the CLI module.
 from .verify import (  # noqa: F401 -- re-exported for backward-compatible access
     _MAX_JSON_DEPTH,
+    CHAIN_FAIL,
+    CHAIN_INCOMPLETE,
+    CHAIN_INTEGRITY_ONLY,
+    CHAIN_NONE,
+    CHAIN_UNKNOWN,
     STATE_UNSUPPORTED_ALG,
     STATE_UNSUPPORTED_CANON,
     _reject_duplicate_keys,
     _reject_non_finite,
     _text_depth_ok,
     classify_bundle,
+    index_upstreams,
     key_label,
     loads,
     pin_key,
     pinned_key_fingerprint,
+    verify_chain,
 )
 
-_USAGE = ("usage: proof-verify <bundle.json> [--profile pkg.module:attr] [--pubkey HEX]   "
-          "(or: python -m proof_verify ...)")
+_USAGE = ("usage: proof-verify <bundle.json> [--profile pkg.module:attr] [--pubkey HEX] [--json]\n"
+          "                    [--upstream PATH ...]   (or: python -m proof_verify ...)\n"
+          "  --upstream PATH  walk the bundle's derived_from chain through these earlier bundles (a file or a\n"
+          "                   folder of *.json; repeatable). Offline: nothing is fetched.")
 
 #: Exit codes. 0 is reserved for INTEGRITY + ORIGIN (a valid signature under a real PRODUCTION pin),
 #: so a `verify && trust` gate never lets a non-production record through. While proof-core pins the
@@ -45,6 +54,12 @@ EXIT_INTEGRITY_ONLY = 3
 #: from 1 (a genuine integrity failure) and 3 (integrity-only), so a CI gate or an air-gapped script tells
 #: "out of date" from "broken" without parsing text. It is a FAIL for every gate until the verifier is updated.
 EXIT_UNSUPPORTED_CANON = 4
+#: CHAIN INCOMPLETE (only with --upstream): the bundle itself verifies, but its derived_from chain could not be
+#: fully walked -- a cited earlier record was not supplied, was sealed under a newer canon, or the bundle's
+#: provenance is withheld. NOT a pass: nothing about the unwalked links was checked. Its OWN code, distinct
+#: from 1 (a link that was checked and does NOT hold), so a gate can tell "supply the missing record" from
+#: "the chain is broken".
+EXIT_CHAIN_INCOMPLETE = 5
 
 #: the JSON `kind` discriminator for a verify verdict, so an agent can tell verdict shapes apart and detect
 #: schema evolution. Bump the trailing version if the verify JSON contract changes shape.
@@ -120,7 +135,7 @@ def _json_exit_code(rep: dict) -> int:
     return code
 
 
-def _emit_json(path: str, bundle: dict, rep: dict) -> int:
+def _emit_json(path: str, bundle: dict, rep: dict, chain: dict | None = None) -> int:
     """Emit the machine-readable verdict (the classify_bundle report plus a few CLI-level facts) and return
     the matching exit code. The demo-pin / not-a-production-pass fact is made UNAMBIGUOUS via
     ``production_origin_pass`` so an automated gate never mistakes an integrity-only (exit 3) record for a
@@ -128,8 +143,10 @@ def _emit_json(path: str, bundle: dict, rep: dict) -> int:
     present on EVERY verify JSON path (success and the unreadable error): ``kind, path, exit_code,
     integrity_ok, state, production_origin_pass, not_a_production_pass``; an agent gates on ``exit_code`` /
     ``production_origin_pass``, never the ``state`` string."""
-    code = _json_exit_code(rep)
+    code = _chain_gate(chain, _json_exit_code(rep))
     out = dict(rep)
+    if chain is not None:
+        out["chain"] = chain
     out["kind"] = VERIFY_VERDICT_KIND
     out["path"] = path
     out["exit_code"] = code
@@ -145,11 +162,15 @@ def _emit_json(path: str, bundle: dict, rep: dict) -> int:
     # "fail", so only the attestation-gate override is rewritten.
     if code == EXIT_FAIL and rep.get("integrity_ok") and not rep.get("attestations_ok", True):
         out["state"] = "fail (invalid sign-off)"
+    elif code == EXIT_FAIL and rep.get("integrity_ok") and chain is not None:
+        out["state"] = "fail (chain)"
+    elif code == EXIT_CHAIN_INCOMPLETE:
+        out["state"] = "incomplete (chain)"
     print(json.dumps(out, sort_keys=True, default=str))
     return code
 
 
-def verify_path(path: str, *, profile=None, as_json: bool = False) -> int:
+def verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: list[str] | None = None) -> int:
     """Verify the bundle JSON at ``path``; print a human-readable result; return an exit code:
 
       0  verified (integrity + origin): every hash recomputes and the signature is valid under a real
@@ -166,6 +187,12 @@ def verify_path(path: str, *, profile=None, as_json: bool = False) -> int:
          supports. Its header seal and signature are valid -- it is NOT tampered -- but this verifier
          cannot recompute its sections under that newer canon. Use a newer verifier; a gate must reject
          this until the verifier is updated (it is not a pass).
+      5  CHAIN INCOMPLETE (only with ``upstreams``): the bundle verifies, but a cited earlier record was not
+         supplied (or could not be checked), so part of its derived_from chain was NOT walked. Not a pass.
+
+    With ``upstreams`` (paths to earlier bundles, or folders of them), the bundle's derived_from chain is also
+    walked offline (``verify_chain``): a link that does not hold fails the run (1), an unwalked link leaves it
+    incomplete (5), and a chain whose weakest link is integrity-only caps the code at 3.
 
     A bundle may also carry human sign-offs (countersignatures). A present-but-INVALID sign-off
     overrides the code above to 1 (FAIL): the decision seal may be intact, but a claim of human
@@ -190,10 +217,25 @@ def verify_path(path: str, *, profile=None, as_json: bool = False) -> int:
             return EXIT_UNREADABLE
         print(f"error: cannot read bundle {path!r}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_UNREADABLE
+    ups = None
+    if upstreams is not None:
+        try:
+            ups = _load_upstreams(upstreams)
+        except ValueError as exc:
+            if as_json:
+                print(json.dumps({"kind": VERIFY_VERDICT_KIND, "path": path, "state": "unreadable",
+                                  "integrity_ok": False, "error": str(exc),
+                                  "exit_code": EXIT_UNREADABLE, "production_origin_pass": False,
+                                  "not_a_production_pass": True}, sort_keys=True))
+                return EXIT_UNREADABLE
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_UNREADABLE
     rep = classify_bundle(bundle, profile=profile)
+    chain = None if ups is None else verify_chain(bundle, index_upstreams(ups, profile=profile).get,
+                                                  profile=profile)
     if as_json:
         # machine-readable verdict: the SAME exit code as the prose path, no prose printed.
-        return _emit_json(path, bundle, rep)
+        return _emit_json(path, bundle, rep, chain)
     if rep.get("state") == STATE_UNSUPPORTED_CANON:
         # ADR-050 fail-FORWARD: a signed record sealed under a canon this verifier does not support. The
         # header seals and its signature verifies, so the sha256sums header is unedited since signing -- but
@@ -269,8 +311,9 @@ def verify_path(path: str, *, profile=None, as_json: bool = False) -> int:
         _print_withheld(bundle)
         _print_canon_note(bundle)
         _print_attestations(rep)
-        _print_frontier(rep)
-        return _attestation_gate(rep, EXIT_INTEGRITY_ONLY)
+        _print_frontier(rep, walked=chain is not None)
+        _print_chain(chain, len(ups or []))
+        return _chain_gate(chain, _attestation_gate(rep, EXIT_INTEGRITY_ONLY), announce=True)
     # origin_ok is True only under a real production pin (never under the demo pin), so reaching here
     # means a pinned-production-key signature over an intact bundle.
     print(f"OK  verified (integrity + origin): {path}")
@@ -280,8 +323,9 @@ def verify_path(path: str, *, profile=None, as_json: bool = False) -> int:
     _print_withheld(bundle)
     _print_canon_note(bundle)
     _print_attestations(rep)
-    _print_frontier(rep)
-    return _attestation_gate(rep, EXIT_VERIFIED)
+    _print_frontier(rep, walked=chain is not None)
+    _print_chain(chain, len(ups or []))
+    return _chain_gate(chain, _attestation_gate(rep, EXIT_VERIFIED), announce=True)
 
 
 def _print_withheld(bundle: dict) -> None:
@@ -292,7 +336,7 @@ def _print_withheld(bundle: dict) -> None:
         print("          sections (e.g. the result core) was verified here.")
 
 
-def _print_frontier(rep: dict) -> None:
+def _print_frontier(rep: dict, *, walked: bool = False) -> None:
     """Show the optional frontier assertion slots the bundle sealed, if any. Said honestly: the signature
     proves the producer ASSERTED these and nobody edited them, NOT that the claims are true. Whether the
     model applies (applicability) is the domain adapter's evidence, never something this verifier judges."""
@@ -317,14 +361,84 @@ def _print_frontier(rep: dict) -> None:
         print(f"    provenance completeness: {c_s}  (captured: {cap}) -- the producer's declaration.")
     if dfrom:
         print(f"    derived from {len(dfrom)} prior record(s): this bundle is cryptographically bound to their")
-        print("      exact seals (editing a link breaks this seal). Verify each independently to walk the chain:")
+        if walked:
+            print("      exact seals (editing a link breaks this seal). Walked below against the supplied records:")
+        else:
+            print("      exact seals (editing a link breaks this seal). They are NOT checked by this run; walk the")
+            print("      chain with:  proof-verify <this bundle> --upstream <the earlier bundles, or their folder>")
         for link in dfrom:
             if isinstance(link, dict):
                 # a BINDING link records FACTS only (ADR-049): the upstream seal, the role, and WHAT this
                 # record consumed from it -- never a verdict about the upstream (that is this walker's call).
                 consumed = link.get("consumed") or {}
+                tail = "" if walked else " -- not checked here"
                 print(f"      - {link.get('bundle_sha256')}   (role: {link.get('role')}; consumed "
-                      f"{consumed.get('path')} -- re-verify the upstream yourself, not checked here)")
+                      f"{consumed.get('path')}{tail})")
+
+
+def _read_bundle_file(path: str):
+    """Read one bundle with the SAME hardened loader as the subject (strict UTF-8, duplicate keys, NaN,
+    depth, size, digit limit). Raises ValueError with a plain reason on any failure."""
+    try:
+        with open(path, "rb") as handle:
+            return loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError, RecursionError, MemoryError) as exc:
+        raise ValueError(f"cannot read upstream bundle {path!r}: {type(exc).__name__}: {exc}") from exc
+
+
+def _load_upstreams(paths: list[str]) -> list:
+    """The supplied earlier bundles: each PATH is a bundle file, or a folder whose *.json files (not recursive)
+    are all read. Any unreadable file is an error (fail closed: a record the reviewer handed over but this run
+    could not read must not silently drop out of the walk)."""
+    bundles = []
+    for p in paths:
+        if os.path.isdir(p):
+            files = sorted(os.path.join(p, f) for f in os.listdir(p) if f.lower().endswith(".json"))
+            if not files:
+                raise ValueError(f"--upstream folder {p!r} holds no *.json files")
+            bundles.extend(_read_bundle_file(f) for f in files)
+        else:
+            bundles.append(_read_bundle_file(p))
+    return bundles
+
+
+def _chain_gate(chain: dict | None, code: int, *, announce: bool = False) -> int:
+    """Fold the chain walk into the exit code. Only a passing single-bundle code (0 / 3) is ever changed: a
+    link that does not hold -> 1, an unwalked link -> 5, an integrity-only link caps a 0 at 3. No chain
+    report (no --upstream), or a bundle that cites nothing, leaves the code as it was."""
+    if chain is None or code not in (EXIT_VERIFIED, EXIT_INTEGRITY_ONLY):
+        return code
+    c = chain.get("chain")
+    if c == CHAIN_FAIL:
+        if announce:
+            print("FAIL  the derived_from chain does not hold (see the links above) -- failing closed.",
+                  file=sys.stderr)
+        return EXIT_FAIL
+    if c in (CHAIN_INCOMPLETE, CHAIN_UNKNOWN):
+        if announce:
+            print(f"INCOMPLETE  part of the derived_from chain was not walked -- exit {EXIT_CHAIN_INCOMPLETE}: "
+                  "NOT a pass; supply the missing earlier records.", file=sys.stderr)
+        return EXIT_CHAIN_INCOMPLETE
+    if c == CHAIN_INTEGRITY_ONLY and code == EXIT_VERIFIED:
+        return EXIT_INTEGRITY_ONLY
+    return code
+
+
+def _print_chain(chain: dict | None, supplied: int) -> None:
+    """Print the walk: one line per link with its verdict, then any chain-level problems."""
+    if chain is None:
+        return
+    if chain.get("chain") == CHAIN_NONE:
+        print("    chain: this bundle cites no earlier records (no derived_from), so --upstream had nothing to walk.")
+        return
+    links = chain.get("links") or []
+    print(f"    chain walk: {chain.get('chain')}  ({len(links)} link(s); {supplied} earlier record(s) supplied)")
+    for e in links:
+        print(f"      - {e.get('bundle_sha256')}  depth {e.get('depth')}: {e.get('state')} -- {e.get('detail')}")
+    for problem in chain.get("problems") or []:
+        print(f"      problem: {problem}")
+    print("    the walk checks each cited record's own seal and that the value this bundle says it consumed is")
+    print("    that record's result. It does not judge whether the earlier computation was right.")
 
 
 def _resolve_profile(spec: str):
@@ -373,6 +487,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="pin this 64-hex Ed25519 public key as the origin trust root")
     p.add_argument("--json", action="store_true",
                    help="emit the verdict as a JSON object (same exit code) instead of human text")
+    p.add_argument("--upstream", action="append", metavar="PATH",
+                   help="an earlier bundle (or a folder of them) to walk the derived_from chain through; repeatable")
     try:
         ns = p.parse_args(args)
     except SystemExit:
@@ -392,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, TypeError) as exc:
             print(f"error: --pubkey must be 64 lowercase hex characters: {exc}", file=sys.stderr)
             return EXIT_UNREADABLE
-    return verify_path(ns.bundle, profile=profile, as_json=ns.json)
+    return verify_path(ns.bundle, profile=profile, as_json=ns.json, upstreams=ns.upstream)
 
 
 if __name__ == "__main__":

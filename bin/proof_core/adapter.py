@@ -81,19 +81,12 @@ class Adapter:
     def verify(self, bundle_or_bytes):
         """Independent offline check. Returns a verdict dict, never raises on bad input: malformed JSON yields
         ``{"integrity_ok": False, "state": "fail", ...}`` rather than a traceback. Imports no producer code."""
-        from proof_verify.verify import classify_bundle, loads
-        if isinstance(bundle_or_bytes, dict):
-            bundle = bundle_or_bytes
-        else:
-            # the verifier's own hardened loader (duplicate keys, NaN, depth, size, digit limit), never a plain
-            # json.loads: a duplicate key would otherwise let the text a person reads differ from what is checked
-            try:
-                text = bundle_or_bytes.decode("utf-8") if isinstance(bundle_or_bytes, (bytes, bytearray)) \
-                    else bundle_or_bytes
-                bundle = loads(text)
-            except (ValueError, TypeError, RecursionError, MemoryError) as exc:
-                return {"integrity_ok": False, "state": "fail",
-                        "error": f"not a valid bundle ({exc.__class__.__name__})"}
+        from proof_verify.verify import classify_bundle
+        try:
+            bundle = _load(bundle_or_bytes)
+        except (ValueError, TypeError, RecursionError, MemoryError) as exc:
+            return {"integrity_ok": False, "state": "fail",
+                    "error": f"not a valid bundle ({exc.__class__.__name__})"}
         return classify_bundle(bundle)
 
     def sealed_inputs(self, bundle):
@@ -119,7 +112,18 @@ class Adapter:
         ``reproduced=False`` with an ``error`` rather than raising. Returns ``{"reproduced": bool,
         "expected_sha", "got_sha"}`` (plus ``"error"`` when it refuses). Pass ``verify_first=False`` only when
         the caller has already verified.
+
+        ``bundle`` may be the bundle's bytes/str (preferred for a file from someone else: it is parsed ONCE with
+        the verifier's hardened loader, which refuses duplicate keys, so the recipe that is re-run is the one
+        that was verified) or a dict. A dict must come from ``proof_verify.verify.loads``: a plain ``json.loads``
+        silently keeps the LAST of two duplicate keys, and that cannot be detected after parsing.
         """
+        if not isinstance(bundle, dict):
+            try:
+                bundle = _load(bundle)
+            except (ValueError, TypeError, RecursionError, MemoryError) as exc:
+                return {"reproduced": False, "expected_sha": None, "got_sha": None,
+                        "error": f"not a valid bundle ({exc.__class__.__name__})"}
         if verify_first and not self.verify(bundle).get("integrity_ok", False):
             return {"reproduced": False, "expected_sha": None, "got_sha": None,
                     "error": "bundle failed integrity verification; not re-deriving"}
@@ -130,6 +134,16 @@ class Adapter:
                              "(foreign or incompatible bundle)"}
         got = self.digest(run(self.sealed_inputs(bundle)))
         return {"reproduced": got == expected, "expected_sha": expected, "got_sha": got}
+
+
+def _load(bundle_or_bytes):
+    """A dict passes through; bytes/str are parsed with the verifier's own hardened loader (duplicate keys, NaN,
+    depth, size, digit limit), never a plain json.loads, so the text a person reads is the text that is checked."""
+    if isinstance(bundle_or_bytes, dict):
+        return bundle_or_bytes
+    from proof_verify.verify import loads
+    text = bundle_or_bytes.decode("utf-8") if isinstance(bundle_or_bytes, (bytes, bytearray)) else bundle_or_bytes
+    return loads(text)
 
 
 __all__ = ["Adapter", "Fidelity", "Verdict"]
