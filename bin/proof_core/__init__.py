@@ -18,9 +18,10 @@ The five verbs:
 The independent *checker* (integrity + origin, importing nothing from this package) lives in the
 sibling ``proof_verify`` package -- keep it separate so verification never trusts the producer.
 
-The on-disk schema carries a domain-neutral ``evidence.*`` namespace (e.g. ``evidence.envelope.v2``);
+The on-disk schema carries a domain-neutral ``evidence.*`` namespace (e.g. ``evidence.envelope.v3``);
 the spine is domain-agnostic and names nothing about any particular producer.
 """
+from .adapter import Adapter
 from .attest import ATTESTATION_SCHEMA, attest_bundle, make_attestation
 from .certify import (
     REPRODUCTION_CAPABILITY,
@@ -46,12 +47,13 @@ from .testing import assert_integration
 
 #: Single source of truth for the version. pyproject derives the dist version from this
 #: (see [tool.setuptools.dynamic]). Independent of any consumer's version line.
-__version__ = "0.16.0"
+__version__ = "0.19.0"
 
 __all__ = [
     "ATTESTATION_SCHEMA",
     "NEUTRAL",
     "REPRODUCTION_CAPABILITY",
+    "Adapter",
     "Case",
     "Fidelity",
     "Profile",

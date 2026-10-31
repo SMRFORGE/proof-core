@@ -43,11 +43,12 @@ difference is what `bundle_identical` already reflects.
 """
 from __future__ import annotations
 
+import contextvars
 import copy
 import math
 
 from .contract import ReproduceRunner
-from .envelope import canon, is_integrity_field, stat_tolerance_problem
+from .envelope import _CANON, canon, is_integrity_field, stat_tolerance_problem
 from .provenance import DATA_LIBRARY
 
 CERTIFICATION_SCHEMA = "evidence.certification.v1"
@@ -112,9 +113,29 @@ class ReproduceError(RuntimeError):
     """Raised when a bundle cannot be reproduced with the open engine."""
 
 
+#: The canonicalization used to COMPARE a re-run against its subject: the subject's own sealed canon (set per
+#: call in `reproduce_bundle`). Under canon v2 a whole float and its integer (2.0 / 2) seal identically, so a
+#: v2 comparison must not tell them apart either; v1 keeps its exact, type-sensitive comparison.
+_CMP_CANON: contextvars.ContextVar = contextvars.ContextVar("proof_core_cmp_canon", default=canon)
+
+
+def _ccanon(value):
+    """Canonical bytes for a re-run comparison, under the subject's canon. If the v2 canon cannot represent a
+    value (an int beyond +/-(2^53-1) in a FRESH pin), fall back to v1's exact, type-sensitive bytes, tagged so
+    they can never equal v2 bytes: that only makes two values compare UNEQUAL, so it reports a mismatch instead
+    of raising."""
+    fn = _CMP_CANON.get()
+    try:
+        return fn(value)
+    except (ValueError, TypeError, AttributeError):
+        if fn is canon:
+            raise
+        return b"v1-fallback:" + canon(value)
+
+
 def _exact_match(orig_core, fresh_core) -> tuple[bool, dict]:
     try:
-        return (orig_core is not None and canon(orig_core) == canon(fresh_core)), {"mode": "exact"}
+        return (orig_core is not None and _ccanon(orig_core) == _ccanon(fresh_core)), {"mode": "exact"}
     except ValueError as exc:
         # a NaN/Infinity in either core: not RFC 8259 JSON, so it can neither be sealed (canon refuses at
         # mint) nor compared -- a closed negative, never a crash and never a pass
@@ -214,10 +235,10 @@ def _stat_match(orig_core: dict, fresh_core: dict, tol: dict) -> tuple[bool, dic
 
     o_rest, o_meta = _split_metadata(_blanked(orig_core))
     f_rest, f_meta = _split_metadata(_blanked(fresh_core))
-    rest_identical = canon(o_rest) == canon(f_rest)
+    rest_identical = _ccanon(o_rest) == _ccanon(f_rest)
     metadata_drift = {
         k: {"sealed": o_meta.get(k), "fresh": f_meta.get(k)}
-        for k in METADATA_KEYS if canon(o_meta.get(k)) != canon(f_meta.get(k))
+        for k in METADATA_KEYS if _ccanon(o_meta.get(k)) != _ccanon(f_meta.get(k))
     }
     return bool(within and rest_identical), {
         "mode": "stat", "quantity": q, "sigmas": sigmas, "sealed_sigmas": sealed_sigmas,
@@ -286,14 +307,14 @@ def _compare_environment(sealed_prov, fresh_prov, *, profile=None) -> dict:
     for key, s_val in s_data.items():
         f_val = f_data.get(key)
         if key in env_informational:
-            if canon(s_val) != canon(f_val):
+            if _ccanon(s_val) != _ccanon(f_val):
                 env["notes"].append(
                     f"data.{key} differs (sealed {s_val!r}, fresh {f_val!r}) -- a path-sensitive index "
                     "hash, informational only; the content pin is data_library_sha256")
         elif key.endswith("_sha256") or key in env_run_controls:
             pins[f"data.{key}"] = (s_val, f_val)
     for name, (s_val, f_val) in pins.items():
-        if canon(s_val) != canon(f_val):
+        if _ccanon(s_val) != _ccanon(f_val):
             env["mismatch"][name] = {"sealed": s_val, "fresh": f_val}
     # toolchain (python / platform / engine image): ADVISORY -- recorded so a reviewer sees whether their
     # runtime matches the minting one below the version string, but NEVER a hard block (a reviewer on a
@@ -301,7 +322,7 @@ def _compare_environment(sealed_prov, fresh_prov, *, profile=None) -> dict:
     s_tc = sealed_prov.get("toolchain")
     if isinstance(s_tc, dict):
         f_tc = fresh_prov.get("toolchain") if isinstance(fresh_prov.get("toolchain"), dict) else {}
-        if canon(s_tc) != canon(f_tc):
+        if _ccanon(s_tc) != _ccanon(f_tc):
             env["notes"].append(
                 f"toolchain differs (sealed {s_tc}, fresh {f_tc}) -- advisory only; the result core "
                 "re-derives across toolchains, so this does not block certification")
@@ -423,7 +444,22 @@ def reproduce_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> 
             f"that made this bundle to reproduce it (reproduction re-runs the open engine, unlike verify)"
         )
     orig_core = _result_core_of(bundle)     # a withheld result raises here, not a silent False below
-    fresh = runner.run(capability, spec["inputs"])
+    # ADR-053/054: compare the re-run under the subject's sealed canon (see _CMP_CANON). The runner gets the
+    # sealed inputs exactly as parsed: under v2 a whole number may arrive as 2 or 2.0 (the seal cannot tell them
+    # apart), so a v2 runner must accept either -- see docs/INTEGRATING.md.
+    sums = bundle.get("sha256sums") if isinstance(bundle, dict) else None
+    subject_cv = sums.get("canon_version") if isinstance(sums, dict) else None
+    v2 = type(subject_cv) is int and subject_cv == 2
+    run_inputs = spec["inputs"]
+    token = _CMP_CANON.set(_CANON[2] if v2 else canon)
+    try:
+        return _reproduce_compare(bundle, runner, spec, capability, orig_core, run_inputs, profile, verify_fields)
+    finally:
+        _CMP_CANON.reset(token)
+
+
+def _reproduce_compare(bundle, runner, spec, capability, orig_core, run_inputs, profile, verify_fields) -> dict:
+    fresh = runner.run(capability, run_inputs)
     fresh_core = fresh["manifest"]["result"]["value"]
     result_match, reproduce_detail = _cores_match(orig_core, fresh_core)
     # The re-run must have honored the SEALED inputs, not substituted its own. `reproduce_bundle` hands
@@ -434,7 +470,7 @@ def reproduce_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> 
     fresh_inputs_blk = fresh.get("manifest", {}).get("inputs", {}) if isinstance(fresh, dict) else {}
     fresh_inputs = fresh_inputs_blk.get("value") if isinstance(fresh_inputs_blk, dict) else None
     try:
-        inputs_identical = canon(spec) == canon(fresh_inputs)
+        inputs_identical = _ccanon(spec) == _ccanon(fresh_inputs)
     except ValueError:
         inputs_identical = False
     environment = _compare_environment(_sealed_provenance_of(bundle),
@@ -563,9 +599,12 @@ def certify_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> di
 
 
 def seal_certification(bundle: dict, runner: ReproduceRunner, *, role: str = "reproduced",
-                       profile=None) -> dict:
+                       profile=None, canon_version: int | None = None) -> dict:
     """Run certify over `bundle` and SEAL the reproduction verdict into its OWN signed evidence bundle,
     cryptographically CHAINED to the subject via the existing `derived_from` mechanism.
+
+    `canon_version` (ADR-054) selects the record's canon; None (default) uses the SUBJECT's sealed canon. A
+    record may not use a LOWER canon than its subject (the mint refuses a v1 link to a v2 upstream).
 
     `certify_bundle` returns an UNSIGNED report on purpose -- a reviewer trusts their own run, it is not a
     signed claim. But a reviewer (or a paid independent-reproduction service) often needs to HAND SOMEONE a
@@ -610,7 +649,15 @@ def seal_certification(bundle: dict, runner: ReproduceRunner, *, role: str = "re
         raise ValueError("cannot seal a reproduction record: the subject's result core is not single-capability "
                          f"(capability {subject_cap!r} does not key its result map) -- no scoped value to bind to")
     consumed_value = res_map[subject_cap]
-    consumed_sha = sha(canon(consumed_value))
+    # ADR-054: the record is minted under the SUBJECT's sealed canon by default (a v2 subject gets a v2 record;
+    # a v1 subject -- which may carry a bare big int v2 cannot represent -- stays v1), and its link's consumed
+    # digest is taken under the RECORD's canon, which is what the walker re-derives.
+    if canon_version is None:
+        sv = subject_sums.get("canon_version")
+        canon_version = sv if type(sv) is int and sv in _CANON else 1
+    if type(canon_version) is not int or canon_version not in _CANON:
+        raise ValueError(f"unsupported canon_version {canon_version!r}; supported: {sorted(_CANON)}")
+    consumed_sha = sha(_CANON[canon_version](consumed_value))
     verdict = (Verdict.PASS if reproduced is True
                else Verdict.FAIL if reproduced is False else Verdict.ADVISORY)
     outputs = {
@@ -661,4 +708,5 @@ def seal_certification(bundle: dict, runner: ReproduceRunner, *, role: str = "re
         # mint the record under the SAME dialect the subject was reproduced under, so a branded
         # consumer's reproduction record verifies in its own dialect. profile=None -> neutral.
         profile=profile,
+        canon_version=canon_version,
     )

@@ -1,6 +1,6 @@
 # proof-core plugin
 
-A Claude Code plugin shipping an Agent Skill that seals a computed result into a tamper-evident, independently re-runnable evidence bundle, then verifies or reproduces one. It wraps the open-source [proof-core](https://gitlab.com/proof-core/proof-core) kernel (MIT), **vendored into this plugin** (`bin/`) at version 0.16.0, so it runs with no install.
+A Claude Code plugin shipping an Agent Skill that seals a computed result into a tamper-evident, independently re-runnable evidence bundle, then verifies or reproduces one. It wraps the open-source [proof-core](https://gitlab.com/proof-core/proof-core) kernel (MIT), **vendored into this plugin** (`bin/`) at version 0.19.0, so it runs with no install.
 
 It is **local-only**: pure Python 3.11+ standard library, no third-party dependencies, **no network calls, and no account**. Everything happens on the machine running the agent.
 

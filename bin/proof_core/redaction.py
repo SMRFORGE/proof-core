@@ -21,6 +21,15 @@ redaction entry is a failure, not a pass.
 Only whole-section, hash-only withholding is offered (`inputs`, `result`, `provenance`).
 The headline case is withholding `inputs` -- a proprietary data snapshot, model configuration or
 design spec -- while the computed evidence in `result` stays public and verifiable.
+
+LEAK BOUNDARY (producer's responsibility, not the verifier's): withholding removes a section's
+CONTENTS and keeps its DIGEST pinned. It does NOT guarantee the withheld value appears nowhere else
+in the bundle. If the producer echoes a withheld `inputs` value into a public section (the readable
+`provenance`/`reproducibility`, or the `result` map), it is still readable in the clear even though
+`inputs` is "withheld". The verifier catches only one specific echo (a withheld input re-stated in the
+result core's `provenance.inputs`); it cannot scan for every possible echo. The withholder MUST ensure
+the withheld content is not reproduced in any retained public section. The format's promise is "the
+digest stays pinned", never "this content appears nowhere else".
 """
 from __future__ import annotations
 
@@ -45,7 +54,7 @@ def redact_bundle(bundle: dict, *, withhold, profile=None) -> dict:
     withholding lives in the producer's own docket/affidavit, never in the bundle.
 
     Args:
-        bundle: a signed evidence bundle (evidence.envelope.v2).
+        bundle: a signed evidence bundle (evidence.envelope.v3).
         withhold: section names to withhold (subset of WITHHOLDABLE).
         profile: optional dialect profile; supplies the dialect's own ``redaction_schema`` tag. None/default
             uses the neutral literal.

@@ -14,16 +14,49 @@ import json
 import pathlib
 from collections.abc import Callable
 
+from .verify import (
+    STATE_UNSUPPORTED_ALG,  # signature-suite fail-forward verdict
+    STATE_UNSUPPORTED_CANON,  # ADR-050: the named fail-forward verdict
+)
 from .verify import loads as _loads  # the ONE guarded loader (dup-key / NaN / depth / size)
 
 CONFORMANCE_SCHEMA = "evidence.conformance.v1"
 
 
-def _ok(result) -> bool:
-    """Normalise a verifier's return: accept bool or (ok, problems)."""
+def _interpret(result) -> tuple[bool, str | None, list[str]]:
+    """Normalise a verifier's return to `(accepted, state, problems)`.
+
+    `accepted` is the conformance ACCEPT answer (well-formed + signed under the pinned key). A verifier may
+    return a bare bool (that answer, no detail), an `(ok, problems)` tuple, or a `classify_bundle`-style dict
+    (ADR-050: the shape needed to tell a fail-FORWARD `unsupported-canon` verdict from a plain rejection --
+    `state` carries the named verdict, or the token appears in `problems`)."""
+    if isinstance(result, dict):
+        accepted = bool(result.get("key_matches_pin", result.get("integrity_ok", False)))
+        problems = [str(p) for p in (result.get("problems") or [])]
+        return accepted, result.get("state"), problems
     if isinstance(result, tuple):
-        return bool(result[0])
-    return bool(result)
+        problems = [str(p) for p in (result[1] if len(result) > 1 and isinstance(result[1], (list, tuple)) else [])]
+        return bool(result[0]), None, problems
+    return bool(result), None, []
+
+
+def _is_unsupported_canon(state: str | None, problems: list[str]) -> bool:
+    """ADR-050: did the verifier report the DISTINCT fail-forward verdict (not a plain rejection)? True when
+    the named state is exposed, or the literal token rides in the problems list."""
+    # `state` is authoritative when exposed; the substring fallback is only for verifiers that expose none
+    # (a problem string can echo attacker-chosen text, so it must never override a named state).
+    if state is not None:
+        return state == STATE_UNSUPPORTED_CANON
+    return any(STATE_UNSUPPORTED_CANON in p for p in problems)
+
+
+def _is_unsupported_alg(state, problems) -> bool:
+    # `state` is authoritative. The substring fallback is ONLY for verifiers that expose no state
+    # (bool/tuple): the unsupported-alg MESSAGE also rides in `problems` of a plain FAIL (an unknown
+    # suite PLUS a real tamper), where the verdict is `fail`, not the fail-forward.
+    if state is not None:
+        return state == STATE_UNSUPPORTED_ALG
+    return any(STATE_UNSUPPORTED_ALG in p for p in problems)
 
 
 def load_manifest(vectors_dir) -> dict:
@@ -69,20 +102,49 @@ def run_conformance(verify_fn: Callable, vectors_dir) -> dict:
     passed = 0
     for entry in vectors:
         try:
-            bundle = _loads(_safe_vector_path(d, entry["file"]).read_text(encoding="utf-8"))
+            text = _safe_vector_path(d, entry["file"]).read_text(encoding="utf-8")
         except (OSError, KeyError, ValueError) as exc:
-            # a missing/renamed vector file or a malformed entry is a conformance FAILURE, not an
+            # a missing/renamed/undecodable vector file or a malformed entry is a conformance FAILURE, not an
             # uncaught crash -- a misconfigured battery must never read as conformant.
             failures.append({"file": entry.get("file", "<missing>"), "expected": entry.get("expect"),
                              "got": f"error: {exc}", "note": entry.get("note", "")})
             continue
-        got = _ok(verify_fn(bundle))
-        expected = entry["expect"] == "valid"
-        if got == expected:
+        try:
+            bundle = _loads(text)
+        except ValueError as exc:
+            # the hardened loader REFUSED the text (dup key, NaN, too deep, too big): that is a rejection, the
+            # same verdict the CLI gives -- correct for an 'invalid' vector, a failure for any other expectation
+            # (the JS runner counts a parse rejection the same way).
+            accepted, state, problems = False, "fail", [f"unreadable: {exc}"]
+        else:
+            accepted, state, problems = _interpret(verify_fn(bundle))
+        expect = entry["expect"]
+        unsupported = _is_unsupported_canon(state, problems)
+        unsupported_alg = _is_unsupported_alg(state, problems)
+        if accepted:
+            got = "valid"
+        elif unsupported:
+            got = "unsupported"
+        elif unsupported_alg:
+            got = "unsupported-alg"
+        else:
+            got = "invalid"
+        if expect == "valid":
+            ok = accepted
+        elif expect == "unsupported":
+            ok = (not accepted) and unsupported
+        elif expect == "unsupported-alg":
+            ok = (not accepted) and unsupported_alg
+        elif expect == "invalid":
+            ok = (not accepted) and not unsupported and not unsupported_alg
+        else:
+            ok = False  # an UNRECOGNIZED expect token is a conformance FAILURE, never coerced
+            got = f"{got} (unknown expect {expect!r})"
+        if ok:
             passed += 1
         else:
-            failures.append({"file": entry["file"], "expected": entry["expect"],
-                             "got": "valid" if got else "invalid", "note": entry.get("note", "")})
+            failures.append({"file": entry["file"], "expected": expect,
+                             "got": got, "note": entry.get("note", "")})
     total = len(vectors)
     # Conformant iff the verifier passed a NON-EMPTY battery with zero failures. An empty vector set
     # must never certify -- otherwise a reject-everything verifier passes vacuously.

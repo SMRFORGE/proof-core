@@ -15,6 +15,8 @@ import sys
 # that reach for them on the CLI module.
 from .verify import (  # noqa: F401 -- re-exported for backward-compatible access
     _MAX_JSON_DEPTH,
+    STATE_UNSUPPORTED_ALG,
+    STATE_UNSUPPORTED_CANON,
     _reject_duplicate_keys,
     _reject_non_finite,
     _text_depth_ok,
@@ -38,10 +40,34 @@ EXIT_VERIFIED = 0
 EXIT_FAIL = 1
 EXIT_UNREADABLE = 2
 EXIT_INTEGRITY_ONLY = 3
+#: ADR-050 fail-FORWARD: the bundle is sealed under a canon_version NEWER than this verifier supports (its
+#: header seal + signature are valid; this verifier simply cannot check its sections). Its OWN code, distinct
+#: from 1 (a genuine integrity failure) and 3 (integrity-only), so a CI gate or an air-gapped script tells
+#: "out of date" from "broken" without parsing text. It is a FAIL for every gate until the verifier is updated.
+EXIT_UNSUPPORTED_CANON = 4
 
 #: the JSON `kind` discriminator for a verify verdict, so an agent can tell verdict shapes apart and detect
 #: schema evolution. Bump the trailing version if the verify JSON contract changes shape.
 VERIFY_VERDICT_KIND = "proof_core.verify_verdict.v1"
+
+
+def _withheld_list(bundle) -> list:
+    """The `redaction.withheld` names as a sorted list of strings, or [] when absent/malformed -- the CLI must
+    print a verdict on ANY input, never crash formatting a field the verifier already reported as malformed."""
+    red = bundle.get("redaction") if isinstance(bundle, dict) else None
+    wh = red.get("withheld") if isinstance(red, dict) else None
+    return sorted(w for w in wh if isinstance(w, str)) if isinstance(wh, list) else []
+
+
+def _print_canon_note(bundle) -> None:
+    """ADR-053/054: under canon_version 2 (JCS) the seal covers numeric VALUES, not their spelling, so say so
+    next to "UNEDITED" -- a reader must not infer that `1` vs `1.0` in the text was sealed."""
+    sums = bundle.get("sha256sums") if isinstance(bundle, dict) else None
+    cv = sums.get("canon_version") if isinstance(sums, dict) else None
+    if type(cv) is int and cv == 2:
+        print("    NOTE: canon v2 seals number VALUES: a whole number written 1, 1.0 or 1e0 verifies the same,")
+        print("          so 'UNEDITED' means no value changed, not that the text is byte-identical. A reader")
+        print("          may get 2.0 where 2 was sealed; treat whole numbers as interchangeable.")
 
 
 def _print_attestations(rep: dict) -> None:
@@ -71,7 +97,11 @@ def _attestation_gate(rep: dict, code: int) -> int:
     `verify && trust` gate would wave the forged sign-off through. If any sign-off does not verify, override
     the exit code to FAIL -- the decision is untampered, but a claim of human approval on it is not."""
     if not rep.get("attestations_ok", True):
-        print("FAIL  a human sign-off on this bundle does not verify -- failing closed.", file=sys.stderr)
+        if rep.get("attestations_null") is True:
+            print("FAIL  the bundle's attestations field is present but null (malformed) -- failing closed.",
+                  file=sys.stderr)
+        else:
+            print("FAIL  a human sign-off on this bundle does not verify -- failing closed.", file=sys.stderr)
         return EXIT_FAIL
     return code
 
@@ -80,6 +110,8 @@ def _json_exit_code(rep: dict) -> int:
     """The SAME exit code the prose path returns, computed purely (no printing). Integrity failure -> 1;
     else integrity+origin -> 0 or integrity-only -> 3; then the attestation gate overrides a present-but-
     INVALID human sign-off to 1 (exactly as ``_attestation_gate`` does for the prose branches)."""
+    if rep.get("state") in (STATE_UNSUPPORTED_CANON, STATE_UNSUPPORTED_ALG):
+        return EXIT_UNSUPPORTED_CANON        # unsupported / use a newer verifier -- not an integrity failure
     if not rep["integrity_ok"]:
         return EXIT_FAIL
     code = EXIT_VERIFIED if rep["origin_ok"] else EXIT_INTEGRITY_ONLY
@@ -101,7 +133,7 @@ def _emit_json(path: str, bundle: dict, rep: dict) -> int:
     out["kind"] = VERIFY_VERDICT_KIND
     out["path"] = path
     out["exit_code"] = code
-    out["withheld"] = sorted((bundle.get("redaction") or {}).get("withheld", []))
+    out["withheld"] = _withheld_list(bundle)
     out["pinned_key_fingerprint"] = pinned_key_fingerprint()
     # the one fact an origin gate keys on: exit 0 under a real PRODUCTION pin is the only pass.
     out["production_origin_pass"] = code == EXIT_VERIFIED
@@ -111,7 +143,7 @@ def _emit_json(path: str, bundle: dict, rep: dict) -> int:
     # is intact). Never let `state` read non-fail while the CLI failed closed -- an agent keying on `state`
     # must see the failure too, not only one keying on exit_code. A genuine integrity fail already reads
     # "fail", so only the attestation-gate override is rewritten.
-    if code == EXIT_FAIL and out.get("state") != "fail":
+    if code == EXIT_FAIL and rep.get("integrity_ok") and not rep.get("attestations_ok", True):
         out["state"] = "fail (invalid sign-off)"
     print(json.dumps(out, sort_keys=True, default=str))
     return code
@@ -130,17 +162,23 @@ def verify_path(path: str, *, profile=None, as_json: bool = False) -> int:
          (e.g. a dev machine's own key), OR the pin itself is the public demo identity (proof-core's
          shipped default), under which NO bundle can prove origin. Untampered, so `reproduce` can
          re-derive it; not a production pass, so an automated origin gate must still reject it.
+      4  UNSUPPORTED CANON (ADR-050): the bundle is sealed under a canon_version newer than this verifier
+         supports. Its header seal and signature are valid -- it is NOT tampered -- but this verifier
+         cannot recompute its sections under that newer canon. Use a newer verifier; a gate must reject
+         this until the verifier is updated (it is not a pass).
 
     A bundle may also carry human sign-offs (countersignatures). A present-but-INVALID sign-off
     overrides the code above to 1 (FAIL): the decision seal may be intact, but a claim of human
     approval riding on it does not verify, so the CLI fails closed rather than exit 0 or 3.
     """
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, "rb") as handle:
+            # BYTES, decoded as strict UTF-8 here: no newline translation (the size cap counts the file's real
+            # bytes) and an invalid byte is UNREADABLE (UnicodeDecodeError is a ValueError), never U+FFFD.
             # RFC 8259: `NaN` / `Infinity` are not JSON tokens -- Python's parser accepts them by default,
             # a browser's does not. Reject at parse time (like duplicate keys and pathological nesting), so
             # this verifier can never attest a bundle another conformant parser cannot even read.
-            bundle = loads(handle.read())
+            bundle = loads(handle.read().decode("utf-8"))
     except (OSError, ValueError, RecursionError, MemoryError) as exc:
         # ValueError covers JSONDecodeError + the parse guards (dup key / NaN / depth / size); MemoryError
         # covers an input too large to hold or parse. Either is an UNREADABLE verdict, never a traceback.
@@ -156,6 +194,48 @@ def verify_path(path: str, *, profile=None, as_json: bool = False) -> int:
     if as_json:
         # machine-readable verdict: the SAME exit code as the prose path, no prose printed.
         return _emit_json(path, bundle, rep)
+    if rep.get("state") == STATE_UNSUPPORTED_CANON:
+        # ADR-050 fail-FORWARD: a signed record sealed under a canon this verifier does not support. The
+        # header seals and its signature verifies, so the sha256sums header is unedited since signing -- but
+        # this verifier LACKS that canon and cannot recompute the sections, so it does NOT (and cannot) say
+        # the record is untampered. Per Decision 4, report whether the version claim is signed under the PIN.
+        signer_hex = (rep.get("signer") or "").removeprefix("ed25519:")
+        pinned_hex = (rep.get("pinned_key") or "").removeprefix("ed25519:")
+        signed_under_pin = bool(signer_hex) and signer_hex == pinned_hex
+        print(f"UNSUPPORTED  {path}", file=sys.stderr)
+        print(f"    this bundle declares canon_version {rep.get('canon_version')}; this verifier supports up to "
+              f"{rep.get('supported_canon_max')}.", file=sys.stderr)
+        print("    its sha256sums header seals and the Ed25519 signature over it verifies, so the header is", file=sys.stderr)
+        print("    UNEDITED since signing -- but this verifier lacks that canon, so it CANNOT recompute or", file=sys.stderr)
+        print("    vouch for the inputs / result / provenance sections. This is not a claim that the record", file=sys.stderr)
+        print("    is untampered; it is this verifier saying it cannot check it.", file=sys.stderr)
+        if signed_under_pin and not rep.get("pinned_key_is_demo"):
+            print(f"    the version claim IS signed under the pinned production key ({pinned_key_fingerprint()}),", file=sys.stderr)
+            print("    so it comes from a trusted origin: get a newer verifier and re-check.", file=sys.stderr)
+        elif signed_under_pin:
+            print("    the version claim is signed under the pinned key, but that pin is the public DEMO identity", file=sys.stderr)
+            print("    (anyone can sign under it), so this proves integrity of the header, not a trusted origin.", file=sys.stderr)
+        else:
+            print(f"    WARNING: the signature is NOT under the pinned key ({pinned_key_fingerprint()}); it is", file=sys.stderr)
+            print(f"    {key_label(signer_hex)}. This canon_version claim is not from a trusted origin and could be", file=sys.stderr)
+            print('    attacker-planted -- do not read "use a newer verifier" as trust in this record.', file=sys.stderr)
+        # any unsigned top-level keys riding outside the seal (ADR-050 trust-surface check on fail-forward)
+        for problem in rep.get("problems", []):
+            if "unexpected top-level keys" in problem:
+                print(f"    - {problem}", file=sys.stderr)
+        print(f"    exit {EXIT_UNSUPPORTED_CANON}: NOT a pass -- a gate must reject this until the verifier is updated.",
+              file=sys.stderr)
+        return EXIT_UNSUPPORTED_CANON
+    if rep.get("state") == STATE_UNSUPPORTED_ALG:
+        print(f"UNSUPPORTED  {path}", file=sys.stderr)
+        print("    signed with a signature suite this verifier cannot check (a newer/unknown algorithm).",
+              file=sys.stderr)
+        print("    integrity and origin are UNDETERMINED -- NOT a claim the record is untampered, NOT a pass.",
+              file=sys.stderr)
+        for problem in rep["problems"]:
+            print(f"    - {problem}", file=sys.stderr)
+        print(f"    exit {EXIT_UNSUPPORTED_CANON}: NOT a pass -- use a newer verifier.", file=sys.stderr)
+        return EXIT_UNSUPPORTED_CANON
     if not rep["integrity_ok"]:
         print(f"FAIL  {path}", file=sys.stderr)
         for problem in rep["problems"]:
@@ -187,6 +267,7 @@ def verify_path(path: str, *, profile=None, as_json: bool = False) -> int:
         print("           re-derives the number from its sealed inputs (integrity holds, so it is safe to re-run)")
         print(f"    exit {EXIT_INTEGRITY_ONLY}: NOT a production pass -- an automated origin gate must reject this.")
         _print_withheld(bundle)
+        _print_canon_note(bundle)
         _print_attestations(rep)
         _print_frontier(rep)
         return _attestation_gate(rep, EXIT_INTEGRITY_ONLY)
@@ -197,13 +278,14 @@ def verify_path(path: str, *, profile=None, as_json: bool = False) -> int:
     print("    cross-check this fingerprint against the published trust root before")
     print("    relying on origin -- see docs/TRUST_ROOT.md. Origin holds only if it matches.")
     _print_withheld(bundle)
+    _print_canon_note(bundle)
     _print_attestations(rep)
     _print_frontier(rep)
     return _attestation_gate(rep, EXIT_VERIFIED)
 
 
 def _print_withheld(bundle: dict) -> None:
-    withheld = sorted((bundle.get("redaction") or {}).get("withheld", []))
+    withheld = _withheld_list(bundle)
     if withheld:
         print(f"    NOTE: sections withheld ({', '.join(withheld)}); their values are not present in")
         print("          this bundle -- only their sealed digests were checked, so NO value for those")

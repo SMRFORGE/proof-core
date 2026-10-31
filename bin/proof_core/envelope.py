@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import re
+from decimal import Decimal
 from typing import Any
 
 from . import provenance as prov
@@ -24,6 +25,14 @@ from .result import build_result_core
 #: A well-formed content digest, the only shape a sealed `data_library_sha256` may take (mirrors the
 #: verifier's S6 rule; restated here so the MINT refuses what the verifier would reject).
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+#: ADR-050: the REFERENCE canon's output-definition version, stamped INSIDE `sha256sums` (a 4th key, under
+#: the seal) so a retained bundle self-describes which canon produced its hashes, and a stale verifier can
+#: fail FORWARD ("use a newer verifier") rather than mistake a newer format for tampering. The single source
+#: of truth -- NOT a `Profile` field: the canon is profile-invariant (ADR-047), so no dialect may brand or
+#: omit it. A future change to what `canon` EMITS becomes version 2 with v1 frozen verbatim; a verifier-port
+#: bug is fixed in place with NO bump (the format did not move).
+CANON_VERSION = 1
 
 
 def normalize_floats(obj: Any) -> Any:
@@ -60,8 +69,117 @@ def sha(b: bytes) -> str:
     return "sha256:" + hashlib.sha256(b).hexdigest()
 
 
+# --- canon_version 2: strict RFC 8785 (JCS) + string-encoded big ints (ADR-053) ----------------------
+# v2 removes v1's three CPython deviations: strings are raw UTF-8 with JCS-minimal escaping (NOT
+# ensure_ascii), numbers follow ECMAScript Number::toString (a whole float collapses: 2.0 -> "2"), and
+# object keys sort by UTF-16 code unit (NOT code point). Integers outside +-(2^53-1) cannot be bare numbers
+# (JCS numbers are IEEE-754 doubles): the mint GUARDS and refuses one (fail-loud -- encode it as a string),
+# and refuses a lone surrogate (no UTF-8 encoding). The ES number rule reuses Python's shortest-round-trip
+# repr() for digit selection, then reformats per ECMA-262 6.1.6.1.20. Kept byte-identical to the independent
+# verifier's `_canon_v2` (proof_verify.verify); the conformance battery + a cross-language fuzz locks parity.
+_SAFE_INT = 2**53 - 1   # Number.MAX_SAFE_INTEGER -- the largest bare integer canon v2 may carry
+_V2_SHORT_ESCAPE = {0x08: "\\b", 0x09: "\\t", 0x0A: "\\n", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\"}
+
+
+def _v2_guard(obj: Any) -> None:
+    if isinstance(obj, bool):
+        return
+    if isinstance(obj, int):
+        if not (-_SAFE_INT <= obj <= _SAFE_INT):
+            raise ValueError(f"canon v2: bare integer {obj} is outside +-(2^53-1); encode it as a JSON string "
+                             "(RFC 8785 cannot represent it as a number)")
+    elif isinstance(obj, float):
+        if not math.isfinite(obj):
+            raise ValueError("canon v2: NaN/Infinity are not valid JSON")
+    elif isinstance(obj, str):
+        return   # always representable: a lone surrogate is escaped to \uXXXX by canon_v2 (JCS), not raw UTF-8
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise TypeError(f"canon v2: object key must be a string, got {type(k).__name__}")
+            _v2_guard(k)
+            _v2_guard(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _v2_guard(v)
+    elif obj is not None:
+        raise ValueError(f"canon v2: not a JSON value: {type(obj).__name__}")
+
+
+def _v2_string(s: str) -> str:
+    out = ['"']
+    for ch in s:
+        c = ord(ch)
+        if c in _V2_SHORT_ESCAPE:
+            out.append(_V2_SHORT_ESCAPE[c])
+        elif c < 0x20 or 0xD800 <= c <= 0xDFFF:  # C0 controls AND lone surrogates -> \uXXXX (ECMAScript
+            out.append(f"\\u{c:04x}")            # JSON.stringify / RFC 8785), so the UTF-8 encode never sees one
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _v2_number(n: Any) -> str:
+    if isinstance(n, int):
+        return str(n)
+    if not math.isfinite(n):
+        raise ValueError("canon v2: NaN/Infinity are not valid JSON")
+    if n == 0:
+        return "0"
+    neg = n < 0
+    _, digs, exp = Decimal(repr(abs(n))).as_tuple()
+    digs = list(digs)
+    while len(digs) > 1 and digs[-1] == 0:
+        digs.pop()
+        exp += 1
+    s = "".join(map(str, digs))
+    k = len(s)
+    m = k + exp
+    if k <= m <= 21:
+        out = s + "0" * (m - k)
+    elif 0 < m <= 21:
+        out = s[:m] + "." + s[m:]
+    elif -6 < m <= 0:
+        out = "0." + "0" * (-m) + s
+    else:
+        mant = s[0] + ("." + s[1:] if k > 1 else "")
+        e = m - 1
+        out = f"{mant}e{'+' if e >= 0 else '-'}{abs(e)}"
+    return "-" + out if neg else out
+
+
+def _v2_emit(obj: Any) -> str:
+    if obj is None:
+        return "null"
+    if obj is True:
+        return "true"
+    if obj is False:
+        return "false"
+    if isinstance(obj, str):
+        return _v2_string(obj)
+    if isinstance(obj, (int, float)):
+        return _v2_number(obj)
+    if isinstance(obj, (list, tuple)):
+        return "[" + ",".join(_v2_emit(v) for v in obj) + "]"
+    if isinstance(obj, dict):
+        items = sorted(obj.items(), key=lambda kv: kv[0].encode("utf-16-be", "surrogatepass"))
+        return "{" + ",".join(_v2_string(k) + ":" + _v2_emit(v) for k, v in items) + "}"
+    raise TypeError(f"not a JSON value: {type(obj).__name__}")
+
+
+def canon_v2(obj: Any) -> bytes:
+    """canon_version 2 bytes: guard (reject unrepresentable values, fail-loud) then emit JCS (UTF-8)."""
+    _v2_guard(obj)
+    return _v2_emit(obj).encode("utf-8")
+
+
+#: version -> mint canon (mirrors proof_verify.verify._CANON). APPEND-ONLY and FROZEN: v1 stays verbatim.
+_CANON = {1: canon, 2: canon_v2}
+
+
 def _assert_sealed_provenance_honest(capability: str, core: dict, repro: dict, *, profile=None,
-                                     inputs_value: dict | None = None) -> None:
+                                     inputs_value: dict | None = None, canon_version: int = 1) -> None:
     """BELT: refuse to MINT a bundle whose sealed provenance contradicts its own signed result -- the
     "seal what actually ran" invariant, enforced at build time so a regressing producer FAILS to produce
     a bundle instead of silently shipping a false attestation. Mechanical checks only (no domain
@@ -137,6 +255,26 @@ def _assert_sealed_provenance_honest(capability: str, core: dict, repro: dict, *
         problem = stat_tolerance_problem(tol, outputs)
         if problem:
             raise ValueError(f"{capability}: refusing to seal a stat reproduce_tolerance: {problem}")
+    # PROVENANCE-SHAPE belt: the verifier's own required/optional provenance rules (not a second copy), so the
+    # producer never signs a bundle its verifier rejects -- e.g. a Result.provenance override of rng_seed=None.
+    from proof_verify.verify import (
+        _check_frontier_slots,
+        _check_optional_provenance,
+        _check_required_provenance,
+    )
+    shape_problems: list[str] = []
+    _check_required_provenance(repro, shape_problems)
+    _check_optional_provenance(repro, shape_problems)
+    # the frontier slots (applicability / completeness / derived_from shape): the same rule the verifier applies,
+    # with no own-seal yet (the self-reference check needs the final seal; the verifier still applies it).
+    # derived_from is held to its own CHAIN belt below (the verifier's shape rule + the binding check), so it is
+    # left out here rather than reported twice.
+    _check_frontier_slots({k: v for k, v in repro.items() if k != "derived_from"}, shape_problems, p,
+                          own_seal=None)
+    if repro.get("data_library", "") is None:
+        shape_problems.append("provenance data_library is null")
+    if shape_problems:
+        raise ValueError(f"{capability}: refusing to seal a provenance the verifier would reject: {shape_problems}")
     # CHAIN belt (ADR-049: binding is the one chain shape): a sealed `derived_from` link must be BINDING,
     # not decoration -- the producer-end twin of the verifier's shape rule. Two refusals, mechanical +
     # domain-agnostic: (1) the link must pass the verifier's OWN closed shape rule (no second copy), so the
@@ -152,13 +290,24 @@ def _assert_sealed_provenance_honest(capability: str, core: dict, repro: dict, *
         own_inputs = inputs_value.get("inputs") if isinstance(inputs_value, dict) else None
         if not isinstance(own_inputs, dict):
             raise ValueError(f"{capability}: derived_from needs the sealed inputs to bind against; none were given")
+        canon_fn = _CANON[canon_version]
         for i, link in enumerate(links):
+            # ADR-054: the citing canon must be at least the upstream's. A v1 digest is spelling-sensitive
+            # (`2.0` != `2`) while a v2 upstream's seal is not, so a v1 link to a v2 upstream would bind or not
+            # depending on how the upstream's JSON is spelled. The verifier's walker refuses it; so does the mint.
+            up_cv = link["sha256sums"].get("canon_version")
+            if up_cv > canon_version:
+                raise ValueError(
+                    f"{capability}: derived_from[{i}] cites a canon_version {up_cv} upstream from a canon_version "
+                    f"{canon_version} bundle; the citing canon must be at least the upstream's (mint this bundle "
+                    f"under canon_version {up_cv})")
             key = link["consumed"]["input"]
             if key not in own_inputs:
                 raise ValueError(
                     f"{capability}: derived_from[{i}] says it consumed input {key!r}, but the sealed inputs carry "
                     "no such key -- a chain link must name a value this run actually took as input")
-            got = sha(canon(own_inputs[key]))
+            # under the canon THIS bundle seals with (ADR-054): the walker re-derives it the same way.
+            got = sha(canon_fn(own_inputs[key]))
             if got != link["consumed"]["sha256"]:
                 raise ValueError(
                     f"{capability}: derived_from[{i}] consumed.sha256 {link['consumed']['sha256']} != the digest of "
@@ -220,6 +369,7 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
                  completeness: dict | None = None,
                  derived_from: list | None = None,
                  solver: dict | None = None,
+                 canon_version: int = 1,
                  profile=None) -> dict:
     # `profile` (domain-neutral, ADDITIVE) brands the on-disk dialect -- schema tags, the open-engine
     # sentinel, the default `reproduce` phrasing, the unpinned-data marker, the attestation scope, and
@@ -229,6 +379,15 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
     # stays below, untouched by the profile -- a profile can never weaken the seal.
     from .profile import NEUTRAL
     p = profile or NEUTRAL
+    # canon_version selects the canonicalization (ADR-053): v1 (default, FROZEN) or v2 (strict JCS). All
+    # digests below use `_c`, INCLUDING a derived_from link's `consumed.sha256` (ADR-054: a link's consumed
+    # digest is taken under the canon of the bundle that SEALS the link, so the chain walker re-derives it
+    # under the citing bundle's sealed canon_version). Everything else is version-agnostic (signing, the
+    # manifest/seal math, the ASCII header).
+    # strict int (a bool or 2.0 compares equal to 1/2 but would seal a header no verifier accepts)
+    if type(canon_version) is not int or canon_version not in _CANON:
+        raise ValueError(f"unsupported canon_version {canon_version!r}; supported: {sorted(_CANON)}")
+    _c = _CANON[canon_version]
     # the sealed sections carry the NORMALIZED spelling (-0.0 -> 0.0), so the digest a strict, plain
     # canonical-JSON verifier recomputes over the stored value equals the one taken here.
     core = normalize_floats(build_result_core(case, result, profile=p))
@@ -318,23 +477,31 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
         repro["lineage"] = {"count": len(lineage), "steps": lineage}
     repro = normalize_floats(repro)
     manifest = {
-        "inputs": {"sha256": sha(canon(inputs_value)), "value": inputs_value},
-        "result": {"sha256": sha(canon(core)), "value": core},   # the result.v1 core, unchanged
-        "provenance": {"sha256": sha(canon(repro)), "value": repro},  # signed, not just informational
+        "inputs": {"sha256": sha(_c(inputs_value)), "value": inputs_value},
+        "result": {"sha256": sha(_c(core)), "value": core},   # the result.v1 core, unchanged
+        "provenance": {"sha256": sha(_c(repro)), "value": repro},  # signed, not just informational
     }
     # The signed seal commits to the LIST of section digests, NOT their contents. Each value is
     # still pinned (manifest[s].sha256 == sha(canon(value)) and equals its entry here), so the
     # seal transitively covers everything -- but a section's value can be WITHHELD (redacted)
     # while its digest keeps the commitment intact and the signature stays valid. See
     # proof_core.redaction.
-    sha256sums = {s: manifest[s]["sha256"] for s in ("inputs", "result", "provenance")}
+    # ADR-050: `canon_version` is a 4th key INSIDE `sha256sums` (NOT a new top-level key), so it is covered
+    # by the existing seal equation `bundle_sha256 == sha(canon(sha256sums))` -- editing or stripping it
+    # breaks the seal + signature (integrity FAIL, never fail-forward). canon sorts keys, so the emitted
+    # bytes carry it first regardless of insertion order; the seal equation below is textually UNCHANGED.
+    sha256sums = {"canon_version": canon_version}
+    sha256sums.update({s: manifest[s]["sha256"] for s in ("inputs", "result", "provenance")})
+    # Belt (the mint never ships a sha256sums without the version): the golden-bytes gate pins the shape too.
+    assert "canon_version" in sha256sums, "mint invariant: sha256sums must carry canon_version"
     # BELT (don't mint a self-contradicting bundle): runs BEFORE signing, so the signing key is never
     # invoked on a bundle that would then be discarded when the belt raises. It reads only core/repro/
     # profile/inputs_value (all finalized above), never the signature, so the ordering is clean. Belts run
     # before signing; emitted bytes and verdicts are identical to the old belt-last order: a passing bundle
     # signs exactly as before; a failing one raises and emits NOTHING either way -- the only difference is
     # that the key is never touched on a refused mint.
-    _assert_sealed_provenance_honest(case.capability, core, repro, profile=p, inputs_value=inputs_value)
+    _assert_sealed_provenance_honest(case.capability, core, repro, profile=p, inputs_value=inputs_value,
+                                     canon_version=canon_version)
     bundle = {
         "schema": p.envelope_schema,
         "result": core,                       # the envelope is a superset that embeds the result core shape
@@ -342,6 +509,9 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
         "manifest": manifest,
         "sha256sums": sha256sums,             # the sealed digest-list (redaction-safe)
     }
+    # the seal recomputes over the ALL-ASCII sha256sums header, which canonicalizes identically under every
+    # canon version (the ADR-050 header invariant); use the fixed v1 `canon` so the mint matches both
+    # verifiers' header recompute explicitly (not just coincidentally for ASCII).
     bundle["bundle_sha256"] = sha(canon(sha256sums))
     bundle["signature"] = signing.sign_bundle_digest(bundle["bundle_sha256"])
     # BELT (S1/S2, producer side): the block just minted is exactly {alg, public_key, signature, message}

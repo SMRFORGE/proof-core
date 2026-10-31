@@ -162,6 +162,14 @@ def _capability_of(bundle: dict) -> str | None:
         return None
 
 
+def _subject_canon_version(bundle: dict) -> int:
+    """The subject's sealed canon_version when it is one this producer can mint, else 1 (a subject sealed under
+    an unknown canon cannot have been verified intact, so the re-mint's comparison fails on its own)."""
+    from .envelope import _CANON
+    sv = (bundle.get("sha256sums") or {}).get("canon_version")
+    return sv if type(sv) is int and sv in _CANON else 1
+
+
 def _rebuild_with_outputs(bundle: dict, fresh_outputs: dict, profile=None) -> dict:
     """A fresh bundle that mirrors ``bundle`` but carries ``fresh_outputs`` in place of the sealed outputs.
 
@@ -200,6 +208,9 @@ def _rebuild_with_outputs(bundle: dict, fresh_outputs: dict, profile=None) -> di
         applicability=prov.get("applicability"),
         completeness=prov.get("completeness"),
         derived_from=prov.get("derived_from"),
+        # re-mint under the subject's sealed canon (ADR-053/054): a v2 subject's links were digested under v2,
+        # so a v1 re-mint would be refused by the binding belt (and would not be the same computation's seal).
+        canon_version=_subject_canon_version(bundle),
         # re-mint the fresh bundle under the SAME dialect as the subject, so a branded --command
         # reproduce rebuilds a matching result core instead of a neutral-dialect one. None -> neutral.
         profile=profile,
@@ -420,8 +431,10 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_USAGE
 
     try:
-        with open(args.bundle, encoding="utf-8") as fh:
-            bundle = loads(fh.read())
+        with open(args.bundle, "rb") as fh:
+            # bytes + strict UTF-8, exactly as proof-verify reads: no newline translation before the size cap,
+            # and an invalid byte is unreadable (UnicodeDecodeError is a ValueError), never U+FFFD
+            bundle = loads(fh.read().decode("utf-8"))
     except (OSError, ValueError, RecursionError, MemoryError) as exc:
         if args.json:
             return _emit_json_error(args.bundle, "unreadable", EXIT_USAGE,

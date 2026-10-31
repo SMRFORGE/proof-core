@@ -34,6 +34,8 @@ import hashlib
 import json
 import math
 import re
+import sys
+from decimal import Decimal
 from typing import Any
 
 _RESULT_REQUIRED = ("schema", "schema_version", "result", "fidelity", "verdict")
@@ -45,6 +47,10 @@ _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _PUBKEY_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _SIGNATURE_HEX_RE = re.compile(r"[0-9a-f]{128}")
 _SECTIONS = ("inputs", "result", "provenance")
+#: ADR-050: `sha256sums` carries the three section digests PLUS the integer `canon_version` (a 4th key under
+#: the seal). The valid key set a well-formed `sha256sums` (bundle-level and in a derived_from link) must
+#: have -- exactly the three sections plus `canon_version`.
+_SHA256SUMS_KEYS = set(_SECTIONS) | {"canon_version"}
 #: The signature block is UNSIGNED apart from the `signature` bytes themselves (the seal binds only
 #: `bundle_sha256`), so any key beyond these four rides unsigned: an intermediary who cannot re-sign
 #: could staple `"attestation": "APPROVED"` into the block of a genuinely-signed bundle and the Ed25519
@@ -59,7 +65,6 @@ _SIGNATURE_MESSAGE = "bundle_sha256"
 #: allowlist closes). `redaction` is a machine record of WHICH sections are withheld; `host` is a
 #: diagnostic triple. Neither may carry a conclusion, a note, or any other unsigned claim.
 _REDACTION_SCHEMA = "evidence.envelope.redaction.v1"
-_REDACTION_KEYS = {"schema", "withheld", "reason", "parent_bundle_sha256", "caveats"}
 _HOST_KEYS = {"python_version", "python_impl", "platform"}
 #: `timestamp` is an OPTIONAL unsigned RFC 3161 trusted-timestamp token embedded in the bundle (added AFTER
 #: signing, by a Timestamp Authority -- so it cannot live inside the signed manifest). It is self-
@@ -67,13 +72,11 @@ _HOST_KEYS = {"python_version", "python_impl", "platform"}
 #: validity would be checked SEPARATELY by a dedicated RFC 3161 tool (ASN.1/CMS/X.509, which this
 #: stdlib-only verifier cannot parse); no such tool ships here yet. Here we only constrain its SHAPE so
 #: nothing else rides unsigned.
-_TIMESTAMP_KEYS = {"format", "tsa", "token"}
 _TIMESTAMP_TOKEN_MAX = 200_000        # a base64 RFC 3161 token is a few KB; cap to reject a stapled blob
-#: The timestamp shape (ADR-049: always strict). A timestamp is a bare RFC 3161
-#: token with no free-text `tsa` label holds the record to the CLOSED, REQUIRED {format, token} set, and the
+#: The timestamp shape (ADR-049: always strict). A timestamp is a bare RFC 3161 token with no free-text
+#: label: the record is held to the CLOSED, REQUIRED {format, token} set (`_TIMESTAMP_KEYS_STRICT`), and the
 #: token to strict base64 that decodes to a DER SEQUENCE (starts 'MI', correct padding, no other characters,
-#: no trailing whitespace -- `fullmatch` rejects a trailing newline). Used by the timestamp
-#: is ON; the neutral open shape ({format, tsa, token}) is unchanged.
+#: no trailing whitespace -- `fullmatch` rejects a trailing newline).
 _TIMESTAMP_TOKEN_RE = re.compile(r"^MI[A-Za-z0-9+/]{2}(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$")
 _TIMESTAMP_KEYS_STRICT = {"format", "token"}                              # closed+required set when strict
 #: The redaction REQUIRED key set (ADR-049: the record is always prose-free + strict): every one must be present.
@@ -111,6 +114,15 @@ STATE_INTEGRITY_ONLY = "integrity-only"  # every hash recomputes; valid signatur
 #: other-key integrity-only state so a consumer can tell "ours, but a demo pin" from "signed by someone else".
 STATE_INTEGRITY_ONLY_DEMO = "integrity-only (demo pin)"
 STATE_FAIL = "fail"                      # a hash/seal/schema problem, or the signature is invalid
+#: ADR-050 fail-FORWARD: the bundle is sealed under a `canon_version` NEWER than this verifier supports, and
+#: its header seal + signature are valid -- a signed record this verifier simply cannot check the sections
+#: of. A DISTINCT, NAMED verdict, never `fail`/"tampered": the honest answer is "use a newer verifier", not
+#: "this is corrupt". `integrity_ok` is still False and `verify_bundle` still returns False (integrity
+#: cannot be established, so a boolean consumer stays fail-closed); only the state + message distinguish it.
+STATE_UNSUPPORTED_CANON = "unsupported-canon"
+STATE_UNSUPPORTED_ALG = "unsupported-alg"
+_ALG_SUPPORTED = frozenset({"ed25519"})
+_ALG_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9.+\-]{0,31}")
 
 
 def _profile_value(profile, name, default):
@@ -212,7 +224,96 @@ def _canon(obj: Any) -> bytes:
                       allow_nan=False).encode()
 
 
-def _try_canon(obj: Any, label: str, problems: list[str]) -> bytes | None:
+# --- canon_version 2: strict RFC 8785 (JCS) + string-encoded big ints (ADR-053) ----------------------
+# An independent re-implementation of the producer's v2 canonicalization, on purpose. v2 removes v1's three
+# CPython deviations: strings are raw UTF-8 with JCS-minimal escaping (NOT ensure_ascii), numbers follow
+# ECMAScript Number::toString (a whole float collapses: 2.0 -> "2"; 1e-7 -> "1e-7"), and object keys sort by
+# UTF-16 code unit (NOT code point). Integers outside +-(2^53-1) are not representable as bare numbers under
+# v2 (the mint refuses one; encode it as a JSON string) and `_v2_number` REFUSES one, so a v2 bundle sealing one is a
+# canonicalization FAIL here and in the JS verifier. The ES number rule reuses Python's shortest-round-trip repr() for digit SELECTION, then
+# reformats per ECMA-262 6.1.6.1.20 -- no dtoa reimplementation. See the ADR-053 canon spec + conformance.
+_V2_SHORT_ESCAPE = {0x08: "\\b", 0x09: "\\t", 0x0A: "\\n", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\"}
+
+
+def _v2_string(s: str) -> str:
+    out = ['"']
+    for ch in s:
+        c = ord(ch)
+        if c in _V2_SHORT_ESCAPE:
+            out.append(_V2_SHORT_ESCAPE[c])
+        elif c < 0x20 or 0xD800 <= c <= 0xDFFF:  # C0 controls AND lone surrogates -> \uXXXX (lowercase),
+            out.append(f"\\u{c:04x}")            # exactly as ECMAScript JSON.stringify / RFC 8785 escapes them
+        else:
+            out.append(ch)                       # raw (all other non-ASCII, incl. valid astral scalars)
+    out.append('"')
+    return "".join(out)
+
+
+#: The largest integer magnitude a canon-v2 (JCS / IEEE-754 double) number represents exactly.
+_JS_SAFE_INT = 2 ** 53 - 1
+
+
+def _v2_number(n: Any) -> str:
+    if isinstance(n, int):                        # bool is handled by _v2_emit before reaching here
+        # JCS numbers are IEEE-754 doubles: an integer outside +/-(2^53-1) has no exact v2 encoding (the producer
+        # refuses to mint one -- encode it as a JSON string, ADR-053). A verifier must refuse it too, or a v2
+        # bundle the producer could never mint would verify (and a v2 link could bind a float to a nearby big
+        # int). Raising here makes every v2 section with one a canonicalization FAIL, in both verifiers.
+        if abs(n) > _JS_SAFE_INT:
+            raise ValueError(f"canon v2: integer {n} is outside +/-(2^53-1) and not representable; "
+                             "encode it as a JSON string")
+        return str(n)
+    if not math.isfinite(n):
+        raise ValueError("NaN/Infinity are not valid JSON")
+    if n == 0:
+        return "0"                                # -0.0 -> "0"
+    neg = n < 0
+    _, digs, exp = Decimal(repr(abs(n))).as_tuple()
+    digs = list(digs)
+    while len(digs) > 1 and digs[-1] == 0:        # strip trailing zeros; value = int(digs) * 10**exp
+        digs.pop()
+        exp += 1
+    s = "".join(map(str, digs))
+    k = len(s)
+    m = k + exp                                   # ES: value = s * 10**(m-k); point goes after m digits
+    if k <= m <= 21:
+        out = s + "0" * (m - k)
+    elif 0 < m <= 21:
+        out = s[:m] + "." + s[m:]
+    elif -6 < m <= 0:
+        out = "0." + "0" * (-m) + s
+    else:
+        mant = s[0] + ("." + s[1:] if k > 1 else "")
+        e = m - 1
+        out = f"{mant}e{'+' if e >= 0 else '-'}{abs(e)}"
+    return "-" + out if neg else out
+
+
+def _v2_emit(obj: Any) -> str:
+    if obj is None:
+        return "null"
+    if obj is True:
+        return "true"
+    if obj is False:
+        return "false"
+    if isinstance(obj, str):
+        return _v2_string(obj)
+    if isinstance(obj, (int, float)):
+        return _v2_number(obj)
+    if isinstance(obj, (list, tuple)):
+        return "[" + ",".join(_v2_emit(v) for v in obj) + "]"
+    if isinstance(obj, dict):
+        items = sorted(obj.items(), key=lambda kv: kv[0].encode("utf-16-be", "surrogatepass"))
+        return "{" + ",".join(_v2_string(k) + ":" + _v2_emit(v) for k, v in items) + "}"
+    raise TypeError(f"not a JSON value: {type(obj).__name__}")
+
+
+def _canon_v2(obj: Any) -> bytes:
+    # canon_version 2 = strict RFC 8785 (JCS) + string-encoded big ints. Output is UTF-8 (raw non-ASCII).
+    return _v2_emit(obj).encode("utf-8")
+
+
+def _try_canon(obj: Any, label: str, problems: list[str], canon_fn=_canon) -> bytes | None:
     """`_canon` that turns a serialization failure into a FAIL problem, never an uncaught traceback.
 
     `_canon` can raise on a hand-built object handed straight to the Python API (a value json cannot
@@ -221,10 +322,54 @@ def _try_canon(obj: Any, label: str, problems: list[str]) -> bytes | None:
     answer with a verdict, so a canon failure becomes a problem here and returns None (which never
     compares equal to real canonical bytes, so a failed canon reads as a mismatch -- closed)."""
     try:
-        return _canon(obj)
-    except (TypeError, ValueError, RecursionError) as exc:
+        return canon_fn(obj)
+    except (TypeError, ValueError, AttributeError, RecursionError) as exc:
         problems.append(f"{label}: value cannot be canonicalized ({type(exc).__name__}: {exc})")
         return None
+
+
+# --- ADR-050: the version -> canon map (append-only, frozen) ------------------------------------------
+#: The REFERENCE canon's output-definition version -> the canon function that produces it. APPEND-ONLY and
+#: FROZEN: a future change to what the reference canon EMITS becomes `canon_version = 2` with a NEW `_canon_v2`
+#: entry while `1: _canon` is preserved VERBATIM, so every v1 bundle verifies forever. A VERIFIER-port bug
+#: (a port disagreeing with the reference for version N) is fixed IN PLACE with NO bump -- that verifier was
+#: non-conformant; the format did not move. For v1 the map's canon IS this module's `_canon`.
+_CANON = {1: _canon, 2: _canon_v2}
+#: The highest `canon_version` this verifier can apply. A bundle sealed under anything higher is a
+#: fail-FORWARD (`STATE_UNSUPPORTED_CANON`), never an integrity failure.
+_CANON_SUPPORTED_MAX = max(_CANON)
+
+#: The exact set of top-level keys the envelope allows. Anything else rides UNSIGNED (the seal commits
+#: only to `sha256sums`), so a rendering UI must never show it. This membership test is canon-INDEPENDENT
+#: (pure key-set), so the fail-FORWARD branch applies it too, even though it leaves the newer bundle's
+#: sections to a newer verifier. ADR-049: `host` is RETIRED -- a stapled host block fails this allowlist.
+_ALLOWED_TOP = frozenset({"schema", "result", "reproducibility", "manifest", "sha256sums",
+                          "bundle_sha256", "signature", "redaction", "timestamp", "attestations"})
+
+
+def _read_canon_version(sha256sums: Any) -> tuple[str | None, int | None, bool]:
+    """Read the sealed `canon_version` from `sha256sums` (ADR-050). Returns
+    `(problem_or_None, version_or_None, newer_than_supported)`:
+
+    - `(None, N, False)` -- a KNOWN version (`1 <= N <= _CANON_SUPPORTED_MAX`): apply that canon.
+    - `(None, N, True)`  -- NEWER than this verifier supports: the caller fails FORWARD.
+    - `(problem, None, False)` -- MISSING, non-int, `< 1`, or a float/bool: a MALFORMED header. There is no
+      implicit default -- a bundle without the field is not a "v0 bundle", it is not a bundle this format
+      defines -- so the caller treats it as an integrity FAIL.
+
+    Reading the version is a plain parse: the header canonicalizes identically under every canon version
+    (the ADR-050 header invariant), so no canon is needed to read it, and there is no bootstrapping circularity.
+    """
+    if not isinstance(sha256sums, dict) or "canon_version" not in sha256sums:
+        return (("sha256sums is missing the required integer canon_version (ADR-050): a bundle without it "
+                 "is not a bundle this format defines"), None, False)
+    v = sha256sums["canon_version"]
+    # NB: bool is a subclass of int -- reject it explicitly (a JSON `true`/`false` is not a version).
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        return (f"canon_version must be an integer >= 1, got {v!r}", None, False)
+    if v > _CANON_SUPPORTED_MAX:
+        return (None, v, True)
+    return (None, v, False)
 
 
 def _non_finite_paths(obj: Any, path: str = "$") -> list[str]:
@@ -268,6 +413,11 @@ def _check_redaction(bundle: dict, problems: list[str], profile=None) -> set[str
     if not isinstance(withheld, list) or not withheld \
             or not all(isinstance(w, str) and w in _SECTIONS for w in withheld):
         problems.append(f"redaction.withheld must be a non-empty list of sections {list(_SECTIONS)}: {withheld!r}")
+        withheld = []
+    elif len(set(withheld)) != len(withheld):
+        # the schema declares `withheld` uniqueItems; reject duplicates here too so a JSON-Schema validator
+        # and this verifier never disagree on whether a redacted bundle is well-formed.
+        problems.append(f"redaction.withheld has duplicate sections (must be unique): {sorted(withheld)}")
         withheld = []
     parent = red.get("parent_bundle_sha256")
     if "parent_bundle_sha256" in red and not (isinstance(parent, str) and _SHA256_RE.fullmatch(parent)):
@@ -399,11 +549,33 @@ def loads(text: str) -> dict:
     and NaN/Infinity (not RFC 8259 JSON). Any reader that bypasses this -- a plain ``json.loads`` in
     conformance, the lineage index, reproduce/certify -- could attest or re-derive a bundle this
     authoritative verifier would refuse to even parse, so they all route through here."""
-    if len(text) > _MAX_BUNDLE_BYTES:
-        raise ValueError(f"bundle text is {len(text)} bytes (> {_MAX_BUNDLE_BYTES} cap; rejected)")
+    nbytes = len(text) if len(text) > _MAX_BUNDLE_BYTES else len(text.encode("utf-8", "surrogatepass"))
+    if nbytes > _MAX_BUNDLE_BYTES:
+        raise ValueError(f"bundle text is {nbytes} UTF-8 bytes (> {_MAX_BUNDLE_BYTES} cap; rejected)")
     if not _text_depth_ok(text):
         raise ValueError(f"JSON nesting exceeds {_MAX_JSON_DEPTH} levels (rejected fail-closed)")
-    return json.loads(text, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_non_finite)
+    return json.loads(text, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_non_finite,
+                      parse_int=_parse_bounded_int)
+
+
+#: Integer literals longer than this many digits are refused, independent of PYTHONINTMAXSTRDIGITS (CPython's
+#: default limit), so the verdict on a bundle never depends on the environment. The JS verifier matches.
+_MAX_INT_DIGITS = 4300
+
+
+def _parse_bounded_int(literal: str) -> int:
+    digits = literal.lstrip("-")
+    if len(digits) > _MAX_INT_DIGITS:
+        raise ValueError(f"integer literal has more than {_MAX_INT_DIGITS} digits (rejected fail-closed)")
+    # An interpreter configured with a LOWER int-string limit (PYTHONINTMAXSTRDIGITS) cannot print such an
+    # integer later (every str/repr/json.dumps would raise), so refuse it HERE, while reading, with the limit
+    # named: an unreadable verdict, never a traceback further on.
+    env_limit = sys.get_int_max_str_digits()
+    if env_limit and len(digits) > env_limit:
+        raise ValueError(f"integer literal has {len(digits)} digits, beyond this Python's PYTHONINTMAXSTRDIGITS "
+                         f"limit ({env_limit}); the reference reads up to {_MAX_INT_DIGITS} digits at the default "
+                         "limit -- re-run without lowering it")
+    return int(literal)
 
 
 def _sha(b: bytes) -> str:
@@ -516,7 +688,7 @@ def _ed25519_verify(signature: bytes, msg: bytes, pubkey: bytes) -> bool:
 
 
 def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
-                     origin_problems: list[str], profile=None) -> str | None:
+                     origin_problems: list[str], profile=None, sig_out: dict | None = None) -> str | None:
     """The signature check, split on the two distinct things a signature proves.
 
     INTEGRITY (-> `problems`): the block is well-formed and the Ed25519 signature is VALID over the
@@ -549,8 +721,30 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
     # (or none) is a block that does not describe the seal it claims to cover.
     if sig.get("message") != _SIGNATURE_MESSAGE:
         problems.append(f"signature.message must be {_SIGNATURE_MESSAGE!r} (got {sig.get('message')!r})")
-    if sig.get("alg") != "ed25519":
-        problems.append(f"unsupported signature alg: {sig.get('alg')!r}")
+    alg = sig.get("alg")
+    if not (isinstance(alg, str) and alg in _ALG_SUPPORTED):
+        signer_v, sig_hex_v = sig.get("public_key"), sig.get("signature")
+        # mirror the JS `blockShapeOk` gate: grant the soft fail-forward ONLY when the block is OTHERWISE
+        # well-formed (hex fields valid; S1/S2 above already recorded any extra/missing key or bad message).
+        # A garbage/forged/truncated hex field alongside a plausible future-suite label is a plain FAIL, not a
+        # benign "use a newer verifier" -- the one-contract gate is "the unknown suite is the SOLE problem".
+        signer_ok = isinstance(signer_v, str) and _PUBKEY_HEX_RE.fullmatch(signer_v) is not None
+        sighex_ok = isinstance(sig_hex_v, str) and _SIGNATURE_HEX_RE.fullmatch(sig_hex_v) is not None
+        if isinstance(alg, str) and _ALG_TOKEN_RE.fullmatch(alg) and signer_ok and sighex_ok:
+            if sig_out is not None:
+                sig_out["unsupported_alg"] = True
+            problems.append(
+                f"{STATE_UNSUPPORTED_ALG}: signed with signature suite {alg!r}; this verifier can check "
+                f"{sorted(_ALG_SUPPORTED)} and so CANNOT check this signature -- use a newer verifier "
+                "(integrity and origin UNDETERMINED; this verdict can be produced from any content and "
+                "attests nothing about the sections)")
+        else:
+            problems.append(f"unsupported signature alg: {alg!r}")
+            if not signer_ok:
+                problems.append("signature public_key is not a 32-byte hex Ed25519 key (64 lowercase hex characters)")
+            if not sighex_ok:
+                problems.append("signature.signature is not a 64-byte Ed25519 signature (128 lowercase hex "
+                                "characters, no whitespace)")
         return None
     signer = sig.get("public_key")
     # ADR-049 (one strict dialect): hold both hex fields to EXACTLY lowercase hex (the schema pattern)
@@ -588,6 +782,9 @@ _ATTESTATION_SCHEMA = "evidence.attestation.v1"
 #: what was signed and is itself BOUND INTO the signed bytes, so neither it nor the schema can be swapped.
 _ATTESTATION_MESSAGE = "attests:v1"
 _ATT_KEYS = {"schema", "role", "name", "public_key", "timestamp", "message", "signature"}
+#: Exact problem text for a present-but-null `attestations`. The verdict exposes `attestations_null` as a
+#: structured flag so a caller never infers it from problem text (which echoes attacker-chosen names).
+_ATTESTATIONS_NULL_PROBLEM = "attestations is present but null; omit the key instead"
 
 
 def _check_attestations(bundle: dict, bundle_sha256: str, problems: list[str], out: list) -> None:
@@ -605,6 +802,8 @@ def _check_attestations(bundle: dict, bundle_sha256: str, problems: list[str], o
     """
     atts = bundle.get("attestations")
     if atts is None:
+        if "attestations" in bundle:
+            problems.append(_ATTESTATIONS_NULL_PROBLEM)
         return
     if not isinstance(atts, list):
         problems.append(f"attestations is not a list (got {type(atts).__name__})")
@@ -627,10 +826,18 @@ def _check_attestations(bundle: dict, bundle_sha256: str, problems: list[str], o
         if label != _ATTESTATION_MESSAGE:
             problems.append(f"attestation[{i}] message must be {_ATTESTATION_MESSAGE!r} (got {label!r})")
         role, name, ts, pkhex = a.get("role"), a.get("name"), a.get("timestamp"), a.get("public_key")
-        try:
-            pk = bytes.fromhex(pkhex) if isinstance(pkhex, str) else b""
-        except ValueError:
-            pk = b""
+        # role/name/timestamp are REQUIRED strings (the published schema marks them so, and `make_attestation`
+        # always emits them as strings). Hold them to that here -- present, string-typed, and capped at the
+        # same free-text bound as every other unsigned field -- so a keyless, non-string, or oversize sign-off
+        # (`attestations` rides OUTSIDE the seal) cannot be stapled on and rendered. Reported, not gating.
+        for _fld, _val in (("role", role), ("name", name), ("timestamp", ts)):
+            if not isinstance(_val, str):
+                problems.append(f"attestation[{i}] {_fld} must be a string")
+            elif len(_val) > _FREE_TEXT_MAX:
+                problems.append(f"attestation[{i}] {_fld} exceeds {_FREE_TEXT_MAX} characters")
+        # strict lowercase hex BEFORE bytes.fromhex (which is case-insensitive and skips whitespace), matching
+        # the schema's LeanAttestation patterns and the JS verifier.
+        pk = bytes.fromhex(pkhex) if isinstance(pkhex, str) and _PUBKEY_HEX_RE.fullmatch(pkhex) else b""
         valid = False
         if len(pk) != 32:
             problems.append(f"attestation[{i}] public_key is not a 32-byte hex key")
@@ -639,8 +846,10 @@ def _check_attestations(bundle: dict, bundle_sha256: str, problems: list[str], o
             # of them breaks the signature (not only the structural checks above).
             msg = _canon({"attests": bundle_sha256, "schema": schema, "message": label,
                           "role": role, "name": name, "timestamp": ts})
+            sig_hex = a.get("signature")
             try:
-                valid = _ed25519_verify(bytes.fromhex(a.get("signature", "")), msg, pk)
+                valid = (isinstance(sig_hex, str) and _SIGNATURE_HEX_RE.fullmatch(sig_hex) is not None
+                         and _ed25519_verify(bytes.fromhex(sig_hex), msg, pk))
             except (ValueError, TypeError):
                 valid = False
             if not valid:
@@ -685,15 +894,23 @@ _DERIVED_FROM_VERDICT_TOKENS = ("verified", "accepted", "approved", "certified",
                                 "trusted")
 #: `role` and `consumed.input` are IDENTIFIERS (an input key, a role slug), never prose: one bounded token.
 _DERIVED_FROM_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}")
-#: `consumed.path` is an RFC 6901 JSON pointer into the upstream RESULT CORE ("" = the whole core).
-_JSON_POINTER_RE = re.compile(r"(?:/(?:[^/~]|~[01])*)*")
+#: `consumed.path` is an RFC 6901 JSON pointer that MUST address the upstream result MAP: it starts
+#: `/result/<capability>` and may descend further. The whole-capability output is `/result/<capability>`,
+#: NOT the empty pointer -- the chain walker resolves capability-scoped paths only, so an `""`/`/result`/
+#: non-`/result` pointer would mint and single-verify yet never WALK to `verified`. Requiring the walkable
+#: shape here keeps "offline-valid" == "walkable" and stops a second conformant walker from disagreeing.
+_CONSUMED_PATH_RE = re.compile(r"/result/(?:[^/~]|~[01])+(?:/(?:[^/~]|~[01])*)*")
 _MAX_JSON_POINTER_LEN = 1024
 _MAX_DERIVED_FROM_LINKS = 64
 
 
 def _verdict_token_in(label: str) -> str | None:
-    low = label.lower()
-    return next((tok for tok in _DERIVED_FROM_VERDICT_TOKENS if tok in low), None)
+    # match a verdict token as a WHOLE word (segments split on any non-alphanumeric: the identifier
+    # separators `_ . : / -`), not as a bare substring -- so a legitimate identifier like `validator`,
+    # `compass`, `passthrough`, or `cross-validation` is not rejected for merely containing `valid`/`pass`,
+    # while `origin-verified` (segment `verified`) still is.
+    words = set(re.split(r"[^a-z0-9]+", label.lower()))
+    return next((tok for tok in _DERIVED_FROM_VERDICT_TOKENS if tok in words), None)
 
 
 def _is_digest(v: Any) -> bool:
@@ -701,14 +918,15 @@ def _is_digest(v: Any) -> bool:
 
 
 def _derived_from_binding_problems(link: Any, own_seal: str | None, allowed_keys) -> list[str]:
-    """Every way ONE `derived_from` link fails the closed BINDING shape (empty list = well-formed). The
-    Stage-2 port UP of the dialect's own offline per-link rule, so the shared spine, with
-    rejects exactly what the dialect's own chain verifier rejects (verdict parity).
-    OFFLINE only (no upstream needed): the closed key set (a verdict label named as such), every digest a
-    well-formed `sha256:<64 hex>`, `sha256sums` exactly the three sections, `bundle_sha256 ==
-    sha(canon(sha256sums))` (the link is self-consistent, held to the same equality the seal itself is), the
-    closed `consumed` triple (an identifier-shaped input key, a bounded RFC 6901 pointer, a digest), an
-    identifier-shaped `role`, and no link to this bundle's OWN seal (`own_seal`)."""
+    """Every way ONE `derived_from` link fails the closed BINDING shape (empty list = well-formed). This is
+    the shared offline per-link rule, so a standalone port rejects exactly what the full chain verifier does
+    (verdict parity).
+    OFFLINE only (no upstream needed): the closed key set (a verdict label named as such is rejected), every
+    digest a well-formed `sha256:<64 hex>`, `sha256sums` exactly the three sections plus `canon_version`,
+    `bundle_sha256 == sha(canon(sha256sums))` (the link is self-consistent, held to the same equality the
+    seal itself is), the closed `consumed` triple (an identifier-shaped input key, a bounded RFC 6901 pointer
+    into `/result/<capability>`, a digest), an identifier-shaped `role`, and no link to this bundle's OWN
+    seal (`own_seal`)."""
     if not isinstance(link, dict):
         return [f"is not a JSON object (got {type(link).__name__})"]
     problems: list[str] = []
@@ -731,10 +949,14 @@ def _derived_from_binding_problems(link: Any, own_seal: str | None, allowed_keys
     if "sha256sums" in link:
         if not isinstance(sums, dict):
             problems.append(f"sha256sums is not a JSON object (got {type(sums).__name__})")
-        elif set(sums) != set(_SECTIONS):
-            problems.append(f"sha256sums has unexpected/missing sections: {sorted(set(sums) ^ set(_SECTIONS))}")
+        elif set(sums) != _SHA256SUMS_KEYS:
+            # ADR-050: a link carries the upstream's WHOLE sha256sums -- the three digests PLUS canon_version.
+            problems.append(f"sha256sums has unexpected/missing sections: {sorted(set(sums) ^ _SHA256SUMS_KEYS)}")
         elif not all(_is_digest(sums[s]) for s in _SECTIONS):
             problems.append("sha256sums values must each be a well-formed sha256:<64 hex> digest")
+        elif isinstance(sums["canon_version"], bool) or not isinstance(sums["canon_version"], int) \
+                or sums["canon_version"] < 1:
+            problems.append(f"sha256sums.canon_version must be an integer >= 1, got {sums['canon_version']!r}")
         else:
             sums_ok = True
     if sums_ok and _is_digest(target):
@@ -764,8 +986,9 @@ def _derived_from_binding_problems(link: Any, own_seal: str | None, allowed_keys
                                 "verifier's call, never a sealed label")
             path = consumed.get("path")
             if "path" in consumed and not (isinstance(path, str) and len(path) <= _MAX_JSON_POINTER_LEN
-                                           and _JSON_POINTER_RE.fullmatch(path)):
-                problems.append("consumed.path must be a bounded RFC 6901 JSON pointer into the upstream result core")
+                                           and _CONSUMED_PATH_RE.fullmatch(path)):
+                problems.append("consumed.path must be a bounded RFC 6901 pointer into the upstream result map "
+                                "(/result/<capability>/...); the empty pointer and non-/result pointers are not walkable")
             if "sha256" in consumed and not _is_digest(consumed.get("sha256")):
                 problems.append(f"consumed.sha256 is not a well-formed sha256:<64 hex> digest: {consumed.get('sha256')!r}")
     role = link.get("role")
@@ -800,6 +1023,61 @@ def _is_bool_or_null(value) -> bool:
     # NB: `value in (True, False, None)` is WRONG -- `1 == True` and `0 == False` in Python, so an int would
     # slip through. A JSON boolean is a real bool; identity/isinstance is the only sound test.
     return value is None or isinstance(value, bool)
+
+
+#: The schema's LeanReproducibility `required` fields and their types. A signed bundle must say who produced
+#: it, with what code and data, and how to re-run it; an empty or partial provenance asserts none of that.
+_PROV_REQUIRED_STR = ("engine_version", "code_version", "deterministic", "reproduce")
+_PROV_REQUIRED_NONEMPTY = ("produced_by",)
+#: Required, but their VALUE format is the S6 data-library rule's job (below); here only their presence.
+_PROV_REQUIRED_PRESENT = ("data_library", "data_library_sha256")
+
+
+def _is_json_integer(v) -> bool:
+    # JSON Schema `integer` (a whole number, written 1 or 1.0); never a bool. A whole float is accepted so the
+    # verdict cannot depend on spelling under canon v2, where 1 and 1.0 seal identically.
+    if isinstance(v, bool):
+        return False
+    return isinstance(v, int) or (isinstance(v, float) and v.is_integer())
+
+
+def _check_required_provenance(prov_val: dict, problems: list[str]) -> None:
+    for k in _PROV_REQUIRED_STR:
+        if not isinstance(prov_val.get(k), str):
+            problems.append(f"provenance.{k} is required and must be a string")
+    for k in _PROV_REQUIRED_NONEMPTY:
+        v = prov_val.get(k)
+        if not (isinstance(v, str) and v):
+            problems.append(f"provenance.{k} is required and must be a non-empty string")
+    for k in _PROV_REQUIRED_PRESENT:
+        if k not in prov_val:
+            problems.append(f"provenance.{k} is required")
+    if not _is_json_integer(prov_val.get("rng_seed")):
+        problems.append("provenance.rng_seed is required and must be an integer")
+
+
+def _check_optional_provenance(prov_val: dict, problems: list[str]) -> None:
+    """The schema's typed OPTIONAL provenance fields, held to their types when present. `attestation_scope` is the
+    signed claim boundary (what the seal does and does not attest): a non-object there is not a boundary."""
+    if "engine" in prov_val and not isinstance(prov_val["engine"], str):
+        problems.append("provenance.engine must be a string")
+    for k in ("toolchain", "data"):
+        if k in prov_val and not isinstance(prov_val[k], dict):
+            problems.append(f"provenance.{k} must be a JSON object")
+    if "attestation_scope" in prov_val:
+        sc = prov_val["attestation_scope"]
+        if not isinstance(sc, dict) or not all(isinstance(v, str) for v in sc.values()):
+            problems.append("provenance.attestation_scope must be a JSON object of strings")
+    if "lineage" in prov_val:
+        ln = prov_val["lineage"]
+        if not (isinstance(ln, dict) and _is_json_integer(ln.get("count")) and isinstance(ln.get("steps"), list)):
+            problems.append("provenance.lineage must be an object with an integer count and a steps list")
+
+
+def _no_null_leaf(obj: dict, key: str, label: str, problems: list[str]) -> None:
+    # an optional field present but null is malformed (the schema types it string/list); omit it instead.
+    if key in obj and obj[key] is None:
+        problems.append(f"{label} is present but null; omit the key instead")
 
 
 def _cap_text(value, label: str, problems: list[str]) -> None:
@@ -840,7 +1118,9 @@ def _check_frontier_slots(prov_val: dict, problems: list[str], profile=None, own
     recomputed seal, used for the binding self-reference check."""
     derived_from_keys = _profile_value(profile, "derived_from_keys", _DERIVED_FROM_KEYS)
     app = prov_val.get("applicability")
-    if app is not None:
+    if app is None and "applicability" in prov_val:
+        problems.append("provenance.applicability is present but null; omit the key to not assert it")
+    elif app is not None:
         if not isinstance(app, dict):
             problems.append(f"provenance.applicability must be a JSON object (got {type(app).__name__})")
         else:
@@ -851,10 +1131,14 @@ def _check_frontier_slots(prov_val: dict, problems: list[str], profile=None, own
                 problems.append("provenance.applicability.assessed must be a boolean")
             if not _is_bool_or_null(app.get("in_distribution")):
                 problems.append("provenance.applicability.in_distribution must be true, false, or null")
+            _no_null_leaf(app, "method", "provenance.applicability.method", problems)
+            _no_null_leaf(app, "caveats", "provenance.applicability.caveats", problems)
             _cap_text(app.get("method"), "provenance.applicability.method", problems)
             _cap_str_list(app.get("caveats"), "provenance.applicability.caveats", problems)
     comp = prov_val.get("completeness")
-    if comp is not None:
+    if comp is None and "completeness" in prov_val:
+        problems.append("provenance.completeness is present but null; omit the key to not assert it")
+    elif comp is not None:
         if not isinstance(comp, dict):
             problems.append(f"provenance.completeness must be a JSON object (got {type(comp).__name__})")
         else:
@@ -863,10 +1147,14 @@ def _check_frontier_slots(prov_val: dict, problems: list[str], profile=None, own
                 problems.append(f"provenance.completeness has unexpected keys: {extra}")
             if not _is_bool_or_null(comp.get("complete")):
                 problems.append("provenance.completeness.complete must be true, false, or null")
+            _no_null_leaf(comp, "captured", "provenance.completeness.captured", problems)
+            _no_null_leaf(comp, "note", "provenance.completeness.note", problems)
             _cap_str_list(comp.get("captured"), "provenance.completeness.captured", problems)
             _cap_text(comp.get("note"), "provenance.completeness.note", problems)
     dfrom = prov_val.get("derived_from")
-    if dfrom is not None:
+    if dfrom is None and "derived_from" in prov_val:
+        problems.append("provenance.derived_from is present but null; omit the key to not assert a chain")
+    elif dfrom is not None:
         if not isinstance(dfrom, list):
             problems.append(f"provenance.derived_from must be a list (got {type(dfrom).__name__})")
         else:
@@ -934,7 +1222,10 @@ def classify_bundle(bundle: dict, *, profile=None) -> dict:
     origin_problems: list[str] = []
     attestation_problems: list[str] = []
     attestations: list = []
-    signer = _check(bundle, problems, origin_problems, attestation_problems, attestations, profile=profile)
+    canon_info: dict = {}
+    sig_info: dict = {}
+    signer = _check(bundle, problems, origin_problems, attestation_problems, attestations,
+                    profile=profile, canon_out=canon_info, sig_out=sig_info)
     integrity_ok = not problems
     # ORIGIN has two independent gates. First, the signature must be under the PINNED key
     # (`_check_signature` records a key mismatch in `origin_problems`). Second, the pin itself must be a
@@ -967,7 +1258,15 @@ def classify_bundle(bundle: dict, *, profile=None) -> dict:
         origin_problems.append("pinned key is the public demo identity; origin cannot be established")
     origin_ok = integrity_ok and not origin_problems
     if not integrity_ok:
-        state = STATE_FAIL
+        # ADR-050: a bundle sealed under a newer-than-supported canon whose header seal + signature are
+        # valid is a DISTINCT, NAMED fail-FORWARD verdict, not a plain integrity failure. integrity_ok is
+        # still False (a boolean consumer stays fail-closed); only the state + message distinguish it.
+        if canon_info.get("unsupported"):
+            state = STATE_UNSUPPORTED_CANON
+        elif sig_info.get("unsupported_alg") and len(problems) == 1:
+            state = STATE_UNSUPPORTED_ALG
+        else:
+            state = STATE_FAIL
     elif origin_ok:
         state = STATE_VERIFIED
     elif demo_pin and key_matches_pin:
@@ -986,6 +1285,7 @@ def classify_bundle(bundle: dict, *, profile=None) -> dict:
         "attestations": attestations,                 # [{role, name, timestamp, signer, valid}]
         "attestations_ok": not attestation_problems,  # structure well-formed AND every present sign-off valid
         "attestation_problems": attestation_problems,
+        "attestations_null": isinstance(bundle, dict) and "attestations" in bundle and bundle["attestations"] is None,
         # optional frontier assertion slots, as sealed in provenance -- PRODUCER claims the spine carries
         # and shape-checks but never evaluates (applicability is the adapter's judgement, not the seal's):
         "frontier": _frontier_report(bundle),
@@ -993,6 +1293,10 @@ def classify_bundle(bundle: dict, *, profile=None) -> dict:
         "signer_is_demo": signer == _DEMO_PUBKEY,
         "pinned_key_is_demo": demo_pin,
         "pinned_key": "ed25519:" + effective_pin,
+        # ADR-050: the sealed canon version this bundle claims, and the highest version this verifier can
+        # apply. `canon_version` is None when the header was malformed/missing (an integrity FAIL).
+        "canon_version": canon_info.get("version"),
+        "supported_canon_max": canon_info.get("supported_max", _CANON_SUPPORTED_MAX),
     }
 
 
@@ -1019,7 +1323,7 @@ def integrity_ok(bundle: dict, *, profile=None) -> bool:
 
 def _check(bundle: dict, problems: list[str], origin_problems: list[str],
            attestation_problems: list[str] | None = None, attestations_out: list | None = None,
-           profile=None) -> str | None:
+           profile=None, canon_out: dict | None = None, sig_out: dict | None = None) -> str | None:
     """Run every check, appending integrity problems to `problems` and origin problems to
     `origin_problems`; return the embedded signer key (hex) if the signature block was readable.
     Human sign-offs, if any, are validated into `attestations_out` with problems to `attestation_problems`
@@ -1035,7 +1339,75 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
     if _exceeds_depth(bundle):
         problems.append(f"bundle nests deeper than {_MAX_JSON_DEPTH} levels (rejected fail-closed)")
         return None
-    envelope_schema = _profile_value(profile, "envelope_schema", "evidence.envelope.v2")
+    # ADR-050: READ `canon_version` BEFORE trusting any hash -- after the depth guard, BEFORE the schema
+    # check (so a future envelope tag never masks the verdict as "unknown envelope schema"). The header
+    # canonicalizes identically under every canon version, so this is a plain parse.
+    sha256sums_hdr = bundle.get("sha256sums")
+    canon_problem, canon_version, canon_newer = _read_canon_version(sha256sums_hdr)
+    if canon_out is not None:
+        canon_out["version"] = canon_version
+        canon_out["supported_max"] = _CANON_SUPPORTED_MAX
+        canon_out["unsupported"] = False
+    if canon_problem is not None:
+        # MISSING / non-int / < 1 / float / bool: a malformed header -> integrity FAIL (no implicit default).
+        # Nothing below can be trusted, so stop here with the one clear reason.
+        problems.append(canon_problem)
+        return None
+    if canon_newer:
+        # fail-FORWARD. The header (`sha256sums`) canonicalizes identically under every canon version
+        # (ADR-050 header invariant), so we CAN still check the seal and the Ed25519 signature over it. We
+        # do NOT recompute the sections (we lack that canon), so the verdict says only that this verifier
+        # CANNOT CHECK them -- never that the record is "untampered". Per ADR-050 Decision 4, the pinned-key
+        # status is still recorded (via `origin_problems` below) so a reader can tell a trustworthy "get a
+        # newer verifier" from a possibly attacker-planted version label. A record whose header does NOT seal
+        # under a valid signature is tampering, not a newer format: a plain integrity FAIL, never
+        # `unsupported-canon`.
+        bsum = bundle.get("bundle_sha256")
+        cb = _try_canon(sha256sums_hdr, "sha256sums", problems)
+        recomputed = _sha(cb) if cb is not None else ""
+        header_seals = (cb is not None and isinstance(bsum, str)
+                        and _SHA256_RE.fullmatch(bsum) is not None and recomputed == bsum)
+        sig_problems: list[str] = []
+        # populates `origin_problems` with the pinned-key mismatch (Decision 4) even on fail-forward.
+        signer = _check_signature(bundle, recomputed, sig_problems, origin_problems, profile, sig_out=sig_out)
+        if header_seals and not sig_problems:
+            if canon_out is not None:
+                canon_out["unsupported"] = True
+            problems.append(
+                f"{STATE_UNSUPPORTED_CANON}: sealed under canon_version {canon_version}; this verifier "
+                f"supports up to {_CANON_SUPPORTED_MAX} and so CANNOT recompute or check this bundle's "
+                "sections under that canon -- use a newer verifier (not an integrity failure, and not a "
+                "statement that the sections are untampered)")
+            # Canon-INDEPENDENT trust-surface check (pure top-level key membership): an unsigned key riding
+            # outside the sealed shape -- e.g. "conclusion": "accepted by the regulator" -- is caught even
+            # on a fail-forward bundle, so a field-rendering UI is never handed an unsigned claim with no
+            # warning. The newer bundle's SECTIONS are left to the newer verifier; this is the envelope only.
+            extra_top = sorted(set(bundle) - _ALLOWED_TOP)
+            if extra_top:
+                problems.append(
+                    f"bundle has unexpected top-level keys (unsigned, riding outside the seal): {extra_top}")
+        elif header_seals and sig_out is not None and sig_out.get("unsupported_alg") and len(sig_problems) == 1:
+            # F3: header seals, sole signature problem is an unknown suite -> unsupported-alg precedence.
+            # BUT an unsigned top-level key riding outside the seal must still be caught (I1), matching the
+            # normal path and the unsupported-canon sibling; if present, fall through to FAIL.
+            extra_top = sorted(set(bundle) - _ALLOWED_TOP)
+            if extra_top:
+                problems.append(
+                    f"bundle has unexpected top-level keys (unsigned, riding outside the seal): {extra_top}")
+                problems.extend(sig_problems)
+            else:
+                problems.append(sig_problems[0])
+        else:
+            problems.append(
+                f"declares canon_version {canon_version} but its header does not seal under a valid "
+                "signature: an unsigned/edited version claim is tampering, not a newer format")
+            problems.extend(sig_problems)
+        return signer
+    # canon_version is now a KNOWN version (1..max; the newer branch returned above). Select the matching
+    # canon so a v2 bundle's SECTION values recompute under JCS, not v1. The all-ASCII sha256sums header and
+    # the bundle-seal recompute stay on `_canon` (byte-identical across versions), so only section values move.
+    canon_fn = _CANON[canon_version]
+    envelope_schema = _profile_value(profile, "envelope_schema", "evidence.envelope.v3")
     if bundle.get("schema") != envelope_schema:
         problems.append(f"unknown envelope schema: {bundle.get('schema')!r}")
 
@@ -1044,12 +1416,10 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
     # top-level field -- e.g. "conclusion": "accepted by the regulator" -- to a bundle that still "verifies", and a
     # downstream reader/UI that renders bundle fields would show an attacker-authored claim the seal
     # never committed to. Reject unknown top-level keys so nothing unsigned can ride along.
-    _allowed_top = {"schema", "result", "reproducibility", "manifest", "sha256sums",
-                    "bundle_sha256", "signature", "redaction", "timestamp", "attestations"}
     # ADR-049 (one strict dialect): `host` is RETIRED -- it is NOT an allowed top-level key, so a stapled
-    # host block FAILs the top-level allowlist with the "unexpected top-level keys" message. Its structured
-    # replacement is the SIGNED `toolchain` axis (always carrying `machine`).
-    extra_top = sorted(set(bundle) - _allowed_top)
+    # host block FAILs the top-level allowlist (`_ALLOWED_TOP`) with the "unexpected top-level keys"
+    # message. Its structured replacement is the SIGNED `toolchain` axis (always carrying `machine`).
+    extra_top = sorted(set(bundle) - _ALLOWED_TOP)
     if extra_top:
         problems.append(f"bundle has unexpected top-level keys (unsigned): {extra_top}")
 
@@ -1084,8 +1454,10 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
     sections = set(_SECTIONS)
     if set(manifest) != sections:
         problems.append(f"manifest has unexpected/missing sections: {sorted(set(manifest) ^ sections)}")
-    if set(sha256sums) != sections:
-        problems.append(f"sha256sums has unexpected/missing sections: {sorted(set(sha256sums) ^ sections)}")
+    # ADR-050: `sha256sums` is the three sections PLUS the integer `canon_version` (already validated as a
+    # good int above, since we are past the fail-forward gate). Exactly those four keys -- no injected extra.
+    if set(sha256sums) != _SHA256SUMS_KEYS:
+        problems.append(f"sha256sums has unexpected/missing sections: {sorted(set(sha256sums) ^ _SHA256SUMS_KEYS)}")
 
     for side in _SECTIONS:
         blk = manifest.get(side, {})
@@ -1106,7 +1478,7 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
         if declared != sealed:               # the manifest digest must match the SEALED digest
             problems.append(f"{side}: manifest digest {declared} != sealed digest {sealed}")
         if "value" in blk:
-            cb = _try_canon(blk["value"], f"{side}: manifest value", problems)
+            cb = _try_canon(blk["value"], f"{side}: manifest value", problems, canon_fn=canon_fn)
             if cb is not None:
                 recomputed = _sha(cb)
                 if recomputed != declared:
@@ -1128,10 +1500,21 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
         for k in _profile_value(profile, "result_required_fields", _RESULT_REQUIRED):
             if k not in core:
                 problems.append(f"embedded result.v1 core missing required field: {k!r}")
+        # Pin the result-core CONTRACT IDENTITY, not just field presence: the producer stamps a specific
+        # `schema`/`schema_version` at mint, so a future `evidence.result.v2` core (different required fields
+        # / meaning) must not verify identically to v1. Enforce the values the profile pins.
+        want_result_schema = _profile_value(profile, "result_schema", "evidence.result.v1")
+        want_result_schema_version = _profile_value(profile, "result_schema_version", 1)
+        if "schema" in core and core.get("schema") != want_result_schema:
+            problems.append(f"embedded result core schema is not {want_result_schema!r}: {core.get('schema')!r}")
+        if "schema_version" in core and (isinstance(core.get("schema_version"), bool)
+                                         or core.get("schema_version") != want_result_schema_version):
+            problems.append(f"embedded result core schema_version is not {want_result_schema_version!r}: "
+                            f"{core.get('schema_version')!r}")
         res_blk = manifest.get("result", {})
-        cc = _try_canon(core, "embedded result core", problems)
+        cc = _try_canon(core, "embedded result core", problems, canon_fn=canon_fn)
         cr = _try_canon(res_blk.get("value") if isinstance(res_blk, dict) else None,
-                        "hashed result core", problems)
+                        "hashed result core", problems, canon_fn=canon_fn)
         if cc is not None and cr is not None and cc != cr:
             problems.append("embedded result core != hashed result core")
     if "provenance" in withheld:
@@ -1140,8 +1523,15 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
     else:
         prov_blk = manifest.get("provenance", {})
         prov_val = prov_blk.get("value") if isinstance(prov_blk, dict) else None
-        cp = _try_canon(bundle.get("reproducibility", {}), "embedded reproducibility", problems)
-        cpv = _try_canon(prov_val, "hashed provenance", problems)
+        # a signed bundle whose provenance is null asserts no producer, scope or pins at all: malformed, not a
+        # quiet pass (a null provenance + null reproducibility used to compare equal and verify).
+        if not isinstance(prov_val, dict):
+            problems.append(f"hashed provenance value must be a JSON object (got {type(prov_val).__name__})")
+        if "reproducibility" in bundle and not isinstance(bundle["reproducibility"], dict):
+            problems.append("embedded reproducibility is present but not a JSON object "
+                            f"(got {type(bundle['reproducibility']).__name__})")
+        cp = _try_canon(bundle.get("reproducibility", {}), "embedded reproducibility", problems, canon_fn=canon_fn)
+        cpv = _try_canon(prov_val, "hashed provenance", problems, canon_fn=canon_fn)
         if cp is not None and cpv is not None and cp != cpv:
             problems.append("embedded provenance != hashed provenance")
         # S6: the data-library pin must be well-formed: a real `sha256:<64 lowercase hex>`. This catches
@@ -1151,8 +1541,11 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
         # digest) the digest is mandatory: a null/missing digest is a name with nothing committing to the
         # bytes. There is no digest-less exception for any name.
         if isinstance(prov_val, dict):
+            _check_required_provenance(prov_val, problems)
+            _check_optional_provenance(prov_val, problems)
             dl = prov_val.get("data_library")
             dls = prov_val.get("data_library_sha256")
+            _no_null_leaf(prov_val, "data_library", "provenance data_library", problems)
             if dl is not None and not (isinstance(dl, str) and dl):
                 problems.append(f"provenance data_library is not a non-empty string: {dl!r}")
             if isinstance(dl, str) and dl:
@@ -1209,7 +1602,7 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
     if attestation_problems is not None and attestations_out is not None:
         _check_attestations(bundle, recomputed_bundle, attestation_problems, attestations_out)
 
-    return _check_signature(bundle, recomputed_bundle, problems, origin_problems, profile)
+    return _check_signature(bundle, recomputed_bundle, problems, origin_problems, profile, sig_out=sig_out)
 
 
 # ====================================================================================================
@@ -1240,6 +1633,10 @@ LINK_CONSUMED_UNVERIFIABLE = "consumed-unverifiable"
 LINK_CONSUMED_MISMATCH = "consumed-mismatch"
 LINK_CROSS_CAPABILITY_MISMATCH = "cross-capability-mismatch"
 LINK_CYCLE = "cycle"
+#: ADR-050 fail-FORWARD at the chain level: an upstream sealed under a canon this verifier cannot apply is
+#: INCOMPLETE (get a newer verifier), never a tamper FAIL -- the same distinction the single-bundle verdict
+#: makes. Without this the walker would collapse a legitimate newer-canon upstream into `FAIL`/"tampered".
+LINK_UNSUPPORTED_CANON = "unsupported-canon"
 
 #: Chain verdicts.
 CHAIN_VERIFIED = "verified"
@@ -1259,6 +1656,7 @@ _LINK_RANK = {
     LINK_INTEGRITY_ONLY: 2,
     LINK_UNRESOLVED: 1,
     LINK_CONSUMED_UNVERIFIABLE: 1,
+    LINK_UNSUPPORTED_CANON: 1,          # fail-FORWARD: incomplete (get a newer verifier), not a tamper FAIL
     LINK_FAIL: 0,
     LINK_CONSUMED_MISMATCH: 0,
     LINK_CROSS_CAPABILITY_MISMATCH: 0,
@@ -1378,10 +1776,14 @@ def index_upstreams(bundles, *, profile=None) -> dict[str, dict]:
     return index
 
 
-def _digest_of_value(value: Any) -> str | None:
+def _digest_of_value(value: Any, canon_fn=_canon) -> str | None:
+    """`sha(canon_fn(value))`, or None when the value cannot be canonicalized (never a traceback: the walker
+    must answer with a verdict on any in-memory object, incl. a non-string key, which v2's key sort cannot
+    encode). Under canon v2 a bare integer outside +/-(2^53-1) cannot be canonicalized (`_v2_number` refuses
+    it), so it digests to None -- a v2 link cannot bind a float to a different, merely nearby big int."""
     try:
-        return _sha(_canon(value))
-    except (TypeError, ValueError):
+        return _sha(canon_fn(value))
+    except (TypeError, ValueError, AttributeError, RecursionError):
         return None
 
 
@@ -1407,8 +1809,34 @@ def _own_inputs(citing: dict) -> Any:
     return value["inputs"]
 
 
-def _consumed_verdict(link: dict, up: dict, own_inputs: Any) -> tuple[str, str] | None:
-    """Check the consumed value on BOTH ends of a link whose upstream is intact; None = it binds."""
+def _citing_canon_version(citing: Any) -> int | None:
+    """The canon_version a citing bundle's links were digested under (ADR-054): its OWN sealed version, or
+    None when it is not a supported one. `_walk` only walks a citing bundle that classified intact, so None
+    is not expected; if it ever happens every link reads `consumed-mismatch` (fail-closed, no v1 guess)."""
+    sums = citing.get("sha256sums") if isinstance(citing, dict) else None
+    problem, version, newer = _read_canon_version(sums)
+    if problem is None and not newer and version in _CANON:
+        return version
+    return None
+
+
+def _consumed_verdict(link: dict, up: dict, own_inputs: Any, citing_cv: int | None = 1) -> tuple[str, str] | None:
+    """Check the consumed value on BOTH ends of a link whose upstream is intact; None = it binds.
+
+    ADR-054: `consumed.sha256` is taken under the CITING bundle's canon, so BOTH ends -- the upstream's result
+    value and the citing bundle's own sealed input -- are re-digested under that canon. The citing canon must
+    be AT LEAST the upstream's: a v1 digest is spelling-sensitive (`2.0` != `2`) while a v2 upstream's seal is
+    not (JCS writes both as `2`), so a v1 link to a v2 upstream would bind or not depending on how the
+    upstream's JSON text happens to be spelled, not on what was sealed. Such a link never binds."""
+    if citing_cv is None:
+        return (LINK_CONSUMED_MISMATCH, "the citing bundle's canon_version is unreadable; the link cannot be bound")
+    up_cv = up["sha256sums"].get("canon_version") if isinstance(up.get("sha256sums"), dict) else None
+    if not isinstance(up_cv, int) or isinstance(up_cv, bool) or up_cv > citing_cv:
+        return (LINK_CONSUMED_MISMATCH,
+                (f"a canon_version {citing_cv} link cannot bind a canon_version {up_cv!r} upstream: the citing "
+                 "canon must be at least the upstream's (ADR-054), else the binding depends on how the "
+                 "upstream's JSON is spelled rather than on what it sealed"))
+    canon_fn = _CANON[citing_cv]
     consumed = link["consumed"]
     res_blk = up["manifest"]["result"]
     if "value" not in res_blk:
@@ -1417,7 +1845,7 @@ def _consumed_verdict(link: dict, up: dict, own_inputs: Any) -> tuple[str, str] 
     if not found:
         return (LINK_CONSUMED_MISMATCH,
                 f"consumed.path {consumed['path']!r} does not resolve in the upstream result core")
-    if _digest_of_value(value) != consumed["sha256"]:
+    if _digest_of_value(value, canon_fn) != consumed["sha256"]:
         return (LINK_CONSUMED_MISMATCH,
                 "the value at consumed.path in the upstream result does not have the sealed consumed.sha256")
     if own_inputs is None:
@@ -1429,7 +1857,7 @@ def _consumed_verdict(link: dict, up: dict, own_inputs: Any) -> tuple[str, str] 
                  "there is no sealed input to bind the consumed value to"))
     if consumed["input"] not in own_inputs:
         return (LINK_CONSUMED_MISMATCH, f"names input {consumed['input']!r}, which the citing bundle did not seal")
-    if _digest_of_value(own_inputs[consumed["input"]]) != consumed["sha256"]:
+    if _digest_of_value(own_inputs[consumed["input"]], canon_fn) != consumed["sha256"]:
         return (LINK_CONSUMED_MISMATCH,
                 (f"the citing bundle's sealed input {consumed['input']!r} is not the consumed value (a link to "
                  "an upstream that did not feed this result: decoration, not binding)"))
@@ -1577,6 +2005,7 @@ def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, 
     _, prov = _sealed_provenance(citing)
     links = prov["derived_from"]                      # well-formed: the citing bundle classified intact
     own_inputs = _own_inputs(citing)
+    citing_cv = _citing_canon_version(citing)          # ADR-054: links are digested under the citing canon
     citing_cap = _sealed_capability(citing)
     allowed = _consumes_policy(citing_cap, citing_seal, consumes_of, report, state)
     for i, link in enumerate(links):
@@ -1606,6 +2035,14 @@ def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, 
         if rep is None:
             rep = state["classified"][target] = _classify_chain(up, profile)
         entry["signer"], entry["signer_is_demo"] = rep["signer"], rep["signer_is_demo"]
+        if rep["state"] == STATE_UNSUPPORTED_CANON:
+            # ADR-050 fail-FORWARD: the upstream's header seals + signs but was sealed under a newer canon
+            # this verifier cannot apply. That is INCOMPLETE (get a newer verifier), NOT tampering -- mirror
+            # the single-bundle verdict instead of collapsing it into an integrity FAIL.
+            _finish(entry, ranks, LINK_UNSUPPORTED_CANON,
+                    "upstream sealed under a newer canon this verifier cannot check: "
+                    + "; ".join(rep["integrity_problems"][:1]))
+            continue
         if not rep["integrity_ok"]:
             _finish(entry, ranks, LINK_FAIL, "upstream fails integrity: " + "; ".join(rep["integrity_problems"][:3]))
             continue
@@ -1616,7 +2053,7 @@ def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, 
             _finish(entry, ranks, LINK_FAIL, "upstream digest-list != the sha256sums the link sealed")
             continue
         entry["upstream_capability"] = _sealed_capability(up)
-        verdict = (_consumed_verdict(link, up, own_inputs) or _structural_verdict(link, up)
+        verdict = (_consumed_verdict(link, up, own_inputs, citing_cv) or _structural_verdict(link, up)
                    or _consumes_verdict(citing_cap, up, allowed))
         if verdict is not None:
             _finish(entry, ranks, *verdict)

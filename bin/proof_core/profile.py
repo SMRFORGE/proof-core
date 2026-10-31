@@ -43,8 +43,10 @@ class Profile:
     # --- shape tags (mint + verify) -------------------------------------------------------------- #
     #: top-level bundle `schema` literal (mint) / the only accepted envelope schema (verify). ADR-049
     #: bumped this v1 -> v2 with the one-time shape change (no host, machine axis, binding chain, prose-free
-    #: redaction): the neutral envelope shape genuinely moved, so its tag moves with it.
-    envelope_schema: str = "evidence.envelope.v2"
+    #: redaction): the neutral envelope shape genuinely moved, so its tag moves with it. ADR-050 bumps
+    #: v2 -> v3 for the one-time header-shape move (`canon_version` added inside `sha256sums`); the tag names
+    #: the structural SHAPE, orthogonal to `canon_version`, which names the canonicalization ALGORITHM.
+    envelope_schema: str = "evidence.envelope.v3"
     #: embedded result-core `schema` literal and its integer `schema_version` (mint).
     result_schema: str = "evidence.result.v1"
     result_schema_version: int = 1
