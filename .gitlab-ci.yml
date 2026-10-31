@@ -21,7 +21,7 @@ stages: [check]
 .git:
   before_script:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git diffutils
-    - PC_SHA=$(grep -m1 -oE 'main commit:\*\* *[0-9a-f]{7,40}' VENDORED.md | grep -oE '[0-9a-f]{7,40}$' || true)
+    - PC_SHA=$(grep -m1 -oE 'main commit:\*\* *[0-9a-f]{7,40}' VENDORED.md | grep -oE '[0-9a-f]{7,40}$' | head -1 || true)
 
 vendored:
   stage: check
@@ -34,13 +34,14 @@ smoke:
   script:
     - PYTHONPATH=bin python -c "import proof_core, proof_verify; print('proof_core', proof_core.__version__)"
     - PYTHONPATH=bin python -m proof_verify --help > /dev/null
+    - PYTHONPATH=bin python -m proof_core --help > /dev/null   # the entry point SKILL.md documents
 
 freshness:
   stage: check
   extends: .git
   allow_failure: true
   script:
-    - git clone --quiet "$PROOF_CORE_URL" /tmp/pc
+    - git clone --quiet "$PROOF_CORE_URL" /tmp/pc   # FULL clone: describe --tags and short-SHA rev-parse need history
     - TAG=$(git -C /tmp/pc describe --tags --abbrev=0 origin/main)
     - echo "latest release $TAG = $(git -C /tmp/pc rev-parse --short "$TAG^{commit}"); vendored = $PC_SHA"
     - test "$(git -C /tmp/pc rev-parse "$TAG^{commit}")" = "$(git -C /tmp/pc rev-parse "$PC_SHA^{commit}")"

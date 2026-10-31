@@ -7,6 +7,7 @@ set -eu
 url="$1"; sha="$2"; shift 2
 [ -n "$sha" ] || { echo "check_vendored: no commit recorded in VENDORED.md for $url" >&2; exit 2; }
 work=$(mktemp -d)
+# FULL clone on purpose: VENDORED.md records a short SHA, which a --depth 1 clone cannot resolve.
 git clone --quiet "$url" "$work/up"
 git -C "$work/up" checkout --quiet "$sha"
 rc=0
