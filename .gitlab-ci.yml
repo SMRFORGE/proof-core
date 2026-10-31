@@ -8,8 +8,10 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "main"
 
+# Images are pinned by digest so a commit always builds against the same image. To refresh one:
+#   docker buildx imagetools inspect <image:tag>   (copy the top-level Digest)
 default:
-  image: python:3.11-slim
+  image: python:3.11-slim@sha256:673719e071ecf27434fd2635bbd8d00f49f4fdd81f243143438a42ced8bedf60
   interruptible: true
 
 variables:
