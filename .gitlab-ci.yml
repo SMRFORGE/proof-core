@@ -47,3 +47,15 @@ freshness:
     - TAG=$(git -C /tmp/pc describe --tags --abbrev=0 origin/main)
     - echo "latest release $TAG = $(git -C /tmp/pc rev-parse --short "$TAG^{commit}"); vendored = $PC_SHA"
     - test "$(git -C /tmp/pc rev-parse "$TAG^{commit}")" = "$(git -C /tmp/pc rev-parse "$PC_SHA^{commit}")"
+
+image-pins:
+  # Monthly (scheduled pipelines only): report any pinned image whose tag now points at a newer digest, so the
+  # pins get refreshed for security patches. Advisory: it never blocks a merge.
+  stage: check
+  image: python:3.11-slim@sha256:673719e071ecf27434fd2635bbd8d00f49f4fdd81f243143438a42ced8bedf60
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  allow_failure: true
+  before_script: []
+  script:
+    - python tools/check_image_pins.py .gitlab-ci.yml
