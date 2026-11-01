@@ -139,6 +139,24 @@ def _profile_value(profile, name, default):
     return getattr(profile, name, default)
 
 
+#: Origin problem for a profile whose pin is present but not 64 lowercase hex. A malformed pin can never be
+#: a trust root, so it fails origin closed (integrity is unaffected), on every path that reads the pin.
+_MALFORMED_PIN_PROBLEM = "profile pinned_pubkey is not 64 lowercase hex; origin cannot be established"
+
+
+def _profile_pin(profile):
+    """The profile's origin pin as ``(pin, malformed)``. ``(None, False)``: no profile pin (use the module pin).
+    ``(pin, False)``: a well-formed pin. ``(None, True)``: a pin is present but malformed (an empty string, a
+    non-string, upper-case hex...). A duck-typed profile is not validated by ``Profile.__post_init__``, so the
+    verifier checks the shape itself; every reader of the pin goes through here so they cannot disagree."""
+    pin = _profile_value(profile, "pinned_pubkey", None)
+    if pin is None:
+        return None, False
+    if isinstance(pin, str) and _PUBKEY_HEX_RE.fullmatch(pin):
+        return pin, False
+    return None, True
+
+
 def pinned_key_is_demo() -> bool:
     """True while the verifier pins the public demo identity -- a passing verify then proves integrity
     (not edited), not origin. proof-core pins the demo key until it earns its own production trust root,
@@ -617,14 +635,78 @@ def _add(p: tuple[int, int], q: tuple[int, int]) -> tuple[int, int]:
     return (x3, y3)
 
 
+# Scalar multiplication runs in extended coordinates (X:Y:Z:T), x = X/Z, y = Y/Z, xy = T/Z (RFC 8032
+# 5.1.4), so no addition or doubling needs a modular inverse; the one inverse is paid in `_affine` when the
+# multiple is compared. The affine `_add` above costs two inverses per addition (~200 ms a verify). Unified
+# addition "add-2008-hwcd-3" (complete on Ed25519) and doubling "dbl-2008-hwcd", as RFC 8032 gives them.
+# Written for this verifier alone; it shares no code or imports with proof_core.signing. That is code
+# independence, NOT independent derivation: both files transcribe the same RFC formulas, so a typo made in
+# both would agree with itself. The real independent reference is the RFC 8032 known-answer vectors and the
+# OpenSSL (`cryptography`) cross-check in tests/test_ed25519_extended_coords.py.
+_D2 = 2 * _D % _Q
+
+
+def _ext_add(p: tuple[int, int, int, int], q: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _Q
+    b = (y1 + x1) * (y2 + x2) % _Q
+    c = t1 * _D2 * t2 % _Q
+    d = z1 * 2 * z2 % _Q
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % _Q, g * h % _Q, f * g % _Q, e * h % _Q)
+
+
+def _ext_dbl(p: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    x1, y1, z1, _ = p
+    a = x1 * x1 % _Q
+    b = y1 * y1 % _Q
+    c = 2 * z1 * z1 % _Q
+    h = a + b
+    e = h - (x1 + y1) * (x1 + y1) % _Q
+    g = a - b
+    f = c + g
+    return (e * f % _Q, g * h % _Q, f * g % _Q, e * h % _Q)
+
+
+def _affine(p: tuple[int, int, int, int]) -> tuple[int, int]:
+    zinv = pow(p[2], _Q - 2, _Q)
+    return (p[0] * zinv % _Q, p[1] * zinv % _Q)
+
+
 def _mul(p: tuple[int, int], e: int) -> tuple[int, int]:
-    result = (0, 1)
+    # Affine in, affine out: the same point the affine double-and-add returned.
+    x, y = p
+    acc = (0, 1, 1, 0)
+    cur = (x % _Q, y % _Q, 1, x * y % _Q)
     while e > 0:
         if e & 1:
-            result = _add(result, p)
-        p = _add(p, p)
+            acc = _ext_add(acc, cur)
+        cur = _ext_dbl(cur)
         e >>= 1
-    return result
+    return _affine(acc)
+
+
+# [2^i]B for i = 0..252, so [e]B is additions only. B has prime order L, so [e]B == [e mod L]B.
+_BASE_DOUBLINGS = [(_BASE[0], _BASE[1], 1, _BASE[0] * _BASE[1] % _Q)]
+while len(_BASE_DOUBLINGS) < 253:
+    _BASE_DOUBLINGS.append(_ext_dbl(_BASE_DOUBLINGS[-1]))
+
+
+def _mul_base(e: int) -> tuple[int, int]:
+    # Same point as _mul(_BASE, e). A negative e gives the identity, as _mul does (its loop never runs);
+    # that is checked before the mod-L reduction, which would otherwise give [e mod L]B.
+    if e < 0:
+        return (0, 1)
+    acc = (0, 1, 1, 0)
+    e %= _L
+    for pt in _BASE_DOUBLINGS:
+        if e == 0:
+            break
+        if e & 1:
+            acc = _ext_add(acc, pt)
+        e >>= 1
+    return _affine(acc)
 
 
 def _on_curve(p: tuple[int, int]) -> bool:
@@ -684,7 +766,7 @@ def _ed25519_verify(signature: bytes, msg: bytes, pubkey: bytes) -> bool:
     if s >= _L:                                   # reject a non-canonical / malleable scalar (RFC 8032)
         return False
     k = int.from_bytes(hashlib.sha512(signature[:32] + pubkey + msg).digest(), "little")
-    return _mul(_BASE, s) == _add(r_point, _mul(a_point, k))
+    return _mul_base(s) == _add(r_point, _mul(a_point, k))
 
 
 def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
@@ -771,8 +853,10 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
     # verifier's module-global pin unchanged -- the neutral default -- so the deliberate single-pin design
     # is intact unless a caller opts a profile in. This never affects INTEGRITY (checked above under the
     # embedded key); it only decides which key counts as "origin".
-    pinned = _profile_value(profile, "pinned_pubkey", None) or _PINNED_PUBKEY
-    if signer != pinned:
+    profile_pin, malformed_pin = _profile_pin(profile)
+    if malformed_pin:
+        origin_problems.append(_MALFORMED_PIN_PROBLEM)
+    elif signer != (profile_pin or _PINNED_PUBKEY):
         origin_problems.append("signature is not under the pinned public key")
     return signer
 
@@ -1246,7 +1330,7 @@ def classify_bundle(bundle: dict, *, profile=None) -> dict:
     # so such a pin is treated as demo (integrity-only) even when the literal match does not hold. It
     # defaults False and `_profile_value` returns False for `profile is None`, so the neutral / no-profile
     # path is byte/verdict-identical.
-    profile_pin = _profile_value(profile, "pinned_pubkey", None)
+    profile_pin, _malformed = _profile_pin(profile)   # a malformed pin already failed origin in _check_signature
     profile_declares_demo = _profile_value(profile, "pin_is_demo", False)
     if profile_pin is None:
         effective_pin = _PINNED_PUBKEY

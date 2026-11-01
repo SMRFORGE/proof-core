@@ -10,8 +10,11 @@ DEMO: a self-contained RFC 8032 Ed25519 (stdlib `hashlib` only) with a hardcoded
 so the project stays dependency-free AND the standalone verifier can check a REAL
 signature with its own independent implementation. Swap in a vetted library + HSM for prod.
 
-`pow(x, -1, q)`-style modular inverse via the builtin keeps the field ops at C speed, so a
-sign is a few milliseconds despite being pure Python.
+Scalar multiplication runs in extended twisted-Edwards coordinates (RFC 8032 5.1.4), so the
+only modular inverse (the builtin `pow(x, q - 2, q)`) is paid once per multiple, not per addition;
+a sign is about a millisecond despite being pure Python. This signer is NOT constant-time: the
+double-and-add branches on secret scalar bits. It is for demo/dev keys only; production signing
+uses a hardware-held key.
 """
 from __future__ import annotations
 
@@ -53,20 +56,93 @@ def _edwards(p: tuple[int, int], qq: tuple[int, int]) -> tuple[int, int]:
     return (x3, y3)
 
 
+# --- extended twisted-Edwards coordinates (RFC 8032 5.1.4) ---
+# A point (x, y) is held as (X, Y, Z, T) with x = X/Z, y = Y/Z, x*y = T/Z. Addition and doubling then need
+# NO modular inverse; the single inverse is paid once, in `_to_affine`, when a scalar multiple is encoded or
+# compared. Affine `_edwards` costs two inverses PER addition, which is what made a verify ~200 ms. The
+# formulas are the unified "add-2008-hwcd-3" (complete on Ed25519: a = -1 is a square, d is not) and
+# "dbl-2008-hwcd", exactly as RFC 8032 5.1.4 gives them. Same points, same bytes, same accept/reject.
+_d2 = 2 * _d % _q
+
+
+def _to_extended(p: tuple[int, int]) -> tuple[int, int, int, int]:
+    x, y = p
+    return (x % _q, y % _q, 1, x * y % _q)
+
+
+def _to_affine(p: tuple[int, int, int, int]) -> tuple[int, int]:
+    x, y, z, _t = p
+    zi = _inv(z)
+    return (x * zi % _q, y * zi % _q)
+
+
+def _ext_add(p: tuple[int, int, int, int], qq: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = qq
+    a = (y1 - x1) * (y2 - x2) % _q
+    b = (y1 + x1) * (y2 + x2) % _q
+    c = t1 * _d2 * t2 % _q
+    dd = z1 * 2 * z2 % _q
+    e, f, g, h = b - a, dd - c, dd + c, b + a
+    return (e * f % _q, g * h % _q, f * g % _q, e * h % _q)
+
+
+def _ext_double(p: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    x1, y1, z1, _t1 = p
+    a = x1 * x1 % _q
+    b = y1 * y1 % _q
+    c = 2 * z1 * z1 % _q
+    h = a + b
+    e = h - (x1 + y1) * (x1 + y1) % _q
+    g = a - b
+    f = c + g
+    return (e * f % _q, g * h % _q, f * g % _q, e * h % _q)
+
+
+def _ext_scalarmult(p: tuple[int, int, int, int], e: int) -> tuple[int, int, int, int]:
+    # Iterative double-and-add over the scalar's bits (never recursive; see `_scalarmult`).
+    result = (0, 1, 1, 0)
+    addend = p
+    while e > 0:
+        if e & 1:
+            result = _ext_add(result, addend)
+        addend = _ext_double(addend)
+        e >>= 1
+    return result
+
+
 def _scalarmult(p: tuple[int, int], e: int) -> tuple[int, int]:
     # Iterative double-and-add. This was recursive to depth ~e.bit_length(); `sign` and `verify` feed
     # it the UNREDUCED 512-bit SHA-512 scalars r and k (~510 bits), so under a lowered recursion limit
     # or a deep call stack it could raise an uncaught RecursionError (only _decodepoint was guarded),
     # diverging from the standalone verifiers' iterative _mul which return a clean bool. Same result,
-    # no recursion.
-    result = (0, 1)
-    addend = p
+    # no recursion. Affine in, affine out; the work is done in extended coordinates.
+    return _to_affine(_ext_scalarmult(_to_extended(p), e))
+
+
+# [2^i]B for i < 253, built once at import, so a multiple of the base point is additions only (no
+# doublings). B has prime order L, so [e]B == [e mod L]B and every reduced scalar fits in 253 bits.
+_B_TABLE: list[tuple[int, int, int, int]] = [_to_extended(_B)]
+for _ in range(252):
+    _B_TABLE.append(_ext_double(_B_TABLE[-1]))
+
+
+def _scalarmult_base(e: int) -> tuple[int, int]:
+    """[e]B, the same point `_scalarmult(_B, e)` returns, via the precomputed `_B_TABLE`.
+
+    A negative e returns the identity, exactly as `_scalarmult(_B, e)` does (its loop never runs);
+    it is checked BEFORE the mod-L reduction, which would otherwise turn it into [e mod L]B."""
+    if e < 0:
+        return (0, 1)
+    e %= _L
+    result = (0, 1, 1, 0)
+    i = 0
     while e > 0:
         if e & 1:
-            result = _edwards(result, addend)
-        addend = _edwards(addend, addend)
+            result = _ext_add(result, _B_TABLE[i])
         e >>= 1
-    return result
+        i += 1
+    return _to_affine(result)
 
 
 def _hbytes(m: bytes) -> bytes:
@@ -93,14 +169,14 @@ def _encodepoint(p: tuple[int, int]) -> bytes:
 
 def publickey(sk: bytes) -> bytes:
     a = _secret_scalar(_hbytes(sk))
-    return _encodepoint(_scalarmult(_B, a))
+    return _encodepoint(_scalarmult_base(a))
 
 
 def sign(msg: bytes, sk: bytes, pk: bytes) -> bytes:
     h = _hbytes(sk)
     a = _secret_scalar(h)
     r = _hint(h[32:64] + msg)
-    renc = _encodepoint(_scalarmult(_B, r))
+    renc = _encodepoint(_scalarmult_base(r))
     s = (r + _hint(renc + pk + msg) * a) % _L
     return renc + s.to_bytes(32, "little")
 
@@ -166,7 +242,7 @@ def verify(signature: bytes, msg: bytes, pk: bytes) -> bool:
     if s >= _L:                                   # reject a non-canonical / malleable scalar (RFC 8032)
         return False
     k = int.from_bytes(hashlib.sha512(signature[:32] + pk + msg).digest(), "little")
-    return _scalarmult(_B, s) == _edwards(r_point, _scalarmult(a_point, k))
+    return _scalarmult_base(s) == _edwards(r_point, _scalarmult(a_point, k))
 
 
 # --- the signing identity ---

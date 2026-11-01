@@ -6,7 +6,7 @@
     {
       "name": "proof-core",
       "source": "./",
-      "description": "Seal/verify/reproduce an agent's computed result into a re-runnable, tamper-evident evidence bundle. Vendored open proof-core v0.20.0; offline, no install, no account."
+      "description": "Seal/verify/reproduce an agent's computed result into a re-runnable, tamper-evident evidence bundle. Vendored open proof-core v0.20.1; offline, no install, no account."
     }
   ]
 }

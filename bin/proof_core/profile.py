@@ -81,7 +81,7 @@ class Profile:
     certification_schema: str = "evidence.certification.v1"
     #: sealed `data` pins compared INFORMATIONALLY (a difference is a note, never a hard environment block) --
     #: e.g. a path-sensitive library INDEX hash. A dialect whose informational pin has a different name
-    #: (a reactor consumer's `cross_sections_sha256`, say) replaces this tuple.
+    #: (a consumer's `dataset_index_sha256`, say) replaces this tuple.
     env_informational: tuple[str, ...] = ("data_index_sha256",)
     #: sealed `data` run controls a genuine reproduction must have re-used (compared HARD, alongside every
     #: `*_sha256`). A dialect whose run is parameterized differently (particle counts, batches) replaces this.
