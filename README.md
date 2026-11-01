@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/proof-core-banner.png" alt="proof-core" width="880">
+</p>
+
 # proof-core plugin
 
 **Give a Claude Code agent three verbs: seal a result, verify a record, re-run it.** Not "trust us". Check us.
