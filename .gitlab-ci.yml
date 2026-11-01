@@ -13,6 +13,7 @@ workflow:
 default:
   image: python:3.11-slim@sha256:673719e071ecf27434fd2635bbd8d00f49f4fdd81f243143438a42ced8bedf60
   interruptible: true
+  tags: [proof-core]          # run only on the proof-core group self-hosted runner
 
 variables:
   PROOF_CORE_URL: https://gitlab.com/proof-core/proof-core.git
