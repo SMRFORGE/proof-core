@@ -87,8 +87,11 @@ edited here. CI checks it still matches upstream. See [VENDORED.md](VENDORED.md)
 
 ## The proof-core family
 
-Every repo is MIT and lives at [gitlab.com/proof-core](https://gitlab.com/proof-core). They all make or check
-the same bundle format, so a bundle made by any of them is checked by the same verifiers.
+Every repo lives at [gitlab.com/proof-core](https://gitlab.com/proof-core). The code repos are MIT; envelope-spec,
+the format standard, is Apache-2.0. They all make or check the same bundle format, so a bundle made by any of
+them is checked by the same verifiers.
+
+The bundles this plugin makes follow [envelope-spec](https://gitlab.com/proof-core/envelope-spec).
 
 ```mermaid
 flowchart LR
@@ -115,7 +118,8 @@ flowchart LR
 |---|---|
 | [proof-core](https://gitlab.com/proof-core/proof-core) | seal, verify and reproduce any computed result (Python, standard library only) |
 | [pytest-proof-core](https://gitlab.com/proof-core/pytest-proof-core) | seal each test's outcome and re-check it later in CI |
-| [mcp](https://gitlab.com/proof-core/mcp) | record an agent's MCP tool calls, seal the run, and check it with `proof-accept` |
+| [envelope-spec](https://gitlab.com/proof-core/envelope-spec) | the bundle format's written standard: spec, JSON Schema, and 79 conformance vectors to test any verifier against |
+| [mcp](https://gitlab.com/proof-core/mcp) | v0.1.0: code-mode receipts, MCP over stdio and streamable HTTP, loop consistency receipts for ordinary tool-calling loops, and `proof-accept` to accept or reject a sealed run |
 | [proof-core-kernel-js](https://gitlab.com/proof-core/proof-core-kernel-js) | verify bundles in Node or a browser, with no dependencies |
 | [skill](https://gitlab.com/proof-core/skill) **(this repo)** | give a Claude Code agent seal, verify and reproduce as a skill |
 | [pytest-proof-core-plugin](https://gitlab.com/proof-core/pytest-proof-core-plugin) | the pytest plugin, packaged for Claude Code |
