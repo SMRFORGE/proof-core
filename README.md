@@ -97,14 +97,14 @@ The bundles this plugin makes follow [envelope-spec](https://gitlab.com/proof-co
 flowchart LR
     subgraph make["Make a bundle"]
         PT["pytest-proof-core<br/>seal test outcomes"]
-        MCP["mcp<br/>seal an agent's tool-calling run"]
+        MCP["proof-mcp<br/>seal an agent's tool-calling run"]
         SK["skill, pytest-proof-core-plugin<br/>Claude Code plugins"]
     end
     K["proof-core<br/>the kernel: seal, verify, reproduce"]
     subgraph check["Check a bundle"]
         PV["proof-verify<br/>Python, in proof-core"]
         JS["@proof-core/verify<br/>JavaScript, proof-core-kernel-js"]
-        PA["proof-accept<br/>agent runs, in mcp"]
+        PA["proof-accept<br/>agent runs, in proof-mcp"]
     end
     PT --> K
     MCP --> K
@@ -119,7 +119,7 @@ flowchart LR
 | [proof-core](https://gitlab.com/proof-core/proof-core) | seal, verify and reproduce any computed result (Python, standard library only) |
 | [pytest-proof-core](https://gitlab.com/proof-core/pytest-proof-core) | seal each test's outcome and re-check it later in CI |
 | [envelope-spec](https://gitlab.com/proof-core/envelope-spec) | the bundle format's written standard: spec, JSON Schema, and 79 conformance vectors to test any verifier against |
-| [mcp](https://gitlab.com/proof-core/mcp) | v0.1.0: code-mode receipts, MCP over stdio and streamable HTTP, loop consistency receipts for ordinary tool-calling loops, and `proof-accept` to accept or reject a sealed run |
+| [proof-mcp](https://gitlab.com/proof-core/proof-mcp) | v0.2.0: code-mode receipts, MCP over stdio and streamable HTTP, async hosts, loop consistency receipts for ordinary tool-calling loops, and `proof-accept` to accept or reject a sealed run |
 | [proof-core-kernel-js](https://gitlab.com/proof-core/proof-core-kernel-js) | verify bundles in Node or a browser, with no dependencies |
 | [skill](https://gitlab.com/proof-core/skill) **(this repo)** | give a Claude Code agent seal, verify and reproduce as a skill |
 | [pytest-proof-core-plugin](https://gitlab.com/proof-core/pytest-proof-core-plugin) | the pytest plugin, packaged for Claude Code |
