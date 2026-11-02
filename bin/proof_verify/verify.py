@@ -30,13 +30,67 @@ real production trust root is pinned. Callers that only need integrity use `inte
 """
 from __future__ import annotations
 
+import copy
 import hashlib
+import hmac
 import json
 import math
 import re
 import sys
 from decimal import Decimal
 from typing import Any
+
+
+def safe_text(text: Any) -> str:
+    """Make text safe to print on a terminal: printable ASCII and newlines pass through, every other character
+    (ESC and every control character, DEL, every non-ASCII character such as a look-alike letter or a direction
+    mark) is written as a Python-style escape (``\\x1b``, ``\\u202e``, ``\\U0001f600``). A fixed rule, not
+    ``str.isprintable()``, so the same bundle prints the same text on every Python. The JSON outputs never need it:
+    ``json.dumps`` already escapes every non-ASCII character."""
+    out = []
+    for ch in str(text):
+        if " " <= ch <= "~" or ch == "\n":
+            out.append(ch)
+            continue
+        o = ord(ch)
+        out.append(f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}")
+    return "".join(out)
+
+
+class _SafeStream:
+    """A text stream that passes everything written to it through `safe_text` (see `safe_terminal_output`)."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, s: str) -> int:
+        return self._stream.write(safe_text(s))
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+class safe_terminal_output:  # a context manager, named in lower case like contextlib's helpers
+    """Context manager: while active, ``sys.stdout`` and ``sys.stderr`` escape everything printed through them with
+    `safe_text`. The text-mode CLIs print bundle-derived strings (problem lists, link details, capability names);
+    a bundle must never be able to send a terminal escape sequence (clear the screen, recolour, forge an "OK"
+    line). Disabled (``enabled=False``) it changes nothing, for the JSON modes."""
+
+    def __init__(self, enabled: bool = True):
+        self._enabled = enabled
+        self._saved = None
+
+    def __enter__(self):
+        if self._enabled:
+            self._saved = (sys.stdout, sys.stderr)
+            sys.stdout, sys.stderr = _SafeStream(sys.stdout), _SafeStream(sys.stderr)
+        return self
+
+    def __exit__(self, *exc):
+        if self._saved is not None:
+            sys.stdout, sys.stderr = self._saved
+            self._saved = None
+        return False
 
 _RESULT_REQUIRED = ("schema", "schema_version", "result", "fidelity", "verdict")
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -218,6 +272,337 @@ def key_label(pubkey_hex: str | None) -> str:
     return "no readable key"
 
 
+# --- pin sets and the receiver policy's pin input (SPEC v4 draft 7.11, 7.12, 13.4.1) --------------------------
+# SPEC 7.12: "A verifier is configured with a **pin set**: the `pins` array of the effective receiver policy
+# (13.4.1). Each entry is a closed object with **exactly one** of: `key_id`, per 7.11; or `legacy_raw_key`, 64
+# lowercase hex characters ... plus `demo` (boolean, REQUIRED) and `label` (OPTIONAL restricted text, 1 to 256 code
+# points, shown only, never compared)." The same semantics as kernel-js `_resolvePins` (its MR !16).
+
+class PolicyError(ValueError):
+    """A malformed receiver policy or pin set. SPEC 13.4.1: "A verifier MUST refuse a malformed policy: the library
+    raises an error, and the CLI exits 2 with no verdict. It MUST NOT fall back to the default policy." ``kind`` is
+    the runner protocol v2 error kind (13.3, ``expect_error: "policy"``)."""
+
+    kind = "policy"
+
+
+class PolicyUnsupportedError(PolicyError):
+    """A WELL-FORMED receiver policy member this release does not evaluate (any value other than its default).
+    Refused rather than ignored, so a caller who sets one never believes it ran; a distinct kind from a malformed
+    policy (``policy``). Full policy evaluation (quorum, suites, aging, roles, TSAs, archive) comes in later releases."""
+
+    kind = "policy_unsupported"
+
+
+#: SIG-25: "A key id MUST match `[a-z0-9][a-z0-9.+\-]{0,31}:sha256:[0-9a-f]{64}`". The three-part form also refuses
+#: a bare `alg:<hex>` string (SIG-26: "v4 policy input MUST NOT accept a bare `alg:<hex>` string as a key id").
+_KEY_ID_RE = re.compile(r"[a-z0-9][a-z0-9.+\-]{0,31}:sha256:[0-9a-f]{64}", re.ASCII)
+_PIN_KEYS = frozenset({"key_id", "legacy_raw_key", "demo", "label"})
+_MAX_PINS = 64                                   # 13.4.1: "array of 0 to 64 pin objects"
+POLICY_SCHEMA = "evidence.receiver-policy.v1"
+
+
+def key_id(alg: str, public_key_hex: str) -> str:
+    """SPEC 7.11: ``key_id = alg || ":sha256:" || lowerhex(SHA-256(public_key bytes))``."""
+    return f"{alg}:sha256:" + hashlib.sha256(bytes.fromhex(public_key_hex)).hexdigest()
+
+
+#: The demo key's id (SPEC section 2: "key id `ed25519:sha256:7cb4fd86...`"). The P-256 demo key joins this set when
+#: section 2 names its value (SIG-28: "The P-256 part takes effect when the P-256 demo key is written into section 2").
+DEMO_KEY_ID = key_id("ed25519", _DEMO_PUBKEY)
+_DEMO_KEY_IDS = frozenset({DEMO_KEY_ID})
+
+#: SPEC 2.2: the frozen DICP-18 table (Unicode 18.0.0 Default_Ignorable_Code_Point, 27 ranges, 4,174 code points).
+#: Rule 1: "An implementation MUST test DICP-18 membership against exactly this table. It MUST NOT consult its
+#: runtime's Unicode tables".
+_DICP18 = (
+    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160), (0x17B4, 0x17B5),
+    (0x180B, 0x180D), (0x180E, 0x180E), (0x180F, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E),
+    (0x2060, 0x2064), (0x2065, 0x2065), (0x2066, 0x206F), (0x3164, 0x3164), (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0000), (0xE0001, 0xE0001), (0xE0002, 0xE001F), (0xE0020, 0xE007F), (0xE0080, 0xE00FF),
+    (0xE0100, 0xE01EF), (0xE01F0, 0xE0FFF),
+)
+
+
+def _forbidden_code_point(cp: int) -> bool:
+    """The forbidden set F of SPEC 2.2: Cc (U+0000-001F, U+007F-009F), the surrogates U+D800-DFFF, and DICP-18."""
+    if cp <= 0x1F or 0x7F <= cp <= 0x9F or 0xD800 <= cp <= 0xDFFF:
+        return True
+    return any(lo <= cp <= hi for lo, hi in _DICP18)
+
+
+def is_restricted_text(s: Any, min_len: int, max_len: int) -> bool:
+    """Restricted text (SPEC 2.2): a string with no code point of F, ``min_len`` to ``max_len`` code points long.
+    Rule 4: "Restricted text is never normalized"; this reads the code points exactly as given."""
+    return (isinstance(s, str) and min_len <= len(s) <= max_len
+            and not any(_forbidden_code_point(ord(ch)) for ch in s))
+
+
+def _pin_entry(pin: Any, where: str) -> tuple[str, bool]:
+    """One pin object -> ``(key id, demo flag as stated)``. Raises PolicyError on any breach of 7.12 (SIG-27: "A pin
+    entry that breaks this shape MUST make the policy malformed")."""
+    if not isinstance(pin, dict):
+        raise PolicyError(f"{where} must be a JSON object")
+    unknown = sorted(set(pin) - _PIN_KEYS)
+    if unknown:
+        raise PolicyError(f"{where} has unknown key(s) {unknown}")
+    if ("key_id" in pin) == ("legacy_raw_key" in pin):
+        raise PolicyError(f"{where} must have exactly one of key_id or legacy_raw_key")
+    if "key_id" in pin:
+        kid = pin["key_id"]
+        if not (isinstance(kid, str) and _KEY_ID_RE.fullmatch(kid)):
+            raise PolicyError(f"{where}.key_id is not a key id of the form <alg>:sha256:<64 lowercase hex> "
+                              "(SIG-25, SIG-26)")
+    else:
+        raw = pin["legacy_raw_key"]
+        if not (isinstance(raw, str) and _PUBKEY_HEX_RE.fullmatch(raw)):
+            raise PolicyError(f"{where}.legacy_raw_key must be 64 lowercase hex characters")
+        kid = key_id("ed25519", raw)      # 13.4.1: "`legacy_raw_key` is turned into ed25519:sha256:<SHA-256 ...>"
+    if not isinstance(pin.get("demo"), bool):
+        raise PolicyError(f"{where}.demo is required and must be a boolean")
+    if "label" in pin and not is_restricted_text(pin["label"], 1, 256):
+        raise PolicyError(f"{where}.label must be restricted text of 1 to 256 code points (SPEC 2.2)")
+    return kid, pin["demo"]
+
+
+def resolve_pins(pins: Any, *, where: str = "pins", duplicates: str = "merge",
+                 into: dict[str, bool] | None = None, labels: dict[str, str] | None = None) -> dict[str, bool]:
+    """Resolve a list of pin objects to a pin set: a dict from key id to the pin's EFFECTIVE demo flag.
+
+    - SIG-28: "Every demo key (section 2) MUST be treated as a demo pin whatever its entry's `demo` value says".
+    - ``duplicates="merge"`` (pins added from outside a policy file, e.g. the ``pins=`` argument): SPEC 7.12 "a merged
+      pin whose key id is already present is one pin, and if either is marked demo, the pin is a demo pin".
+    - ``duplicates="refuse"`` (the ``pins`` of one policy file): SPEC 7.12 "Within one policy file, two pin entries
+      with the same key id make the policy malformed".
+    ``into`` is an existing pin set to merge into (always with the demo-wins rule). Raises PolicyError."""
+    if not isinstance(pins, list):
+        raise PolicyError(f"{where} must be an array of pin objects")
+    if len(pins) > _MAX_PINS:
+        raise PolicyError(f"{where} has {len(pins)} entries (at most {_MAX_PINS})")
+    out = dict(into or {})
+    seen: set[str] = set()
+    for i, pin in enumerate(pins):
+        kid, demo = _pin_entry(pin, f"{where}[{i}]")
+        if duplicates == "refuse" and kid in seen:
+            raise PolicyError(f"{where}[{i}] repeats key id {kid} (SPEC 7.12: malformed within one policy file)")
+        seen.add(kid)
+        out[kid] = out.get(kid, False) or demo or kid in _DEMO_KEY_IDS
+        if labels is not None and "label" in pin:
+            labels.setdefault(kid, pin["label"])     # shown only, never compared (7.12); the first label is kept
+    return out
+
+
+#: The members of the receiver policy (SPEC 13.4.1) with their defaults. This release implements `schema` and
+#: `pins`; every other member is accepted only AT ITS DEFAULT (where it changes nothing), and a non-default value is
+#: refused rather than ignored, so a caller who sets one never believes it ran. Quorum, required suites and aging
+#: (7.13) arrive with co-signatures; sign-offs, time and archive in later releases.
+_POLICY_DEFAULTS: dict[str, Any] = {
+    "origin_quorum": 1, "require_seal_suites": [], "min_envelope": "v3", "suites": {}, "hashes": {}, "tsas": [],
+    "min_seal_tsas": 0, "require_archive": False, "min_archive_tsas": 1, "roster": [], "require_roles": [],
+    "require_order": True, "require_signoff_timestamps": False, "allow_self_verify": False, "originator_keys": [],
+    "originator_signer_ids": [], "max_attest_lag_s": 86400, "allow_ess_v1": False,
+}
+
+
+def _same_json(a: Any, b: Any) -> bool:
+    """Equality on the parsed value model (SPEC 4.3): `true` is never 1, and an int equals a whole double only where
+    the field is a JSON integer (``origin_quorum`` 1.0 is 1). Used only to test 'is this member at its default'."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same_json(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_json(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+def _json_int(v: Any, lo: int, hi: int) -> bool:
+    # section 2 "JSON integer": an integer or a whole double, never a boolean. The int is compared directly:
+    # `math.isfinite` / `float()` raise OverflowError on an integer of a few hundred digits, which must be a
+    # malformed policy (exit 2), never a traceback.
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return lo <= v <= hi
+    return isinstance(v, float) and math.isfinite(v) and v.is_integer() and lo <= v <= hi
+
+
+_UTC_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", re.ASCII)
+_ROLE_RE = re.compile(r"[a-z0-9][a-z0-9.\-]{0,63}", re.ASCII)
+_SIGNER_ID_RE = re.compile(r"[!-~]{1,256}", re.ASCII)
+
+
+def _utc_or_null(v: Any) -> bool:
+    """SPEC 2.3: a UTC timestamp (a real instant, no leap second), or null."""
+    if v is None:
+        return True
+    if not (isinstance(v, str) and _UTC_RE.fullmatch(v)):
+        return False
+    import calendar
+    y, mo, d, h, mi, se = int(v[0:4]), int(v[5:7]), int(v[8:10]), int(v[11:13]), int(v[14:16]), int(v[17:19])
+    return (1 <= mo <= 12 and 1 <= d <= calendar.monthrange(y, mo)[1] if y >= 1 else False) \
+        and h <= 23 and mi <= 59 and se <= 59
+
+
+def _trust_map(v: Any, keys=None) -> bool:
+    return isinstance(v, dict) and all(
+        isinstance(k, str) and (k in keys if keys else _ALG_TOKEN_RE.fullmatch(k) is not None)
+        and isinstance(e, dict) and set(e) == {"trusted_until"} and _utc_or_null(e["trusted_until"])
+        for k, e in v.items())
+
+
+def _str_list(v: Any, n: int, pattern=None, unique: bool = True) -> bool:
+    return (isinstance(v, list) and len(v) <= n and all(isinstance(x, str) for x in v)
+            and (not unique or len(set(v)) == len(v))
+            and (pattern is None or all(pattern.fullmatch(x) for x in v)))
+
+
+#: SPEC 13.4.1: the TYPE and range of each member (a breach makes the policy malformed). Members whose inner object
+#: shapes belong to later phases (`tsas`, `roster`) are checked here only as arrays of objects of the right length.
+_POLICY_SHAPES = {
+    "origin_quorum": lambda v: _json_int(v, 1, 8),
+    "require_seal_suites": lambda v: _str_list(v, 8, _ALG_TOKEN_RE),
+    "min_envelope": lambda v: isinstance(v, str) and v in ("v3", "v4"),
+    "suites": lambda v: _trust_map(v),
+    "hashes": lambda v: _trust_map(v, ("sha256", "sha384", "sha512")),
+    "tsas": lambda v: isinstance(v, list) and len(v) <= 16 and all(isinstance(x, dict) for x in v),
+    "min_seal_tsas": lambda v: _json_int(v, 0, 16),
+    "require_archive": lambda v: isinstance(v, bool),
+    "min_archive_tsas": lambda v: _json_int(v, 1, 4),
+    "roster": lambda v: isinstance(v, list) and len(v) <= 1024 and all(isinstance(x, dict) for x in v),
+    "require_roles": lambda v: _str_list(v, 16, _ROLE_RE, unique=False),
+    "require_order": lambda v: isinstance(v, bool),
+    "require_signoff_timestamps": lambda v: isinstance(v, bool),
+    "allow_self_verify": lambda v: isinstance(v, bool),
+    "originator_keys": lambda v: _str_list(v, 64, _KEY_ID_RE),
+    "originator_signer_ids": lambda v: _str_list(v, 64, _SIGNER_ID_RE),
+    "max_attest_lag_s": lambda v: _json_int(v, 0, 31_622_400),
+    "allow_ess_v1": lambda v: isinstance(v, bool),
+}
+#: The members whose type is "JSON integer" (SPEC 2): a whole double such as `1.0` is the same value as `1`, so it is
+#: normalized to the integer before the policy is hashed (13.4.1: policies with the same meaning have the same digest).
+_POLICY_INT_MEMBERS = frozenset({"origin_quorum", "min_seal_tsas", "min_archive_tsas", "max_attest_lag_s"})
+#: Members this release EVALUATES at a non-default value (13.4.3 row 2). Every other member is accepted only at its
+#: default; a well-formed other value raises PolicyUnsupportedError (a limitation of this release, see CHANGELOG).
+_POLICY_EVALUATED = frozenset({"min_envelope"})
+
+
+def _policy_members(policy: Any) -> dict[str, Any]:
+    """Validate a receiver policy object (SPEC 13.4.1) and return its members with defaults filled in (step 1).
+    Raises PolicyError for a malformed policy ("An unknown key, a wrong type, a value out of range or a breach of a
+    uniqueness rule makes the policy **malformed**") and PolicyUnsupportedError for a well-formed member this
+    release does not evaluate."""
+    if not isinstance(policy, dict):
+        raise PolicyError("a receiver policy must be a JSON object")
+    if policy.get("schema") != POLICY_SCHEMA:
+        raise PolicyError(f"policy schema must be {POLICY_SCHEMA!r} (got {policy.get('schema')!r})")
+    unknown = sorted(set(policy) - {"schema", "pins"} - set(_POLICY_DEFAULTS))
+    if unknown:
+        raise PolicyError(f"policy has unknown key(s) {unknown}")
+    for k in sorted(set(policy) & set(_POLICY_DEFAULTS)):
+        if not _POLICY_SHAPES[k](policy[k]):
+            raise PolicyError(f"policy member {k!r} has a wrong type or a value out of range: {policy[k]!r}")
+    for k in sorted(set(policy) & set(_POLICY_DEFAULTS) - _POLICY_EVALUATED):
+        if not _same_json(policy[k], _POLICY_DEFAULTS[k]):
+            raise PolicyUnsupportedError(
+                f"policy member {k!r} is well-formed but not evaluated by this release except at its default "
+                f"{_POLICY_DEFAULTS[k]!r}; it is refused rather than ignored")
+    given = {k: (int(policy[k]) if k in _POLICY_INT_MEMBERS else policy[k]) for k in _POLICY_DEFAULTS if k in policy}
+    return {**_POLICY_DEFAULTS, **given}
+
+
+def policy_pins(policy: Any) -> dict[str, bool]:
+    """Validate a receiver policy object and return its resolved pin set. Raises PolicyError (or
+    PolicyUnsupportedError, see `_policy_members`)."""
+    _policy_members(policy)
+    return resolve_pins(policy.get("pins", []), where="policy.pins", duplicates="refuse")
+
+
+def effective_policy(policy: Any = None, pins: Any = None) -> tuple[dict[str, bool] | None, dict]:
+    """SPEC 13.4.1 "Effective policy": (the effective pin set, or None on the single-pin v3 path when neither
+    argument is given; the normalized members WITHOUT the pins). Steps 1-4: defaults filled in, legacy_raw_key
+    turned into key_id, caller pins merged with the demo-wins rule, demo flags made effective."""
+    members = _policy_members(policy) if policy is not None else dict(_POLICY_DEFAULTS)
+    labels: dict[str, str] = {}
+    members["_labels"] = labels
+    if policy is None and pins is None:
+        return None, members
+    out = (resolve_pins(policy.get("pins", []), where="policy.pins", duplicates="refuse", labels=labels)
+           if policy is not None else {})
+    if pins is not None:
+        out = resolve_pins(pins, where="pins", duplicates="merge", into=out, labels=labels)
+    return out, members
+
+
+def effective_pins(policy: Any = None, pins: Any = None) -> dict[str, bool] | None:
+    """The effective pin set (SPEC 13.4.1 steps 2-4). None when neither argument is given."""
+    return effective_policy(policy, pins)[0]
+
+
+def policy_sha256(members: dict, pin_set: dict[str, bool]) -> str:
+    """SPEC 13.4.1: ``policy_sha256 = digest(canon_1(effective policy))`` after step 5 (null trust entries dropped;
+    pins sorted by key_id; the string lists sorted by code point; a pin's label kept only when present)."""
+    labels = members.get("_labels", {})
+    eff = {k: copy.deepcopy(v) for k, v in members.items() if k != "_labels"}
+    eff["schema"] = POLICY_SCHEMA
+    for m in ("suites", "hashes"):
+        eff[m] = {k: e for k, e in eff[m].items() if e.get("trusted_until") is not None}
+    for m in ("require_seal_suites", "originator_keys", "originator_signer_ids", "require_roles"):
+        eff[m] = sorted(eff[m])
+    eff["pins"] = [{"key_id": k, "demo": pin_set[k], **({"label": labels[k]} if k in labels else {})}
+                   for k in sorted(pin_set)]
+    return _sha(_canon(eff))
+
+
+def _verdict_pins(rep: dict) -> dict[str, bool] | None:
+    """The effective pin set a verdict was made under, as it reports it (`pin_set`, or the single pin)."""
+    ps = rep.get("pin_set")
+    if isinstance(ps, list):
+        return {e["key_id"]: bool(e["demo"]) for e in ps if isinstance(e, dict) and "key_id" in e and "demo" in e}
+    pk = rep.get("pinned_key")
+    if isinstance(pk, str) and pk.startswith("ed25519:"):
+        return {key_id("ed25519", pk.removeprefix("ed25519:")): bool(rep.get("pinned_key_is_demo"))}
+    return None
+
+
+def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -> list[str]:
+    """SPEC 13.4.3, the reason codes in table order, for the rows this release can evaluate. Rows 4-12 read v2
+    sign-off entries, rows 15 and 18 TSA and archive evaluation: they cannot apply until those blocks are checked,
+    and a PRESENT unchecked block already rejects through rows 3, 14 and 17 (see `_dims`).
+
+    13.4.2: "`verdict` MUST have been produced under the same effective policy ... If the hashes differ, `evaluate`
+    MUST refuse (an error, not a decision)". A verdict records its `policy_sha256`; ``members`` (with ``pin_set``,
+    or the verdict's own pins when it is None) must hash to it, else PolicyError is raised."""
+    recorded = rep.get("policy_sha256")
+    if recorded is None and isinstance(rep.get("decision"), dict):
+        recorded = rep["decision"].get("policy_sha256")
+    if recorded is not None:
+        pins = pin_set if pin_set is not None else _verdict_pins(rep)
+        if pins is None or policy_sha256(members, pins) != recorded:
+            raise PolicyError("evaluate: the verdict was made under a different policy "
+                              f"(its policy_sha256 is {_shown(recorded)}); re-verify under this policy instead")
+    reasons = []
+    if rep["state"] != STATE_VERIFIED:
+        reasons.append("state_not_accepted")
+    if members.get("min_envelope") == "v4" and rep.get("canon_version") in (1, 2):
+        reasons.append("envelope_below_minimum")
+    dims = rep.get("dims", {})
+    if dims.get("signoffs") == "invalid":
+        reasons.append("signoffs_invalid")
+    if dims.get("time") == "invalid":
+        reasons.append("time_invalid")
+    if dims.get("time") == "malformed":
+        reasons.append("time_malformed")
+    if dims.get("archive") == "broken":
+        reasons.append("archive_broken")
+    if dims.get("archive") == "malformed":
+        reasons.append("archive_malformed")
+    return reasons
+
+
 def _normalize_floats(obj: Any) -> Any:
     """Return `obj` with every float ``-0.0`` replaced by ``0.0`` (recursively). ``-0.0 == 0.0`` in
     IEEE-754 but ``json.dumps`` writes them as different bytes, so the producer normalizes ``-0.0`` to
@@ -251,20 +636,30 @@ def _canon(obj: Any) -> bytes:
 # canonicalization FAIL here and in the JS verifier. The ES number rule reuses Python's shortest-round-trip repr() for digit SELECTION, then
 # reformats per ECMA-262 6.1.6.1.20 -- no dtoa reimplementation. See the ADR-053 canon spec + conformance.
 _V2_SHORT_ESCAPE = {0x08: "\\b", 0x09: "\\t", 0x0A: "\\n", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\"}
+#: Every character JCS escapes: the C0 controls, '"', '\\', and (lone) surrogates. Everything else is written raw.
+_V2_MUST_ESCAPE = re.compile(r'[\x00-\x1f"\\\ud800-\udfff]')
+#: What is left to escape once '\\', '"', '\n', '\r' and '\t' are done: the other C0 controls and surrogates.
+_V2_RARE_ESCAPE = re.compile(r"[\x00-\x1f\ud800-\udfff]")
+
+
+def _v2_escape_rare(m: re.Match) -> str:
+    c = ord(m.group())
+    esc = _V2_SHORT_ESCAPE.get(c)                 # \b \f; the rest -> lowercase \uXXXX (C0 control or surrogate)
+    return esc if esc is not None else f"\\u{c:04x}"
 
 
 def _v2_string(s: str) -> str:
-    out = ['"']
-    for ch in s:
-        c = ord(ch)
-        if c in _V2_SHORT_ESCAPE:
-            out.append(_V2_SHORT_ESCAPE[c])
-        elif c < 0x20 or 0xD800 <= c <= 0xDFFF:  # C0 controls AND lone surrogates -> \uXXXX (lowercase),
-            out.append(f"\\u{c:04x}")            # exactly as ECMAScript JSON.stringify / RFC 8785 escapes them
-        else:
-            out.append(ch)                       # raw (all other non-ASCII, incl. valid astral scalars)
-    out.append('"')
-    return "".join(out)
+    # JCS / ECMAScript JSON.stringify escaping: the short forms for \b \t \n \f \r " \, lowercase \uXXXX for the
+    # other C0 controls and lone surrogates, every other character raw (all other non-ASCII, astral scalars). One
+    # C-level scan finds whether anything needs escaping; most strings need nothing and are copied whole.
+    if _V2_MUST_ESCAPE.search(s) is None:
+        return '"' + s + '"'
+    # '\\' first, so no backslash an escape writes is doubled; the escapes written are printable ASCII, so the
+    # final pass (rare characters) never sees one.
+    s = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    if _V2_RARE_ESCAPE.search(s) is not None:
+        s = _V2_RARE_ESCAPE.sub(_v2_escape_rare, s)
+    return '"' + s + '"'
 
 
 #: The largest integer magnitude a canon-v2 (JCS / IEEE-754 double) number represents exactly.
@@ -285,6 +680,13 @@ def _v2_number(n: Any) -> str:
         raise ValueError("NaN/Infinity are not valid JSON")
     if n == 0:
         return "0"                                # -0.0 -> "0"
+    if type(n) is float:
+        # Fast path: repr() writes the shortest round-trip digits in positional form exactly when the decimal
+        # exponent is in [-4, 16), a sub-range of ECMAScript's positional range (-7, 21), where the ES form is the
+        # same text except a whole value ("2.0" in repr, "2" in ES). Exponent-form reprs take the general path.
+        r = repr(n)
+        if "e" not in r:
+            return r.removesuffix(".0")
     neg = n < 0
     _, digs, exp = Decimal(repr(abs(n))).as_tuple()
     digs = list(digs)
@@ -307,23 +709,78 @@ def _v2_number(n: Any) -> str:
     return "-" + out if neg else out
 
 
+def _v2_utf16(kv: tuple) -> bytes:
+    return kv[0].encode("utf-16-be", "surrogatepass")
+
+
+def _v2_into(obj: Any, out: list) -> None:
+    # Appends the JCS text of `obj` to `out` (joined once by `_v2_emit`), so no container's text is copied into
+    # its parent's string level by level. Exact types first (what json.loads builds); subclasses take the
+    # isinstance branches after them.
+    t = type(obj)
+    if t is str:
+        out.append(_v2_string(obj))
+        return
+    if t is dict:
+        if all(type(k) is str and k.isascii() for k in obj):
+            # ASCII keys sort the same by code point as by UTF-16 code unit (and are distinct): plain sort
+            items = [(k, obj[k]) for k in sorted(obj)]
+        else:
+            items = sorted(obj.items(), key=_v2_utf16)
+    elif t is list:
+        items = None
+    elif t is int and -_JS_SAFE_INT <= obj <= _JS_SAFE_INT:
+        out.append(str(obj))
+        return
+    elif t is float:
+        out.append(_v2_number(obj))
+        return
+    elif obj is None:
+        out.append("null")
+        return
+    elif obj is True:
+        out.append("true")
+        return
+    elif obj is False:
+        out.append("false")
+        return
+    elif isinstance(obj, str):
+        out.append(_v2_string(obj))
+        return
+    elif isinstance(obj, (int, float)):
+        out.append(_v2_number(obj))
+        return
+    elif isinstance(obj, (list, tuple)):
+        items = None
+    elif isinstance(obj, dict):
+        items = sorted(obj.items(), key=_v2_utf16)
+    else:
+        raise TypeError(f"not a JSON value: {type(obj).__name__}")
+    mark = len(out)
+    if items is None:                             # an array: each element then ",", the last "," -> "]"
+        out.append("[")
+        for v in obj:
+            _v2_into(v, out)
+            out.append(",")
+        close = "]"
+    else:                                         # an object, members in JCS order
+        out.append("{")
+        for k, v in items:
+            out.append(_v2_string(k))
+            out.append(":")
+            _v2_into(v, out)
+            out.append(",")
+        close = "}"
+    if len(out) == mark + 1:                      # empty: "[" -> "[]" / "{" -> "{}"
+        out.append(close)
+    else:
+        out[-1] = close
+
+
 def _v2_emit(obj: Any) -> str:
-    if obj is None:
-        return "null"
-    if obj is True:
-        return "true"
-    if obj is False:
-        return "false"
-    if isinstance(obj, str):
-        return _v2_string(obj)
-    if isinstance(obj, (int, float)):
-        return _v2_number(obj)
-    if isinstance(obj, (list, tuple)):
-        return "[" + ",".join(_v2_emit(v) for v in obj) + "]"
-    if isinstance(obj, dict):
-        items = sorted(obj.items(), key=lambda kv: kv[0].encode("utf-16-be", "surrogatepass"))
-        return "{" + ",".join(_v2_string(k) + ":" + _v2_emit(v) for k, v in items) + "}"
-    raise TypeError(f"not a JSON value: {type(obj).__name__}")
+    out: list[str] = []
+    _v2_into(obj, out)
+    return "".join(out)
 
 
 def _canon_v2(obj: Any) -> bytes:
@@ -346,13 +803,131 @@ def _try_canon(obj: Any, label: str, problems: list[str], canon_fn=_canon) -> by
         return None
 
 
+# --- canon_version 3: canon_2 over the projection T (SPEC v4 draft 5.6, 6.6) ----------------------------------
+# SPEC 5.6.1: "canon_3(x) = canon_2(T(x))". T maps both forms of a committed item to the same projected form
+# {"$committed": 1, "commitment": C, "marks": M}, so withholding an item changes no digest, header or seal. T is
+# undefined when an item breaks a form or field rule (6.6.1, 6.6.2); then canon_3 is undefined, which "MUST fail the
+# check that needed it. It MUST NOT crash the verifier" -- here it raises ValueError, which `_try_canon` turns into a
+# problem. Placement, the item cap and the path cap are rules of the item walk (`_v4_item_walk`), not of T (5.6.2
+# item 1: "T depends only on the value it is given").
+_COMMITTED = "$committed"
+#: 6.6.3: "tag = the 26 ASCII bytes "evidence.committed-item.v1"", then a NUL, then canon_2(value).
+_ITEM_TAG = b"evidence.committed-item.v1"
+_ITEM_DISCLOSED_KEYS = frozenset({_COMMITTED, "marks", "salt", "value"})
+_ITEM_WITHHELD_KEYS = frozenset({_COMMITTED, "commitment", "marks"})
+_SALT_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
+_COMMITMENT_RE = re.compile(r"hmac-sha256:[0-9a-f]{64}", re.ASCII)
+_MARK_RE = re.compile(r"[a-z0-9][a-z0-9.\-]{0,63}", re.ASCII)
+_MAX_MARKS = 16
+_MAX_ITEMS = 16_384                 # 6.6.6 P6: "At most 16,384 items per bundle"
+_MAX_ITEM_PATH = 1024               # 6.6.5 item 2: "An item path MUST be at most 1,024 code points"
+
+
+def commit(salt_hex: str, value: Any) -> str:
+    """SPEC 6.6.3: ``"hmac-sha256:" || lowerhex(HMAC-SHA256(key = the 32 salt bytes, tag || 0x00 || canon_2(value)))``.
+    The salt must already be 64 lowercase hex (checked as a string before decoding). Raises ValueError when canon_2
+    cannot encode the value."""
+    msg = _ITEM_TAG + b"\x00" + _canon_v2(value)
+    return "hmac-sha256:" + hmac.new(bytes.fromhex(salt_hex), msg, hashlib.sha256).hexdigest()
+
+
+def _has_committed_member(obj: Any) -> bool:
+    """True if an object anywhere in ``obj`` has a member named ``$committed`` (iterative)."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if _COMMITTED in cur:
+                return True
+            stack.extend(cur.values())
+        elif isinstance(cur, (list, tuple)):
+            stack.extend(cur)
+    return False
+
+
+def item_problems(item: Any) -> list[str]:
+    """Every breach of the item form and field rules (SPEC 6.6.1, 6.6.2) by one object that has a ``$committed``
+    member; an empty list is a well-formed item. Placement is not checked here (6.6.6)."""
+    if not isinstance(item, dict) or _COMMITTED not in item:
+        return ["is not an object with a $committed member"]
+    problems: list[str] = []
+    tag = item[_COMMITTED]
+    # 6.6.2: "MUST be an integer literal equal to 1 in the parsed value model of 4.3 ... `true`, `1.0` and `1e0` fail.
+    # The check MUST run on the parsed value **before** canonicalization" (canon_2 writes all three as `1`).
+    if type(tag) is not int or tag != 1:
+        problems.append(f"$committed must be the integer literal 1 (got {tag!r})")
+    keys = set(item)
+    if keys == _ITEM_DISCLOSED_KEYS:
+        salt = item["salt"]
+        if not (isinstance(salt, str) and _SALT_RE.fullmatch(salt)):
+            problems.append("salt must be exactly 64 lowercase hex characters (32 bytes)")
+        if _has_committed_member(item["value"]):
+            problems.append("value contains an object member named $committed (no nesting, 6.6.2 / P4)")
+        else:
+            try:
+                _canon_v2(item["value"])
+            except (TypeError, ValueError, RecursionError) as exc:
+                problems.append(f"value cannot be canonicalized under canon 2 ({exc})")
+    elif keys == _ITEM_WITHHELD_KEYS:
+        c = item["commitment"]
+        if not (isinstance(c, str) and _COMMITMENT_RE.fullmatch(c)):
+            problems.append("commitment must match hmac-sha256:[0-9a-f]{64}")
+    elif {"salt", "value"} & keys and "commitment" in keys:
+        problems.append("carries both the disclosed (salt, value) and the withheld (commitment) form")
+    else:
+        problems.append(f"key set {sorted(keys)} is neither the disclosed form {sorted(_ITEM_DISCLOSED_KEYS)} nor "
+                        f"the withheld form {sorted(_ITEM_WITHHELD_KEYS)}")
+    if "marks" in item:
+        marks = item["marks"]
+        if not (isinstance(marks, list) and all(isinstance(m, str) for m in marks)):
+            problems.append("marks must be an array of strings")
+        else:
+            if len(marks) > _MAX_MARKS:
+                problems.append(f"marks has {len(marks)} entries (at most {_MAX_MARKS})")
+            bad = [m for m in marks if not _MARK_RE.fullmatch(m)]
+            if bad:
+                problems.append(f"marks {bad[:3]!r} do not match [a-z0-9][a-z0-9.\\-]{{0,63}}")
+            if len(set(marks)) != len(marks):
+                problems.append("marks has duplicate entries")
+            elif marks != sorted(marks):                     # Python str order IS code point order
+                problems.append("marks are not sorted ascending in code point order")
+    return problems
+
+
+def _item_commitment(item: dict) -> str:
+    """The projected commitment of a WELL-FORMED item: read from the withheld form, always RECOMPUTED for the
+    disclosed form (6.6.3: "MUST NOT read a commitment from a disclosed item")."""
+    if "commitment" in item:
+        return item["commitment"]
+    return commit(item["salt"], item["value"])
+
+
+def project(obj: Any) -> Any:
+    """The projection T of SPEC 5.6.2. Raises ValueError where T is undefined (a malformed item)."""
+    if isinstance(obj, dict):
+        if _COMMITTED in obj:
+            bad = item_problems(obj)
+            if bad:
+                raise ValueError("committed item is malformed: " + "; ".join(bad))
+            return {_COMMITTED: 1, "commitment": _item_commitment(obj), "marks": list(obj["marks"])}
+        return {k: project(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [project(v) for v in obj]
+    return obj
+
+
+def _canon_v3(obj: Any) -> bytes:
+    # canon_version 3 (SPEC 5.6.1): canon_2 over the projection T.
+    return _canon_v2(project(obj))
+
+
 # --- ADR-050: the version -> canon map (append-only, frozen) ------------------------------------------
 #: The REFERENCE canon's output-definition version -> the canon function that produces it. APPEND-ONLY and
 #: FROZEN: a future change to what the reference canon EMITS becomes `canon_version = 2` with a NEW `_canon_v2`
 #: entry while `1: _canon` is preserved VERBATIM, so every v1 bundle verifies forever. A VERIFIER-port bug
 #: (a port disagreeing with the reference for version N) is fixed IN PLACE with NO bump -- that verifier was
 #: non-conformant; the format did not move. For v1 the map's canon IS this module's `_canon`.
-_CANON = {1: _canon, 2: _canon_v2}
+_CANON = {1: _canon, 2: _canon_v2, 3: _canon_v3}
 #: The highest `canon_version` this verifier can apply. A bundle sealed under anything higher is a
 #: fail-FORWARD (`STATE_UNSUPPORTED_CANON`), never an integrity failure.
 _CANON_SUPPORTED_MAX = max(_CANON)
@@ -363,6 +938,13 @@ _CANON_SUPPORTED_MAX = max(_CANON)
 #: sections to a newer verifier. ADR-049: `host` is RETIRED -- a stapled host block fails this allowlist.
 _ALLOWED_TOP = frozenset({"schema", "result", "reproducibility", "manifest", "sha256sums",
                           "bundle_sha256", "signature", "redaction", "timestamp", "attestations"})
+#: SPEC v4 draft 3.4: the twelve top-level keys of an `evidence.envelope.v4` bundle (v3's singular `timestamp` and
+#: the legacy `host` are not among them).
+_ALLOWED_TOP_V4 = frozenset({"schema", "manifest", "sha256sums", "bundle_sha256", "signature", "signatures", "result",
+                             "reproducibility", "redaction", "timestamps", "attestations", "archive"})
+#: SPEC v4 draft 11.6 step 3: the newer-canon branch checks the top-level keys "against the **union** of the v3 and
+#: v4 sets ... The branch trusts no section-level field, so `schema` does not select the set."
+_ALLOWED_TOP_UNION = _ALLOWED_TOP | _ALLOWED_TOP_V4
 
 
 def _read_canon_version(sha256sums: Any) -> tuple[str | None, int | None, bool]:
@@ -394,13 +976,35 @@ def _non_finite_paths(obj: Any, path: str = "$") -> list[str]:
     """JSON paths of every NaN / +-Infinity float in `obj` -- values RFC 8259 has no encoding for.
     Python's json module writes and reads them as bare `NaN`/`Infinity` tokens, which strict and
     browser parsers reject, so a bundle carrying one would verify here and fail everywhere else."""
+    # Iterative, with parent links: a path string is built only for a hit, never per node (a long key above a long
+    # array would otherwise cost key length x array length to walk).
     if isinstance(obj, float):
         return [] if math.isfinite(obj) else [path]
-    if isinstance(obj, dict):
-        return [p for k, v in obj.items() for p in _non_finite_paths(v, f"{path}.{k}")]
-    if isinstance(obj, (list, tuple)):
-        return [p for i, v in enumerate(obj) for p in _non_finite_paths(v, f"{path}[{i}]")]
-    return []
+    if not isinstance(obj, (dict, list, tuple)):
+        return []
+    out: list[str] = []
+
+    def spell(chain: Any) -> str:
+        parts = []
+        while chain is not None:
+            chain, tok = chain
+            parts.append(f"[{tok}]" if isinstance(tok, int) else f".{tok}")
+        return path + "".join(reversed(parts))
+
+    stack = [(_children(obj), None)]
+    while stack:
+        it, chain = stack[-1]
+        nxt = next(it, _END)
+        if nxt is _END:
+            stack.pop()
+            continue
+        tok, v = nxt
+        if isinstance(v, float):
+            if not math.isfinite(v):
+                out.append(spell((chain, tok)))
+        elif isinstance(v, (dict, list, tuple)):
+            stack.append((_children(v), (chain, tok)))
+    return out
 
 
 def _check_redaction(bundle: dict, problems: list[str], profile=None) -> set[str]:
@@ -504,15 +1108,24 @@ def _exceeds_depth(obj: Any, limit: int = _MAX_JSON_DEPTH) -> bool:
     """True if ``obj`` nests deeper than ``limit``. ITERATIVE (no recursion), so it can guard the recursive
     ``_non_finite_paths`` / ``_canon`` against a RecursionError on a hand-built deep structure handed to the
     Python API. The CLI (``proof_verify.__main__``) rejects deeply nested TEXT before it is ever parsed."""
-    stack: list[tuple[Any, int]] = [(obj, 1)]
+    # One iterator per nesting level (memory proportional to depth, not to the number of nodes); a scalar child
+    # counts as one more level, as before.
+    if limit < 1:
+        return True
+    if not isinstance(obj, (dict, list, tuple)):
+        return False
+    stack = [iter(obj.values() if isinstance(obj, dict) else obj)]
     while stack:
-        cur, depth = stack.pop()
-        if depth > limit:
+        nxt = next(stack[-1], _END)
+        if nxt is _END:
+            stack.pop()
+            continue
+        if len(stack) + 1 > limit:          # the child sits at depth len(stack) + 1
             return True
-        if isinstance(cur, dict):
-            stack.extend((v, depth + 1) for v in cur.values())
-        elif isinstance(cur, (list, tuple)):
-            stack.extend((v, depth + 1) for v in cur)
+        if isinstance(nxt, dict):
+            stack.append(iter(nxt.values()))
+        elif isinstance(nxt, (list, tuple)):
+            stack.append(iter(nxt))
     return False
 
 
@@ -531,6 +1144,24 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
 
 def _reject_non_finite(token: str):
     raise ValueError(f"non-JSON token {token!r} in bundle (NaN/Infinity are not RFC 8259 JSON; rejected)")
+
+
+def _parse_finite_float(literal: str) -> float:
+    """parse_float hook: a number literal with a fraction or exponent, read as an IEEE-754 binary64 double.
+
+    SPEC (evidence.envelope.v4 draft) 4.2 item 9, "(Changed in v4, for every version.)": "A number literal that
+    is finite as written but overflows an IEEE-754 binary64 double (for example `1e400`) MUST make the input
+    **unreadable**. This holds on every path: canon 1, 2 or 3, and the newer-canon branch." This resolves open
+    issue 17.2.1: before it, Python's json read `1e400` as infinity and the bundle failed later as a non-finite
+    value (label `fail`) on the normal path, or read as `unsupported-canon` on the newer-canon branch, while the
+    JavaScript reference refused it at parse time. Refusing it HERE makes it unreadable on every path, in both
+    references. Underflow (`1e-400` -> 0.0) is finite and is not affected; integer literals (no `.`, no
+    exponent) never reach this hook (they are integers, capped by `_parse_bounded_int`)."""
+    value = float(literal)
+    if math.isinf(value):
+        raise ValueError(f"number literal {literal[:40]!r} overflows an IEEE-754 double (finite as written, "
+                         "infinite when read; SPEC 4.2 item 9: unreadable)")
+    return value
 
 
 def _text_depth_ok(text: str) -> bool:
@@ -564,7 +1195,8 @@ def loads(text: str) -> dict:
     """The ONE guarded JSON loader every bundle reader shares. Rejects, at parse time: a bundle larger
     than ``_MAX_BUNDLE_BYTES`` (a pathological input that would exhaust memory), pathological bracket
     nesting (a RecursionError in the parser), duplicate object keys (last-wins ambiguity across parsers),
-    and NaN/Infinity (not RFC 8259 JSON). Any reader that bypasses this -- a plain ``json.loads`` in
+    NaN/Infinity (not RFC 8259 JSON), and a number literal that overflows a double (`1e400`, SPEC 4.2
+    item 9). Any reader that bypasses this -- a plain ``json.loads`` in
     conformance, the lineage index, reproduce/certify -- could attest or re-derive a bundle this
     authoritative verifier would refuse to even parse, so they all route through here."""
     nbytes = len(text) if len(text) > _MAX_BUNDLE_BYTES else len(text.encode("utf-8", "surrogatepass"))
@@ -573,7 +1205,7 @@ def loads(text: str) -> dict:
     if not _text_depth_ok(text):
         raise ValueError(f"JSON nesting exceeds {_MAX_JSON_DEPTH} levels (rejected fail-closed)")
     return json.loads(text, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_non_finite,
-                      parse_int=_parse_bounded_int)
+                      parse_int=_parse_bounded_int, parse_float=_parse_finite_float)
 
 
 #: Integer literals longer than this many digits are refused, independent of PYTHONINTMAXSTRDIGITS (CPython's
@@ -770,7 +1402,8 @@ def _ed25519_verify(signature: bytes, msg: bytes, pubkey: bytes) -> bool:
 
 
 def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
-                     origin_problems: list[str], profile=None, sig_out: dict | None = None) -> str | None:
+                     origin_problems: list[str], profile=None, sig_out: dict | None = None,
+                     pin_set: dict[str, bool] | None = None, v4_suites: bool = False) -> str | None:
     """The signature check, split on the two distinct things a signature proves.
 
     INTEGRITY (-> `problems`): the block is well-formed and the Ed25519 signature is VALID over the
@@ -810,8 +1443,18 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
         # well-formed (hex fields valid; S1/S2 above already recorded any extra/missing key or bad message).
         # A garbage/forged/truncated hex field alongside a plausible future-suite label is a plain FAIL, not a
         # benign "use a newer verifier" -- the one-contract gate is "the unknown suite is the SOLE problem".
-        signer_ok = isinstance(signer_v, str) and _PUBKEY_HEX_RE.fullmatch(signer_v) is not None
-        sighex_ok = isinstance(sig_hex_v, str) and _SIGNATURE_HEX_RE.fullmatch(sig_hex_v) is not None
+        # Canon 3 and newer (`v4_suites`): the v4 suite table (SPEC 7.5). A suite this release does not implement
+        # is shape-checked against its row, and for every reserved or unknown token that row is the GENERIC hex
+        # row, so a real-size ML-DSA key and signature are `unsupported-alg` (SIG-1, SIG-2, 11.4), consistent with
+        # `provenance.seal_signers` (7.9). `ecdsa-p256` is a supported suite in v4 that this release does not
+        # implement yet (a declared limitation): it keeps the Ed25519 shapes and so reads `fail`. Canon 1 and 2
+        # keep the v3 rule (Ed25519 shapes for any suite), unchanged.
+        if v4_suites and isinstance(alg, str) and alg != "ecdsa-p256":
+            key_rx, sig_rx = _GENERIC_HEX_RE, _GENERIC_HEX_RE
+        else:
+            key_rx, sig_rx = _PUBKEY_HEX_RE, _SIGNATURE_HEX_RE
+        signer_ok = isinstance(signer_v, str) and key_rx.fullmatch(signer_v) is not None
+        sighex_ok = isinstance(sig_hex_v, str) and sig_rx.fullmatch(sig_hex_v) is not None
         if isinstance(alg, str) and _ALG_TOKEN_RE.fullmatch(alg) and signer_ok and sighex_ok:
             if sig_out is not None:
                 sig_out["unsupported_alg"] = True
@@ -822,11 +1465,20 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
                 "attests nothing about the sections)")
         else:
             problems.append(f"unsupported signature alg: {alg!r}")
-            if not signer_ok:
-                problems.append("signature public_key is not a 32-byte hex Ed25519 key (64 lowercase hex characters)")
-            if not sighex_ok:
-                problems.append("signature.signature is not a 64-byte Ed25519 signature (128 lowercase hex "
-                                "characters, no whitespace)")
+            if key_rx is _GENERIC_HEX_RE:
+                if not signer_ok:
+                    problems.append("signature public_key does not match the generic hex row of the suite table "
+                                    "(SPEC 7.5)")
+                if not sighex_ok:
+                    problems.append("signature.signature does not match the generic hex row of the suite table "
+                                    "(SPEC 7.5)")
+            else:
+                if not signer_ok:
+                    problems.append("signature public_key is not a 32-byte hex Ed25519 key (64 lowercase hex "
+                                    "characters)")
+                if not sighex_ok:
+                    problems.append("signature.signature is not a 64-byte Ed25519 signature (128 lowercase hex "
+                                    "characters, no whitespace)")
         return None
     signer = sig.get("public_key")
     # ADR-049 (one strict dialect): hold both hex fields to EXACTLY lowercase hex (the schema pattern)
@@ -853,6 +1505,17 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
     # verifier's module-global pin unchanged -- the neutral default -- so the deliberate single-pin design
     # is intact unless a caller opts a profile in. This never affects INTEGRITY (checked above under the
     # embedded key); it only decides which key counts as "origin".
+    if pin_set is not None:
+        # SPEC 7.12 (v3 input, E = [signature]): key_matches_pin iff the verified block's key id is in the pin set;
+        # the matched pin's EFFECTIVE demo flag decides demo-ness (7.4 "with a pin set of one entry the outcome is
+        # exactly the v3 outcome").
+        kid = key_id("ed25519", signer)
+        if kid not in pin_set:
+            origin_problems.append("signature key is not in the pin set")
+        elif sig_out is not None:
+            sig_out["pin_demo"] = pin_set[kid]
+            sig_out["pin_key_id"] = kid
+        return signer
     profile_pin, malformed_pin = _profile_pin(profile)
     if malformed_pin:
         origin_problems.append(_MALFORMED_PIN_PROBLEM)
@@ -995,6 +1658,15 @@ def _verdict_token_in(label: str) -> str | None:
     # while `origin-verified` (segment `verified`) still is.
     words = set(re.split(r"[^a-z0-9]+", label.lower()))
     return next((tok for tok in _DERIVED_FROM_VERDICT_TOKENS if tok in words), None)
+
+
+def _shown(value: Any) -> str:
+    """A bundle-supplied digest field as a problem string shows it: a well-formed digest as is, anything else as a
+    bounded ``repr`` (so a control character in a hostile field reaches the problem list escaped, never raw)."""
+    if _is_digest(value):
+        return value
+    r = repr(value)
+    return r if len(r) <= 100 else r[:100] + "..."
 
 
 def _is_digest(v: Any) -> bool:
@@ -1272,7 +1944,547 @@ def _frontier_report(bundle: dict) -> dict:
             "derived_from": pv.get("derived_from") or []}
 
 
-def classify_bundle(bundle: dict, *, profile=None) -> dict:
+# ====================================================================================================
+# The canon-3 path: evidence.envelope.v4 (SPEC v4 draft 12.2). The canon-1/2 path (`_check` below) is the v3
+# algorithm, unchanged except for the pairing message of 11.5.
+# ====================================================================================================
+
+_ENVELOPE_V4 = "evidence.envelope.v4"
+_REDACTION_V2_SCHEMA = "evidence.envelope.redaction.v2"
+_REDACTION_V2_KEYS = frozenset({"schema", "parent_bundle_sha256", "withheld_sections", "withheld_items"})
+#: 10.4 R2: "`withheld_sections` MUST be an array of distinct strings from {"inputs", "result"}" (provenance cannot
+#: be withheld in v4, 6.6.6 P5).
+_V4_WITHHOLDABLE = ("inputs", "result")
+#: 7.5 suite table: the `public_key` pattern of each row (the generic hex row for reserved and unknown suites).
+_SUITE_KEY_RE = {"ed25519": re.compile(r"[0-9a-f]{64}", re.ASCII),
+                 "ecdsa-p256": re.compile(r"0[23][0-9a-f]{64}", re.ASCII)}
+_GENERIC_HEX_RE = re.compile(r"(?:[0-9a-f]{2}){1,65536}", re.ASCII)
+_MAX_SEAL_SIGNERS = 8
+#: Advisory note code (6.6.1, 6.6.8): a `$committed` object under canon 1 or 2 is plain data, never an item.
+NOTE_COMMITTED_KEY_PLAIN_DATA = "committed_key_plain_data"
+
+
+def _ptr_token(key: str) -> str:
+    """One RFC 6901 reference token: `~` as `~0`, `/` as `~1` (6.6.5 item 1)."""
+    return key.replace("~", "~0").replace("/", "~1")
+
+
+_END = object()
+
+
+def _children(cur: Any):
+    """(token, child) pairs of a container, tokens as the walk keeps them (a str key or an int index)."""
+    if isinstance(cur, dict):
+        return ((k if isinstance(k, str) else str(k), v) for k, v in cur.items())
+    return enumerate(cur)
+
+
+def _token_len(tok: str | int) -> int:
+    """The length of one escaped RFC 6901 reference token, without building it."""
+    if isinstance(tok, int):
+        return len(str(tok))
+    return len(tok) + tok.count("~") + tok.count("/")
+
+
+def _iter_committed(value: Any):
+    """Yield ``(chain, pointer_length, object)`` for every object with a ``$committed`` member in ``value``, in
+    document order, without descending into one. ``chain`` is a parent-linked ``(parent_chain, token)`` pair (None for
+    ``value`` itself), so no pointer string is built during the walk: the walk holds one iterator per nesting level,
+    and memory stays proportional to the depth, never to (key length x number of nodes)."""
+    if isinstance(value, dict) and _COMMITTED in value:
+        yield None, 0, value
+        return
+    if not isinstance(value, (dict, list, tuple)):
+        return
+    stack = [(_children(value), None, 0)]
+    while stack:
+        it, chain, plen = stack[-1]
+        nxt = next(it, _END)
+        if nxt is _END:
+            stack.pop()
+            continue
+        tok, v = nxt
+        if not isinstance(v, (dict, list, tuple)):
+            continue
+        node, nlen = (chain, tok), plen + 1 + _token_len(tok)
+        if isinstance(v, dict) and _COMMITTED in v:
+            yield node, nlen, v
+        else:
+            stack.append((_children(v), node, nlen))
+
+
+def _chain_tokens(chain: Any) -> list[str]:
+    toks = []
+    while chain is not None:
+        chain, tok = chain
+        toks.append(tok if isinstance(tok, str) else str(tok))
+    toks.reverse()
+    return toks
+
+
+def _pointer(prefix: str, toks: list[str], limit: int | None = None) -> str:
+    """The JSON pointer ``prefix`` + tokens. With ``limit``, a pointer longer than ``limit`` code points is cut to
+    its first ``limit`` code points plus ``"..."`` (so it is never a valid item path and never equals one), and no
+    string longer than about ``limit`` is ever built."""
+    if limit is None:
+        return prefix + "".join("/" + _ptr_token(t) for t in toks)
+    out, n = [prefix], len(prefix)
+    for t in toks:
+        piece = "/" + _ptr_token(t[:limit + 1])
+        out.append(piece)
+        n += len(piece)
+        if n > limit:
+            return "".join(out)[:limit] + "..."
+    return "".join(out)
+
+
+def _committed_walk(value: Any, prefix: str = "", *, max_items: int | None = None,
+                    max_path: int | None = None) -> tuple[list[tuple[str, list[str], dict, int]], int]:
+    """The bounded committed-item walk: ``(found, count)``. ``found`` holds at most ``max_items`` entries
+    ``(pointer, tokens, object, true pointer length)`` sorted by pointer; ``count`` is the number of items in
+    ``value``. With ``max_path`` a pointer over the limit is truncated (see `_pointer`); its true length is kept."""
+    found = []
+    count = 0
+    for chain, plen, obj in _iter_committed(value):
+        count += 1
+        if max_items is not None and len(found) >= max_items:
+            continue
+        toks = _chain_tokens(chain)
+        found.append((_pointer(prefix, toks, max_path), toks, obj, len(prefix) + plen))
+    found.sort(key=lambda t: t[0])
+    return found, count
+
+
+def committed_objects(value: Any, prefix: str = "") -> list[tuple[str, list[str], dict]]:
+    """Every object with a ``$committed`` member in ``value``, as ``(pointer, tokens, object)``; the walk does not
+    descend into such an object. Pointers use canonical decimal array indices (6.6.5). Iterative; sorted by pointer
+    in code point order. Pointer strings are built only for the items found (never per node)."""
+    found, _n = _committed_walk(value, prefix)
+    return [(ptr, toks, obj) for ptr, toks, obj, _len in found]
+
+
+def count_committed(value: Any, *, withheld_only: bool = False) -> int:
+    """The number of committed items (or of withheld-form items) in ``value``, without building any pointer."""
+    return sum(1 for _c, _l, obj in _iter_committed(value) if not withheld_only or "commitment" in obj)
+
+
+def _placement_problem(section: str, tokens: list[str], section_value: Any) -> str | None:
+    """SPEC 6.6.6 P1-P3: where an item may sit. None when the placement is allowed."""
+    if not tokens:
+        return "is a section root; whole-section withholding is the mechanism for that (P3)"
+    if section == "provenance":
+        return "is in provenance, which carries no items in v4 (P2)"
+    if section == "inputs":
+        # P1: "strictly below `/inputs/inputs/` (so never at `/inputs`, `/inputs/capability` or `/inputs/inputs`)"
+        if tokens[0] == "inputs" and len(tokens) >= 2:
+            return None
+        return "is outside /inputs/inputs/ (P1)"
+    # P1: "strictly below `/result/result/<capability>/` ... If `manifest.result.value.result` is not an object, no
+    # item may appear below it."
+    res = section_value.get("result") if isinstance(section_value, dict) else None
+    if tokens[0] == "result" and len(tokens) >= 3 and isinstance(res, dict):
+        return None
+    if tokens[0] == "result" and not isinstance(res, dict):
+        return "is below a result core `result` that is not an object (P1)"
+    return "is outside /result/result/<capability>/, in a result-core field the verifier reads or the frontier (P1, P2)"
+
+
+def _v4_redaction(bundle: dict, problems: list[str], profile) -> tuple[set[str], set[str], bool]:
+    """SPEC 10.4 R1, R2, R6. Returns (withheld sections, D, record present)."""
+    if "redaction" not in bundle:
+        return set(), set(), False
+    red = bundle["redaction"]
+    if not isinstance(red, dict):
+        problems.append(f"redaction is not a JSON object (got {type(red).__name__}); it withholds nothing (R6)")
+        return set(), set(), True
+    extra = sorted(set(red) - _REDACTION_V2_KEYS)
+    if extra:
+        problems.append(f"redaction has unexpected keys (unsigned): {extra} (R1)")
+    missing = sorted(_REDACTION_V2_KEYS - set(red))
+    if missing:
+        problems.append(f"redaction is missing required keys: {missing} (R1)")
+    want = _profile_value(profile, "redaction_schema_v2", _REDACTION_V2_SCHEMA)
+    if red.get("schema") != want:
+        problems.append(f"redaction schema is not {want!r}: {red.get('schema')!r} (R1)")
+    ws = red.get("withheld_sections")
+    sections: set[str] = set()
+    ws_ok = (isinstance(ws, list) and all(isinstance(w, str) and w in _V4_WITHHOLDABLE for w in ws)
+             and len(set(ws)) == len(ws) and ws == sorted(ws))
+    if ws_ok:
+        sections = set(ws)
+    else:
+        # R6: "then **no** section counts as withheld, not even the valid entries of a partly bad list"
+        problems.append("redaction.withheld_sections must be a sorted array of distinct sections from "
+                        f"{list(_V4_WITHHOLDABLE)}: {ws!r}; no section counts as withheld (R2, R6)")
+    wi = red.get("withheld_items")
+    declared: set[str] = set()
+    wi_ok = isinstance(wi, list) and all(isinstance(w, str) for w in wi)
+    if not wi_ok:
+        # R6: "If ... `withheld_items` is not an array of strings, then D is empty"
+        problems.append("redaction.withheld_items must be an array of strings; no item counts as declared (R6)")
+    else:
+        declared = set(wi)
+        if len(wi) > _MAX_ITEMS:
+            problems.append(f"redaction.withheld_items has {len(wi)} entries (at most {_MAX_ITEMS}) (R2)")
+        long = [w for w in wi if len(w) > _MAX_ITEM_PATH]
+        if long:
+            problems.append(f"redaction.withheld_items has {len(long)} path(s) over {_MAX_ITEM_PATH} code points (R2)")
+        if len(declared) != len(wi):
+            problems.append("redaction.withheld_items has duplicate paths (R2)")
+        elif wi != sorted(wi):
+            problems.append("redaction.withheld_items is not sorted in code point order (R2)")
+    if ws_ok and wi_ok and not ws and not wi:
+        problems.append("redaction lists no withheld section and no withheld item; omit the record instead (R2)")
+    parent = red.get("parent_bundle_sha256")
+    if "parent_bundle_sha256" in red and not _is_digest(parent):
+        problems.append(f"redaction.parent_bundle_sha256 is not a well-formed sha256:<64 hex> digest: {parent!r}")
+    return sections, declared, True
+
+
+def _seal_signers_problems(prov_val: dict) -> list[str]:
+    """SPEC 7.9 SIG-18, SIG-19: the shape of `provenance.seal_signers` (the full signer-list check against the
+    `signatures` array, 7.10 G2, comes with co-signatures; here E is the primary block alone)."""
+    if "seal_signers" not in prov_val:
+        return ["provenance.seal_signers is required in v4 (SIG-18)"]
+    ss = prov_val["seal_signers"]
+    if not isinstance(ss, list) or not 1 <= len(ss) <= _MAX_SEAL_SIGNERS:
+        return [f"provenance.seal_signers must be an array of 1 to {_MAX_SEAL_SIGNERS} objects (SIG-19)"]
+    problems = []
+    for i, e in enumerate(ss):
+        if not isinstance(e, dict) or set(e) != {"alg", "public_key"}:
+            problems.append(f"provenance.seal_signers[{i}] must be an object with exactly the keys alg, public_key")
+            continue
+        alg, pk = e["alg"], e["public_key"]
+        if not (isinstance(alg, str) and _ALG_TOKEN_RE.fullmatch(alg)):
+            problems.append(f"provenance.seal_signers[{i}].alg is not a suite token: {alg!r}")
+            continue
+        rx = _SUITE_KEY_RE.get(alg, _GENERIC_HEX_RE)
+        if not (isinstance(pk, str) and rx.fullmatch(pk)):
+            problems.append(f"provenance.seal_signers[{i}].public_key does not match the {alg} row of the suite table")
+    pairs = [(e.get("alg"), e.get("public_key")) for e in ss if isinstance(e, dict)]
+    if not problems and len(set(pairs)) != len(pairs):
+        problems.append("provenance.seal_signers has a duplicate (alg, public_key) pair (SIG-19)")
+    return problems
+
+
+def _v4_item_walk(manifest: dict, visible: set[str], problems: list[str]) -> dict:
+    """SPEC 12.2 step 10 over the MANIFEST copies of the visible sections: form and fields (6.6.1, 6.6.2), placement
+    (P1-P4), path length (6.6.5), the item cap (P6), duplicate salts and commitments (6.6.4). Returns the walk:
+    {"items": [(path, item, ok)], "W": set of withheld-form paths}."""
+    # Bounded (finding 1 of v0.21.1): at most one item past the P6 cap is kept, and a pointer past the 6.6.5 length
+    # limit is kept truncated, so a hostile bundle cannot make the walk hold (pointer length x items) in memory.
+    found = []
+    count = 0
+    for s in _SECTIONS:
+        if s not in visible:
+            continue
+        value = manifest[s]["value"]
+        sec_found, n = _committed_walk(value, f"/{s}", max_items=_MAX_ITEMS + 1 - len(found),
+                                       max_path=_MAX_ITEM_PATH)
+        count += n
+        for ptr, toks, obj, plen in sec_found:
+            found.append((s, ptr, toks, obj, value, plen))
+    if count > _MAX_ITEMS:
+        problems.append(f"bundle has {count} committed items (at most {_MAX_ITEMS}, P6)")
+    items, withheld = [], set()
+    salts: dict[str, str] = {}
+    commitments: dict[str, str] = {}
+    for s, ptr, toks, obj, value, plen in found:
+        bad = item_problems(obj)
+        where = f"committed item at {ptr[:80]!r}"
+        for b in bad:
+            problems.append(f"{where}: {b}")
+        place = _placement_problem(s, toks, value)
+        if place:
+            problems.append(f"{where} {place}")
+        if plen > _MAX_ITEM_PATH:
+            problems.append(f"{where}: item path is {plen} code points (at most {_MAX_ITEM_PATH})")
+        ok = not bad
+        items.append((ptr, obj, ok))
+        if not ok:
+            continue
+        if "commitment" in obj:
+            withheld.add(ptr)
+        else:
+            if obj["salt"] in salts:
+                problems.append(f"{where} reuses the salt of the item at {salts[obj['salt']][:80]!r} (6.6.4)")
+            salts.setdefault(obj["salt"], ptr)
+        c = _item_commitment(obj)
+        if c in commitments:
+            problems.append(f"{where} has the same commitment as the item at {commitments[c][:80]!r} (6.6.4)")
+        commitments.setdefault(c, ptr)
+    return {"items": items, "W": withheld, "count": count}
+
+
+def _items_report(walk: dict | None) -> dict:
+    """SPEC 6.6.8: items: {total, disclosed, withheld, withheld_by_mark, withheld_paths: [{path, marks}]}."""
+    rep = {"total": 0, "disclosed": 0, "withheld": 0, "withheld_by_mark": {}, "withheld_paths": []}
+    if not walk:
+        return rep
+    for path, obj, ok in walk["items"]:
+        if not ok:
+            continue
+        if "commitment" in obj:
+            rep["withheld"] += 1
+            for m in obj["marks"]:
+                rep["withheld_by_mark"][m] = rep["withheld_by_mark"].get(m, 0) + 1
+            rep["withheld_paths"].append({"path": path, "marks": list(obj["marks"])})
+        else:
+            rep["disclosed"] += 1
+    rep["total"] = walk.get("count", len(walk["items"]))
+    rep["withheld_paths"].sort(key=lambda e: e["path"])
+    rep["withheld_by_mark"] = dict(sorted(rep["withheld_by_mark"].items()))
+    return rep
+
+
+def _check_v4(bundle: dict, problems: list[str], origin_problems: list[str],
+              attestation_problems: list[str] | None, attestations_out: list | None, *, profile=None,
+              sig_out: dict | None = None, pin_set: dict[str, bool] | None = None,
+              v4_out: dict | None = None) -> str | None:
+    """SPEC v4 draft 12.2 steps 5-19 for a canon-3 bundle. Returns the embedded signer (hex) like `_check`."""
+    # step 5, the pairing (11.5): "Canon 3 MUST appear only in v4"
+    want_v4 = _profile_value(profile, "envelope_schema_v4", _ENVELOPE_V4)
+    schema = bundle.get("schema")
+    if schema != want_v4:
+        if schema == _profile_value(profile, "envelope_schema", "evidence.envelope.v3"):
+            problems.append("canon 3 requires envelope v4 (SPEC 11.5)")
+        else:
+            problems.append(f"unknown envelope schema: {schema!r} (canon 3 pairs only with {want_v4!r}, SPEC 11.5)")
+    # step 6, the top-level key set (3.4)
+    extra_top = sorted(set(bundle) - _ALLOWED_TOP_V4)
+    if extra_top:
+        problems.append(f"bundle has unexpected top-level keys (unsigned): {extra_top}")
+    # step 7, the non-finite scan for an already-parsed input (4.2 item 10)
+    non_finite = _non_finite_paths(bundle)
+    if non_finite:
+        problems.append(f"bundle contains non-JSON (NaN/Infinity) values at: {non_finite[:5]}")
+        return None
+    # step 8
+    manifest = bundle.get("manifest", {})
+    if not isinstance(manifest, dict):
+        problems.append(f"manifest is not a JSON object (got {type(manifest).__name__})")
+        manifest = {}
+    sha256sums = bundle.get("sha256sums", {})
+    if not isinstance(sha256sums, dict):
+        problems.append(f"sha256sums is not a JSON object (got {type(sha256sums).__name__})")
+        sha256sums = {}
+    if set(manifest) != set(_SECTIONS):
+        problems.append(f"manifest has unexpected/missing sections: {sorted(set(manifest) ^ set(_SECTIONS))}")
+    if set(sha256sums) != _SHA256SUMS_KEYS:
+        problems.append(f"sha256sums has unexpected/missing sections: {sorted(set(sha256sums) ^ _SHA256SUMS_KEYS)}")
+    # step 9, the redaction record (10.4 R1, R2, R6)
+    withheld, declared, record = _v4_redaction(bundle, problems, profile)
+    blocks = {}
+    for side in _SECTIONS:
+        blk = manifest.get(side, {})
+        if not isinstance(blk, dict):
+            problems.append(f"{side}: manifest block is not a JSON object (got {type(blk).__name__})")
+            blk = {}
+        blocks[side] = blk
+    visible = {s for s in _SECTIONS if "value" in blocks[s]}
+    # step 10, the item walk (manifest copies), then the readable copies' form check (6.7.2 item 3)
+    walk = _v4_item_walk({s: blocks[s] for s in _SECTIONS}, visible, problems)
+    for copy_key, label in (("result", "result"), ("reproducibility", "reproducibility")):
+        if copy_key in bundle:
+            copy_found, _n = _committed_walk(bundle[copy_key], f"/{copy_key}", max_items=_MAX_ITEMS + 1,
+                                             max_path=_MAX_ITEM_PATH)
+            for ptr, _toks, obj, _plen in copy_found:
+                if copy_key == "reproducibility":
+                    problems.append(f"readable copy {label}: committed item at {ptr[:80]!r} (no items in "
+                                    "reproducibility, P2)")
+                for b in item_problems(obj):
+                    problems.append(f"readable copy {label}: committed item at {ptr[:80]!r}: {b} (6.7.2 item 3)")
+    if v4_out is not None:
+        v4_out["walk"] = walk
+    # step 11, the section digests under canon_3 (6.7.1) and presence (6.1, P5)
+    for side in _SECTIONS:
+        blk = blocks[side]
+        extra_blk = sorted(set(blk) - {"sha256", "value"})
+        if extra_blk:
+            problems.append(f"{side}: manifest block has unexpected keys (unsigned): {extra_blk}")
+        declared_d, sealed = blk.get("sha256"), sha256sums.get(side)
+        for lbl, dig in ((f"{side} manifest sha256", declared_d), (f"{side} sealed digest", sealed)):
+            if not _is_digest(dig):
+                problems.append(f"{lbl} is not a well-formed sha256:<64 hex> digest: {dig!r}")
+        if declared_d != sealed:
+            problems.append(f"{side}: manifest digest {_shown(declared_d)} != sealed digest {_shown(sealed)}")
+        if "value" in blk:
+            cb = _try_canon(blk["value"], f"{side}: manifest value (canon 3)", problems, canon_fn=_canon_v3)
+            if cb is not None and _sha(cb) != declared_d:
+                problems.append(f"{side}: manifest {_shown(declared_d)} != recomputed {_sha(cb)}")
+            if side in withheld:
+                problems.append(f"{side}: declared withheld but its value is still present")
+        elif side == "provenance":
+            problems.append("provenance: its value is withheld, but provenance cannot be withheld in v4 (P5)")
+        elif side not in withheld:
+            problems.append(f"{side}: value is missing but not declared redacted")
+    # step 12, the result copy, compared under canon_2 with NO projection (6.7.2 item 1)
+    if "result" in withheld:
+        if "result" in bundle:
+            problems.append("result section withheld but the embedded result core is still present")
+    else:
+        core = bundle.get("result", {})
+        if not isinstance(core, dict):
+            problems.append(f"embedded result core is not a JSON object (got {type(core).__name__})")
+            core = {}
+        for k in _profile_value(profile, "result_required_fields", _RESULT_REQUIRED):
+            if k not in core:
+                problems.append(f"embedded result.v1 core missing required field: {k!r}")
+        want_rs = _profile_value(profile, "result_schema", "evidence.result.v1")
+        want_rsv = _profile_value(profile, "result_schema_version", 1)
+        if "schema" in core and core.get("schema") != want_rs:
+            problems.append(f"embedded result core schema is not {want_rs!r}: {core.get('schema')!r}")
+        if "schema_version" in core and (isinstance(core.get("schema_version"), bool)
+                                         or core.get("schema_version") != want_rsv):
+            problems.append(f"embedded result core schema_version is not {want_rsv!r}: {core.get('schema_version')!r}")
+        cc = _try_canon(core, "embedded result core", problems, canon_fn=_canon_v2)
+        cr = _try_canon(blocks["result"].get("value"), "hashed result core", problems, canon_fn=_canon_v2)
+        if cc is not None and cr is not None and cc != cr:
+            problems.append("embedded result core != hashed result core (compared in stored form, canon 2 with no "
+                            "projection, 6.7.2: every item must have the same form in both copies)")
+    # step 13, reproducibility: REQUIRED in v4 (3.4), an object, equal under unprojected canon_2 (6.7.2 item 2)
+    prov_val = blocks["provenance"].get("value")
+    if "reproducibility" not in bundle:
+        problems.append("reproducibility is required in v4 (3.4)")
+    elif not isinstance(bundle["reproducibility"], dict):
+        problems.append("embedded reproducibility is not a JSON object "
+                        f"(got {type(bundle['reproducibility']).__name__})")
+    elif "value" in blocks["provenance"]:
+        cp = _try_canon(bundle["reproducibility"], "embedded reproducibility", problems, canon_fn=_canon_v2)
+        cpv = _try_canon(prov_val, "hashed provenance", problems, canon_fn=_canon_v2)
+        if cp is not None and cpv is not None and cp != cpv:
+            problems.append("embedded provenance != hashed provenance")
+    # step 14, R4 (W = D) and R5
+    w_set = walk["W"]
+    if (w_set or set(_SECTIONS) - visible) and not record:
+        problems.append("a redaction record is required when a section or an item is withheld (R5)")
+    for path in sorted(w_set - declared):
+        problems.append(f"undeclared item strip: the withheld item at {path[:80]!r} is not in "
+                        "redaction.withheld_items (R4)")
+    for path in sorted(declared - w_set):
+        sec = path.split("/")[1] if path.startswith("/") else None
+        if sec in _SECTIONS and sec not in visible:
+            problems.append(f"declared withheld item {path[:80]!r} lies in a withheld section and cannot be "
+                            "checked (R4)")
+        else:
+            problems.append(f"declared but not withheld: {path[:80]!r} is not a withheld-form item of a visible "
+                            "section (R4)")
+    # step 16 first, for the self-reference check of step 15 (12.2 step 15 names it)
+    try:
+        own_seal = _sha(_canon(sha256sums))
+    except (TypeError, ValueError):
+        own_seal = None
+    # step 15, provenance rules (8.2), seal_signers (7.9), the frontier slots (8.3) and derived_from (9.1)
+    if not isinstance(prov_val, dict):
+        if "value" in blocks["provenance"]:
+            problems.append(f"hashed provenance value must be a JSON object (got {type(prov_val).__name__})")
+    else:
+        _check_required_provenance(prov_val, problems)
+        _check_optional_provenance(prov_val, problems)
+        dl, dls = prov_val.get("data_library"), prov_val.get("data_library_sha256")
+        _no_null_leaf(prov_val, "data_library", "provenance data_library", problems)
+        if dl is not None and not (isinstance(dl, str) and dl):
+            problems.append(f"provenance data_library is not a non-empty string: {dl!r}")
+        if isinstance(dl, str) and dl and not _is_digest(dls):
+            problems.append(f"provenance names data_library {dl!r} but data_library_sha256 is not a "
+                            f"well-formed sha256:<64 hex> digest: {dls!r}")
+        elif not (isinstance(dl, str) and dl) and dls is not None and not _is_digest(dls):
+            problems.append(f"provenance data_library_sha256 is not a well-formed digest: {dls!r}")
+        ss_problems = _seal_signers_problems(prov_val)
+        problems.extend(ss_problems)
+        _check_frontier_slots(prov_val, problems, profile, own_seal=own_seal)
+    bsum = bundle.get("bundle_sha256")
+    if not _is_digest(bsum):
+        problems.append(f"bundle_sha256 is not a well-formed sha256:<64 hex> digest: {bsum!r}")
+    recomputed = own_seal or ""
+    if own_seal is None:
+        problems.append("sha256sums: value cannot be canonicalized")
+    elif own_seal != bsum:
+        problems.append(f"bundle: {_shown(bsum)} != recomputed {own_seal}")
+    # step 17, R3 against the recomputed seal
+    red = bundle.get("redaction")
+    if isinstance(red, dict) and "parent_bundle_sha256" in red and red["parent_bundle_sha256"] != recomputed:
+        problems.append("redaction parent_bundle_sha256 does not match this bundle's seal (R3)")
+    # step 18, the leak guard (8.1)
+    if "inputs" in withheld:
+        for core_src in (bundle.get("result"), blocks["result"].get("value")):
+            if isinstance(core_src, dict) and isinstance(core_src.get("provenance"), dict) \
+                    and "inputs" in core_src["provenance"]:
+                problems.append("inputs declared withheld but still present in the result core's provenance")
+                break
+    # unsigned v4 blocks this release does not check: never a pass by omission
+    if "signatures" in bundle:
+        problems.append("signatures: co-signatures (SPEC 7.8) are not checked by this verifier release; a bundle "
+                        "that carries them is not verified")
+    if attestation_problems is not None and "attestations" in bundle:
+        attestation_problems.append("attestations: v2 entries (SPEC 10.3) are not checked by this verifier release")
+    if v4_out is not None:
+        v4_out["unchecked_blocks"] = sorted(k for k in ("timestamps", "archive", "attestations") if k in bundle)
+    # step 19, the primary seal signature over the RECOMPUTED seal, and G2 for E = [signature]
+    signer = _check_signature(bundle, recomputed, problems, origin_problems, profile, sig_out=sig_out,
+                              pin_set=pin_set, v4_suites=True)
+    sig = bundle.get("signature")
+    declared_signers = ([(e["alg"], e["public_key"]) for e in prov_val["seal_signers"]]
+                        if isinstance(prov_val, dict) and not ss_problems else None)
+    if declared_signers is not None and isinstance(sig, dict) \
+            and declared_signers != [(sig.get("alg"), sig.get("public_key"))]:
+        problems.append("the seal signatures do not equal provenance.seal_signers (SIG-20, G2): the declared "
+                        "signer list is [the primary signature] in this release")
+    return signer
+
+
+def _dims(bundle: Any, cv: int | None, integrity: bool, att_problems: list[str], atts: list, items: dict) -> dict:
+    """The v4 dimensions (SPEC 13.7 item 4) as runner protocol v2 reports them (`dims`), plus `items` (6.6.8).
+
+    - canon 1/2 (13.4.6): `signoffs` is `invalid` exactly when the v1 attestation check fails, `ok` when a valid block
+      has an entry, else `none`; `time` and `archive` are `none`.
+    - canon 3: this release checks no sign-off v2, timestamp or archive. An absent block reads `none`; a
+      PRESENT one cannot be checked here and reads fail-closed (`signoffs: invalid`; `time`/`archive: malformed`
+      once integrity holds, else `not_checked`, 13.7 table), so the default policy rejects it (13.4.3 rows 3, 14,
+      17; 13.4.5 "a timestamp or archive that is present but invalid or malformed").
+    - canon >= 4, or an unreadable header: `signoffs: none`, `time: not_checked`, `archive: not_checked` (11.6)."""
+    b = bundle if isinstance(bundle, dict) else {}
+    if cv in (1, 2):
+        signoffs = "invalid" if att_problems else ("ok" if atts else "none")
+        return {"signoffs": signoffs, "time": "none", "archive": "none", "items": items}
+    if cv == 3:
+        signoffs = "invalid" if "attestations" in b else "none"
+        time = "not_checked" if not integrity else ("malformed" if "timestamps" in b else "none")
+        archive = "not_checked" if not integrity else ("malformed" if "archive" in b else "none")
+        return {"signoffs": signoffs, "time": time, "archive": archive, "items": items}
+    return {"signoffs": "none", "time": "not_checked", "archive": "not_checked", "items": items}
+
+
+def _plain_data_committed_paths(bundle: Any) -> list[str]:
+    """SPEC 6.6.1 / 6.6.8: under canon 1 and 2 a `$committed` object is plain data; report its JSON Pointer."""
+    manifest = bundle.get("manifest") if isinstance(bundle, dict) else None
+    if not isinstance(manifest, dict) or _exceeds_depth(bundle):
+        return []
+    out: list[str] = []
+    for s in _SECTIONS:
+        blk = manifest.get(s)
+        if isinstance(blk, dict) and "value" in blk:
+            # bounded like the v4 walk: the note names at most _MAX_PLAIN_NOTE_PATHS pointers, each cut at the item
+            # path limit, so plain data under a long key cannot blow up memory (it is advisory, never a state)
+            sec_found, _n = _committed_walk(blk["value"], f"/{s}", max_items=_MAX_PLAIN_NOTE_PATHS - len(out),
+                                            max_path=_MAX_ITEM_PATH)
+            out.extend(ptr for ptr, _t, _o, _l in sec_found)
+    return out
+
+
+#: The most pointers the `committed_key_plain_data` note lists.
+_MAX_PLAIN_NOTE_PATHS = 200
+
+
+#: The problem recorded when verification itself runs out of memory or stack on a hostile bundle (always a fail).
+_RESOURCE_PROBLEM = ("bundle could not be checked: verification ran out of resources ({}); a bundle that cannot be "
+                     "checked fails")
+
+#: The most problems a report lists per list (the state is always decided on the full list).
+_MAX_REPORTED_PROBLEMS = 200
+
+
+def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None) -> dict:
     """The THREE-state verdict. Recompute every hash, check the embedded result.v1 core, validate the
     signature under the bundle's own key (integrity) and check that key against the pin (origin).
 
@@ -1302,14 +2514,39 @@ def classify_bundle(bundle: dict, *, profile=None) -> dict:
     "untampered but not origin-proven" (re-derivable: its sealed inputs are exactly what the signer
     sealed) from "edited/forged" (never to be re-derived) without loosening what a plain pass means.
     """
+    # SPEC 7.12 / 13.4.1: a receiver ``policy`` (its ``pins``) and out-of-policy caller ``pins`` replace the single
+    # v3 pin with a pin set. Either is validated FIRST: a malformed one raises PolicyError and no verdict is made
+    # ("It MUST NOT fall back to the default policy"). A profile's data-only ``pinned_keys`` list (7.12, informative:
+    # "Python `Profile.pinned_keys` is a data-only list that replaces `pinned_pubkey`") is read as caller pins.
+    profile_keys = _profile_value(profile, "pinned_keys", None)
+    if pins is None and profile_keys is not None:
+        pins = list(profile_keys)
+    pin_set, members = effective_policy(policy, pins)
     problems: list[str] = []
     origin_problems: list[str] = []
     attestation_problems: list[str] = []
     attestations: list = []
     canon_info: dict = {}
     sig_info: dict = {}
-    signer = _check(bundle, problems, origin_problems, attestation_problems, attestations,
-                    profile=profile, canon_out=canon_info, sig_out=sig_info)
+    v4_info: dict = {}
+    try:
+        signer = _check(bundle, problems, origin_problems, attestation_problems, attestations,
+                        profile=profile, canon_out=canon_info, sig_out=sig_info, pin_set=pin_set, v4_out=v4_info)
+    except (MemoryError, RecursionError) as exc:
+        # A hostile bundle that exhausts memory or the stack is a verdict (fail), never a traceback.
+        signer = None
+        problems.append(_RESOURCE_PROBLEM.format(type(exc).__name__))
+        canon_info.pop("unsupported", None)
+        sig_info.pop("unsupported_alg", None)
+        v4_info.pop("walk", None)
+    # SPEC 6.6.8 / 13.7 item 4: the `items` report and the advisory `notes` (never a state). Under canon 1 and 2 a
+    # `$committed` object is plain data: items stay zero and the note names its pointer.
+    try:
+        plain = _plain_data_committed_paths(bundle) if canon_info.get("version") in (1, 2) else []
+    except (MemoryError, RecursionError) as exc:
+        plain = []
+        problems.append(_RESOURCE_PROBLEM.format(type(exc).__name__))
+    notes = [NOTE_COMMITTED_KEY_PLAIN_DATA] if plain else []
     integrity_ok = not problems
     # ORIGIN has two independent gates. First, the signature must be under the PINNED key
     # (`_check_signature` records a key mismatch in `origin_problems`). Second, the pin itself must be a
@@ -1332,7 +2569,12 @@ def classify_bundle(bundle: dict, *, profile=None) -> dict:
     # path is byte/verdict-identical.
     profile_pin, _malformed = _profile_pin(profile)   # a malformed pin already failed origin in _check_signature
     profile_declares_demo = _profile_value(profile, "pin_is_demo", False)
-    if profile_pin is None:
+    if pin_set is not None:
+        # the matched pin's effective demo flag (SIG-28 and the demo-wins merge are applied in resolve_pins);
+        # `pin_is_demo = True` marks every entry as demo (7.12, informative).
+        effective_pin = None
+        demo_pin = bool(sig_info.get("pin_demo")) or profile_declares_demo
+    elif profile_pin is None:
         effective_pin = _PINNED_PUBKEY
         demo_pin = pinned_key_is_demo() or profile_declares_demo
     else:
@@ -1357,7 +2599,7 @@ def classify_bundle(bundle: dict, *, profile=None) -> dict:
         state = STATE_INTEGRITY_ONLY_DEMO
     else:
         state = STATE_INTEGRITY_ONLY
-    return {
+    out = {
         "state": state,
         "integrity_ok": integrity_ok,
         "key_matches_pin": key_matches_pin,
@@ -1376,12 +2618,37 @@ def classify_bundle(bundle: dict, *, profile=None) -> dict:
         "signer": ("ed25519:" + signer) if isinstance(signer, str) else None,
         "signer_is_demo": signer == _DEMO_PUBKEY,
         "pinned_key_is_demo": demo_pin,
-        "pinned_key": "ed25519:" + effective_pin,
+        "pinned_key": ("ed25519:" + effective_pin) if effective_pin is not None else sig_info.get("pin_key_id"),
+        # SPEC 7.11: the signer's key id, and (when a pin set is in force) the pin set as {key_id: effective demo}
+        "signer_key_id": key_id("ed25519", signer) if isinstance(signer, str) else None,
+        "pin_set": None if pin_set is None else [{"key_id": k, "demo": pin_set[k]} for k in sorted(pin_set)],
         # ADR-050: the sealed canon version this bundle claims, and the highest version this verifier can
         # apply. `canon_version` is None when the header was malformed/missing (an integrity FAIL).
         "canon_version": canon_info.get("version"),
         "supported_canon_max": canon_info.get("supported_max", _CANON_SUPPORTED_MAX),
+        "items": _items_report(v4_info.get("walk")),
+        "dims": _dims(bundle, canon_info.get("version"), integrity_ok, attestation_problems, attestations,
+                      _items_report(v4_info.get("walk"))),
+        "notes": notes,
+        "note_details": {NOTE_COMMITTED_KEY_PLAIN_DATA: plain} if plain else {},
+        # v4 unsigned blocks this release reports but does not check (timestamps, archive, attestations v2)
+        "unchecked_blocks": v4_info.get("unchecked_blocks", []),
     }
+    # SPEC 13.4.2: decision = evaluate(verdict, policy) -> {accept, policy_sha256, reasons}, under the EFFECTIVE
+    # policy (the default policy plus the single v3 pin when no policy or pin set was given).
+    eff_pins = pin_set if pin_set is not None else {key_id("ed25519", effective_pin): bool(demo_pin)}
+    # the verdict records the policy it was made under (13.4.2), so `evaluate` can refuse a different one
+    out["policy_sha256"] = policy_sha256(members, eff_pins)
+    reasons = evaluate(out, members, eff_pins)
+    out["decision"] = {"accept": not reasons, "policy_sha256": out["policy_sha256"], "reasons": reasons}
+    # Bound the report: a bundle of many malformed items must not produce megabytes of problem text. The state was
+    # decided above on the full list; only the reported lists are capped (`problems_truncated` says by how much).
+    for key in ("problems", "integrity_problems", "origin_problems"):
+        if len(out[key]) > _MAX_REPORTED_PROBLEMS:
+            out[f"{key}_truncated"] = len(out[key]) - _MAX_REPORTED_PROBLEMS
+            out[key] = out[key][:_MAX_REPORTED_PROBLEMS] + [
+                f"... and {len(out[key]) - _MAX_REPORTED_PROBLEMS} more problems not shown"]
+    return out
 
 
 def verify_bundle(bundle: dict, *, profile=None) -> tuple[bool, list[str]]:
@@ -1407,7 +2674,8 @@ def integrity_ok(bundle: dict, *, profile=None) -> bool:
 
 def _check(bundle: dict, problems: list[str], origin_problems: list[str],
            attestation_problems: list[str] | None = None, attestations_out: list | None = None,
-           profile=None, canon_out: dict | None = None, sig_out: dict | None = None) -> str | None:
+           profile=None, canon_out: dict | None = None, sig_out: dict | None = None,
+           pin_set: dict[str, bool] | None = None, v4_out: dict | None = None) -> str | None:
     """Run every check, appending integrity problems to `problems` and origin problems to
     `origin_problems`; return the embedded signer key (hex) if the signature block was readable.
     Human sign-offs, if any, are validated into `attestations_out` with problems to `attestation_problems`
@@ -1446,6 +2714,26 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
         # newer verifier" from a possibly attacker-planted version label. A record whose header does NOT seal
         # under a valid signature is tampering, not a newer format: a plain integrity FAIL, never
         # `unsupported-canon`.
+        #
+        # SPEC 4.2 item 10, "(New in v4, for every version.)": "A verifier entry point that receives an
+        # already-parsed value has no unreadable outcome. It MUST scan for NaN and infinite doubles and fail the
+        # bundle if it finds one. This applies on the canon-1/2 path (12.1 step 7), the canon-3 path (12.2 step
+        # 7) and the newer-canon branch (11.6 step 4)." Text input never gets here with one (`loads` refuses it:
+        # 4.2 items 7 and 9); an in-memory dict handed to `classify_bundle` can. Before this, the branch
+        # returned before any non-finite check (open issue 17.2.1), so such a dict read as `unsupported-canon`.
+        # The scan runs AFTER the seal and signature checks below, in the order of 11.6 (it is step 4, after
+        # steps 1 and 2), so that on a hit "The pin comparison is still recorded" (11.6): `signer` and the
+        # pinned-key result in `origin_problems` are reported, and only the state is `fail`.
+        #
+        # Open issue 17.3.7, "declared intended" (SPEC v4 draft 11.2 item 3 and 11.6): in this branch the
+        # verifier checks ONLY the header seal, the signature over it, and the top-level key set. It does not
+        # read `schema`, the `sha256sums` key set, `redaction`, `timestamp` or `attestations` (it cannot trust
+        # any section-level field of a format it does not implement), and a top-level key outside the allowed
+        # list is REPORTED as a problem while the state stays `unsupported-canon` (11.2 item 3: "the reference
+        # verifiers report it as a problem but the state stays `unsupported-canon` (open issue 17.3.7, now
+        # declared intended)"). On the unsupported-alg sub-branch the same key makes the state `fail` (11.2
+        # item 4). Both are pinned by vectors (unsupported/c4_extra_top_key_reported.json,
+        # v3:invalid/newer_canon_alg_extra_top.json) and must not be "tidied" into one behaviour.
         bsum = bundle.get("bundle_sha256")
         cb = _try_canon(sha256sums_hdr, "sha256sums", problems)
         recomputed = _sha(cb) if cb is not None else ""
@@ -1453,7 +2741,13 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
                         and _SHA256_RE.fullmatch(bsum) is not None and recomputed == bsum)
         sig_problems: list[str] = []
         # populates `origin_problems` with the pinned-key mismatch (Decision 4) even on fail-forward.
-        signer = _check_signature(bundle, recomputed, sig_problems, origin_problems, profile, sig_out=sig_out)
+        signer = _check_signature(bundle, recomputed, sig_problems, origin_problems, profile, sig_out=sig_out,
+                                  pin_set=pin_set, v4_suites=True)
+        non_finite = _non_finite_paths(bundle)   # 11.6 step 4 / 4.2 item 10 (see above): a hit is `fail`
+        if non_finite:
+            problems.append(f"bundle contains non-JSON (NaN/Infinity) values at: {non_finite[:5]}")
+            problems.extend(sig_problems)
+            return signer
         if header_seals and not sig_problems:
             if canon_out is not None:
                 canon_out["unsupported"] = True
@@ -1466,7 +2760,7 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
             # outside the sealed shape -- e.g. "conclusion": "accepted by the regulator" -- is caught even
             # on a fail-forward bundle, so a field-rendering UI is never handed an unsigned claim with no
             # warning. The newer bundle's SECTIONS are left to the newer verifier; this is the envelope only.
-            extra_top = sorted(set(bundle) - _ALLOWED_TOP)
+            extra_top = sorted(set(bundle) - _ALLOWED_TOP_UNION)
             if extra_top:
                 problems.append(
                     f"bundle has unexpected top-level keys (unsigned, riding outside the seal): {extra_top}")
@@ -1474,7 +2768,7 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
             # F3: header seals, sole signature problem is an unknown suite -> unsupported-alg precedence.
             # BUT an unsigned top-level key riding outside the seal must still be caught (I1), matching the
             # normal path and the unsupported-canon sibling; if present, fall through to FAIL.
-            extra_top = sorted(set(bundle) - _ALLOWED_TOP)
+            extra_top = sorted(set(bundle) - _ALLOWED_TOP_UNION)
             if extra_top:
                 problems.append(
                     f"bundle has unexpected top-level keys (unsigned, riding outside the seal): {extra_top}")
@@ -1490,10 +2784,18 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
     # canon_version is now a KNOWN version (1..max; the newer branch returned above). Select the matching
     # canon so a v2 bundle's SECTION values recompute under JCS, not v1. The all-ASCII sha256sums header and
     # the bundle-seal recompute stay on `_canon` (byte-identical across versions), so only section values move.
+    if canon_version == 3:
+        # SPEC v4 draft 12.2: canon 3 is the v4 algorithm (the canon-1/2 path below is the v3 one, unchanged).
+        return _check_v4(bundle, problems, origin_problems, attestation_problems, attestations_out, profile=profile,
+                         sig_out=sig_out, pin_set=pin_set, v4_out=v4_out)
     canon_fn = _CANON[canon_version]
     envelope_schema = _profile_value(profile, "envelope_schema", "evidence.envelope.v3")
     if bundle.get("schema") != envelope_schema:
-        problems.append(f"unknown envelope schema: {bundle.get('schema')!r}")
+        if bundle.get("schema") == _profile_value(profile, "envelope_schema_v4", _ENVELOPE_V4):
+            # SPEC 11.5: "`evidence.envelope.v4` | 1 or 2 | `fail`: "envelope v4 requires canon 3""
+            problems.append(f"envelope v4 requires canon 3 (sealed canon_version {canon_version}; SPEC 11.5)")
+        else:
+            problems.append(f"unknown envelope schema: {bundle.get('schema')!r}")
 
     # The signature covers only the three section DIGESTS (sha256sums), so any key OUTSIDE the known
     # envelope shape rides UNSIGNED. Without this check an intermediary who cannot re-sign could add a
@@ -1560,13 +2862,13 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
             if not (isinstance(dig, str) and _SHA256_RE.fullmatch(dig)):
                 problems.append(f"{lbl} is not a well-formed sha256:<64 hex> digest: {dig!r}")
         if declared != sealed:               # the manifest digest must match the SEALED digest
-            problems.append(f"{side}: manifest digest {declared} != sealed digest {sealed}")
+            problems.append(f"{side}: manifest digest {_shown(declared)} != sealed digest {_shown(sealed)}")
         if "value" in blk:
             cb = _try_canon(blk["value"], f"{side}: manifest value", problems, canon_fn=canon_fn)
             if cb is not None:
                 recomputed = _sha(cb)
                 if recomputed != declared:
-                    problems.append(f"{side}: manifest {declared} != recomputed {recomputed}")
+                    problems.append(f"{side}: manifest {_shown(declared)} != recomputed {recomputed}")
             if side in withheld:
                 problems.append(f"{side}: declared withheld but its value is still present")
         elif side not in withheld:           # a missing value is only OK if lawfully redacted
@@ -1658,7 +2960,7 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
     cs = _try_canon(sha256sums, "sha256sums", problems)
     recomputed_bundle = _sha(cs) if cs is not None else ""
     if cs is not None and recomputed_bundle != bundle.get("bundle_sha256"):
-        problems.append(f"bundle: {bundle.get('bundle_sha256')} != recomputed {recomputed_bundle}")
+        problems.append(f"bundle: {_shown(bundle.get('bundle_sha256'))} != recomputed {recomputed_bundle}")
 
     # a lawful redaction leaves the seal untouched, so its recorded parent digest MUST equal this
     # bundle's own seal -- otherwise the (unsigned) record is claiming a false origin
@@ -1686,7 +2988,8 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
     if attestation_problems is not None and attestations_out is not None:
         _check_attestations(bundle, recomputed_bundle, attestation_problems, attestations_out)
 
-    return _check_signature(bundle, recomputed_bundle, problems, origin_problems, profile, sig_out=sig_out)
+    return _check_signature(bundle, recomputed_bundle, problems, origin_problems, profile, sig_out=sig_out,
+                            pin_set=pin_set)
 
 
 # ====================================================================================================
@@ -1921,10 +3224,29 @@ def _consumed_verdict(link: dict, up: dict, own_inputs: Any, citing_cv: int | No
                  "canon must be at least the upstream's (ADR-054), else the binding depends on how the "
                  "upstream's JSON is spelled rather than on what it sealed"))
     canon_fn = _CANON[citing_cv]
+    if citing_cv == 3 and up_cv != 3:
+        # SPEC v4 draft 9.4 rule 2: "When the upstream's `canon_version` is 1 or 2, both ends MUST be digested under
+        # `canon_2` with **no** projection" (under canon 1/2 `$committed` is plain data; T would merge distinct
+        # upstream values into one binding).
+        canon_fn = _canon_v2
     consumed = link["consumed"]
     res_blk = up["manifest"]["result"]
     if "value" not in res_blk:
         return (LINK_CONSUMED_UNVERIFIABLE, "upstream result is withheld; the consumed value cannot be checked")
+    if up_cv == 3:
+        # 9.4 rule 3: "A `consumed.path` that resolves to an item in the upstream, or passes through one, MUST give
+        # link state `consumed-mismatch`" (the binding would otherwise depend on what was disclosed).
+        tokens = _pointer_tokens(consumed["path"]) or []
+        cur = res_blk["value"]
+        for tok in [None, *tokens]:
+            if tok is not None:
+                ok, cur = resolve_pointer(cur, "/" + _ptr_token(tok))
+                if not ok:
+                    break
+            if isinstance(cur, dict) and _COMMITTED in cur:
+                return (LINK_CONSUMED_MISMATCH,
+                        (f"consumed.path {consumed['path']!r} resolves to, or passes through, a committed item "
+                         "in the upstream (SPEC 9.4 rule 3)"))
     found, value = resolve_pointer(res_blk["value"], consumed["path"])
     if not found:
         return (LINK_CONSUMED_MISMATCH,
@@ -1941,6 +3263,12 @@ def _consumed_verdict(link: dict, up: dict, own_inputs: Any, citing_cv: int | No
                  "there is no sealed input to bind the consumed value to"))
     if consumed["input"] not in own_inputs:
         return (LINK_CONSUMED_MISMATCH, f"names input {consumed['input']!r}, which the citing bundle did not seal")
+    if citing_cv == 3 and up_cv != 3 and _has_committed_member(own_inputs[consumed["input"]]):
+        # 9.4 rule 2, third bullet: "`own_inputs[consumed.input]` MUST NOT contain an object member named
+        # `$committed`. Under canon 3 such a member would be an item, and the binding would then depend on its form"
+        return (LINK_CONSUMED_MISMATCH,
+                (f"the citing bundle's input {consumed['input']!r} holds a committed item, but the upstream is "
+                 f"canon_version {up_cv}: such a link cannot bind (SPEC 9.4 rule 2)"))
     if _digest_of_value(own_inputs[consumed["input"]], canon_fn) != consumed["sha256"]:
         return (LINK_CONSUMED_MISMATCH,
                 (f"the citing bundle's sealed input {consumed['input']!r} is not the consumed value (a link to "

@@ -42,9 +42,55 @@ WITHHOLDABLE = ("inputs", "result", "provenance")
 _TOP_LEVEL_COPY = {"result": "result", "provenance": "reproducibility"}
 
 REDACTION_SCHEMA = "evidence.envelope.redaction.v1"
+#: SPEC evidence.envelope.v4 draft 10.4: the record of a canon-3 (v4) bundle.
+REDACTION_SCHEMA_V2 = "evidence.envelope.redaction.v2"
+#: v4 sections that may be withheld whole (6.6.6 P5: "In v4, `provenance` MUST NOT be withheld as a section").
+WITHHOLDABLE_V4 = ("inputs", "result")
 
 
-def redact_bundle(bundle: dict, *, withhold, profile=None) -> dict:
+def _is_v4(bundle: dict) -> bool:
+    sums = bundle.get("sha256sums")
+    return isinstance(sums, dict) and sums.get("canon_version") == 3
+
+
+def _redact_v4(bundle: dict, sections: list[str], items: list[str], profile) -> dict:
+    """See `_redact_v4_impl`. A malformed bundle raises ValueError (never KeyError/TypeError)."""
+    try:
+        return _redact_v4_impl(bundle, sections, items, profile)
+    except (KeyError, TypeError, AttributeError, IndexError) as exc:
+        raise ValueError(f"cannot redact a malformed v4 bundle ({type(exc).__name__}: {exc})") from None
+
+
+def _redact_v4_impl(bundle: dict, sections: list[str], items: list[str], profile) -> dict:
+    """SPEC v4 draft 10.4: withhold whole sections (inputs, result) and/or committed items by path, keeping the seal.
+    R7: "the sorted union of the old and new `withheld_sections`; the sorted union of the old and new
+    `withheld_items`, minus every path under a section that is now wholly withheld"."""
+    from .committed import item_at, set_item, withheld_form
+    for name in sections:
+        if name not in WITHHOLDABLE_V4:
+            raise ValueError(f"cannot withhold {name!r} in a v4 bundle; withholdable sections: {WITHHOLDABLE_V4}")
+    out = copy.deepcopy(bundle)
+    for path in items:
+        set_item(out, path, withheld_form(item_at(out, path)))     # raises on a path that names no item
+    for name in sections:
+        out["manifest"][name].pop("value", None)
+        top = _TOP_LEVEL_COPY.get(name)
+        if top and top in out:
+            del out[top]
+    prior = bundle.get("redaction") if isinstance(bundle.get("redaction"), dict) else {}
+    all_sections = sorted(set(prior.get("withheld_sections", [])) | set(sections))
+    all_items = sorted(p for p in set(prior.get("withheld_items", [])) | set(items)
+                       if p.split("/")[1] not in all_sections)
+    if not all_sections and not all_items:
+        out.pop("redaction", None)
+        return out
+    out["redaction"] = {"schema": getattr(profile, "redaction_schema_v2", None) or REDACTION_SCHEMA_V2,
+                        "parent_bundle_sha256": bundle["bundle_sha256"],
+                        "withheld_sections": all_sections, "withheld_items": all_items}
+    return out
+
+
+def redact_bundle(bundle: dict, *, withhold=(), withhold_items=(), profile=None) -> dict:
     """Return a disclosure-safe redacted copy of `bundle` with each named section's contents
     withheld. The seal and the original signature are untouched, so the result still verifies.
 
@@ -59,10 +105,18 @@ def redact_bundle(bundle: dict, *, withhold, profile=None) -> dict:
         profile: optional dialect profile; supplies the dialect's own ``redaction_schema`` tag. None/default
             uses the neutral literal.
 
+        withhold_items: v4 (canon 3) only -- item paths (``"/" + section + JSON pointer``) of disclosed committed
+            items to rewrite into withheld form (SPEC v4 draft 6.6, 10.4). A v4 bundle gets a redaction record v2.
+
     Raises:
-        ValueError: if a requested section is not withholdable or not present in the bundle.
+        ValueError: if a requested section is not withholdable or not present in the bundle, or an item path
+            names no committed item.
     """
     names = sorted({str(w) for w in withhold})
+    if _is_v4(bundle):
+        return _redact_v4(bundle, names, sorted({str(p) for p in withhold_items}), profile)
+    if withhold_items:
+        raise ValueError("withhold_items needs a canon-3 (evidence.envelope.v4) bundle; a v3 bundle has no items")
     sums = bundle.get("sha256sums", {})
     for name in names:
         if name not in WITHHOLDABLE:

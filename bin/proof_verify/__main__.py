@@ -20,22 +20,30 @@ from .verify import (  # noqa: F401 -- re-exported for backward-compatible acces
     CHAIN_INTEGRITY_ONLY,
     CHAIN_NONE,
     CHAIN_UNKNOWN,
+    DEMO_KEY_ID,
     STATE_UNSUPPORTED_ALG,
     STATE_UNSUPPORTED_CANON,
+    PolicyError,
     _reject_duplicate_keys,
     _reject_non_finite,
     _text_depth_ok,
+    _utc_or_null,
     classify_bundle,
     index_upstreams,
     key_label,
     loads,
     pin_key,
     pinned_key_fingerprint,
+    safe_terminal_output,
     verify_chain,
 )
 
 _USAGE = ("usage: proof-verify <bundle.json> [--profile pkg.module:attr] [--pubkey HEX] [--json]\n"
-          "                    [--upstream PATH ...]   (or: python -m proof_verify ...)\n"
+          "                    [--policy FILE] [--as-of T] [--upstream PATH ...]   (or: python -m proof_verify ...)\n"
+          "  --policy FILE    a receiver policy (evidence.receiver-policy.v1) whose pins replace the built-in demo\n"
+          "                   pin; --pubkey is then merged into it. A malformed policy exits 2 with no verdict.\n"
+          "  --as-of T        the evaluation instant, a UTC timestamp YYYY-MM-DDTHH:MM:SSZ (default: now, whole\n"
+          "                   seconds); echoed in the JSON verdict. A malformed value exits 2.\n"
           "  --upstream PATH  walk the bundle's derived_from chain through these earlier bundles (a file or a\n"
           "                   folder of *.json; repeatable). Offline: nothing is fetched.")
 
@@ -67,11 +75,31 @@ VERIFY_VERDICT_KIND = "proof_core.verify_verdict.v1"
 
 
 def _withheld_list(bundle) -> list:
-    """The `redaction.withheld` names as a sorted list of strings, or [] when absent/malformed -- the CLI must
-    print a verdict on ANY input, never crash formatting a field the verifier already reported as malformed."""
-    red = bundle.get("redaction") if isinstance(bundle, dict) else None
-    wh = red.get("withheld") if isinstance(red, dict) else None
-    return sorted(w for w in wh if isinstance(w, str)) if isinstance(wh, list) else []
+    """The withheld section names as a sorted list of strings, or [] when absent/malformed -- the CLI must print a
+    verdict on ANY input, never crash formatting a field the verifier already reported as malformed. Reads the v3
+    record (`redaction.withheld`) and the v4 record (`redaction.withheld_sections`), and also names any section
+    whose manifest value is absent, so a withheld section is never left unreported."""
+    if not isinstance(bundle, dict):
+        return []
+    red = bundle.get("redaction")
+    names = set()
+    if isinstance(red, dict):
+        for key in ("withheld", "withheld_sections"):
+            wh = red.get(key)
+            if isinstance(wh, list):
+                names.update(w for w in wh if isinstance(w, str))
+    manifest = bundle.get("manifest")
+    if isinstance(manifest, dict):
+        names.update(s for s in ("inputs", "result", "provenance")
+                     if isinstance(manifest.get(s), dict) and "value" not in manifest[s])
+    return sorted(names)
+
+
+def _withheld_items(rep: dict) -> list:
+    """The withheld committed items of a v4 bundle (`items.withheld_paths`, SPEC 6.6.8): [{path, marks}]."""
+    items = rep.get("items") if isinstance(rep, dict) else None
+    paths = items.get("withheld_paths") if isinstance(items, dict) else None
+    return [e for e in paths if isinstance(e, dict)] if isinstance(paths, list) else []
 
 
 def _print_canon_note(bundle) -> None:
@@ -118,7 +146,18 @@ def _attestation_gate(rep: dict, code: int) -> int:
         else:
             print("FAIL  a human sign-off on this bundle does not verify -- failing closed.", file=sys.stderr)
         return EXIT_FAIL
+    reasons = _decision_rejects(rep)
+    if reasons:
+        print(f"FAIL  the receiver decision rejects this bundle ({', '.join(reasons)}): a timestamp, archive or "
+              "sign-off block is present but could not be accepted -- failing closed.")
+        return EXIT_FAIL
     return code
+
+
+def _decision_rejects(rep: dict) -> list[str]:
+    """SPEC v4 draft 13.5: a decision reason other than `state_not_accepted` turns exit 0 or 3 into 1."""
+    decision = rep.get("decision") or {}
+    return [r for r in decision.get("reasons", []) if r != "state_not_accepted"]
 
 
 def _json_exit_code(rep: dict) -> int:
@@ -130,12 +169,18 @@ def _json_exit_code(rep: dict) -> int:
     if not rep["integrity_ok"]:
         return EXIT_FAIL
     code = EXIT_VERIFIED if rep["origin_ok"] else EXIT_INTEGRITY_ONLY
-    if not rep.get("attestations_ok", True):
+    if not rep.get("attestations_ok", True) or _decision_rejects(rep):
         return EXIT_FAIL
     return code
 
 
-def _emit_json(path: str, bundle: dict, rep: dict, chain: dict | None = None) -> int:
+def _now_utc() -> str:
+    """SPEC 7.13: the default `as_of`, the current time floored to whole seconds."""
+    import time
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _emit_json(path: str, bundle: dict, rep: dict, chain: dict | None = None, as_of: str | None = None) -> int:
     """Emit the machine-readable verdict (the classify_bundle report plus a few CLI-level facts) and return
     the matching exit code. The demo-pin / not-a-production-pass fact is made UNAMBIGUOUS via
     ``production_origin_pass`` so an automated gate never mistakes an integrity-only (exit 3) record for a
@@ -150,27 +195,47 @@ def _emit_json(path: str, bundle: dict, rep: dict, chain: dict | None = None) ->
     out["kind"] = VERIFY_VERDICT_KIND
     out["path"] = path
     out["exit_code"] = code
+    out["as_of"] = as_of or _now_utc()          # SIG-29: the output echoes the as_of used
     out["withheld"] = _withheld_list(bundle)
+    # what this run did NOT check: the values of withheld sections and of withheld committed items (only their
+    # sealed digests / commitments were checked)
+    out["withheld_items"] = [e.get("path") for e in _withheld_items(rep)]
+    out["not_checked"] = ([f"section {s}" for s in out["withheld"]]
+                          + [f"item {e.get('path')}" for e in _withheld_items(rep)])
     out["pinned_key_fingerprint"] = pinned_key_fingerprint()
     # the one fact an origin gate keys on: exit 0 under a real PRODUCTION pin is the only pass.
     out["production_origin_pass"] = code == EXIT_VERIFIED
     out["not_a_production_pass"] = code != EXIT_VERIFIED
-    # reconcile the headline `state` with the exit code: a present-but-INVALID human sign-off overrides the
-    # code to FAIL while classify's `state` still reads integrity-only / integrity+origin (the decision seal
-    # is intact). Never let `state` read non-fail while the CLI failed closed -- an agent keying on `state`
-    # must see the failure too, not only one keying on exit_code. A genuine integrity fail already reads
-    # "fail", so only the attestation-gate override is rewritten.
-    if code == EXIT_FAIL and rep.get("integrity_ok") and not rep.get("attestations_ok", True):
-        out["state"] = "fail (invalid sign-off)"
-    elif code == EXIT_FAIL and rep.get("integrity_ok") and chain is not None:
-        out["state"] = "fail (chain)"
-    elif code == EXIT_CHAIN_INCOMPLETE:
-        out["state"] = "incomplete (chain)"
+    # SPEC v4 draft 13.5: `state` is ALWAYS the 13.1 state, never rewritten -- the former strings
+    # "fail (invalid sign-off)", "fail (chain)" and "incomplete (chain)" are retired for every input. Why the CLI
+    # failed closed is in `exit_code`, `decision` (reasons such as `signoffs_invalid`), `dims` and the `chain`
+    # member (set above when --upstream walked a chain). Exit codes are unchanged.
     print(json.dumps(out, sort_keys=True, default=str))
     return code
 
 
-def verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: list[str] | None = None) -> int:
+def _policy_error(exc: Exception, as_json: bool) -> int:
+    """SPEC 13.4.1: a malformed policy is refused; "the CLI exits 2 with no verdict". Runner protocol v2 (13.3):
+    print ``{"error": "<kind>", "message": "..."}`` with no ``state``."""
+    kind = getattr(exc, "kind", "policy")       # "policy" (malformed) or "policy_unsupported" (not evaluated by this release)
+    if as_json:
+        print(json.dumps({"error": kind, "message": str(exc)}, sort_keys=True))
+    else:
+        print(f"error: policy refused: {exc}", file=sys.stderr)
+    return EXIT_UNREADABLE
+
+
+def verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: list[str] | None = None,
+                policy=None, pins=None, as_of: str | None = None) -> int:
+    """See `_verify_path`. In text mode everything printed is escaped to printable ASCII (`safe_text`): problem
+    lists and link details carry bundle text, and a bundle must never drive the reader's terminal."""
+    with safe_terminal_output(enabled=not as_json):
+        return _verify_path(path, profile=profile, as_json=as_json, upstreams=upstreams, policy=policy, pins=pins,
+                            as_of=as_of)
+
+
+def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: list[str] | None = None,
+                 policy=None, pins=None, as_of: str | None = None) -> int:
     """Verify the bundle JSON at ``path``; print a human-readable result; return an exit code:
 
       0  verified (integrity + origin): every hash recomputes and the signature is valid under a real
@@ -230,12 +295,15 @@ def verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: li
                 return EXIT_UNREADABLE
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_UNREADABLE
-    rep = classify_bundle(bundle, profile=profile)
+    try:
+        rep = classify_bundle(bundle, profile=profile, policy=policy, pins=pins)
+    except PolicyError as exc:
+        return _policy_error(exc, as_json)
     chain = None if ups is None else verify_chain(bundle, index_upstreams(ups, profile=profile).get,
                                                   profile=profile)
     if as_json:
         # machine-readable verdict: the SAME exit code as the prose path, no prose printed.
-        return _emit_json(path, bundle, rep, chain)
+        return _emit_json(path, bundle, rep, chain, as_of)
     if rep.get("state") == STATE_UNSUPPORTED_CANON:
         # ADR-050 fail-FORWARD: a signed record sealed under a canon this verifier does not support. The
         # header seals and its signature verifies, so the sha256sums header is unedited since signing -- but
@@ -290,6 +358,7 @@ def verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: li
         signer_hex = (rep["signer"] or "").removeprefix("ed25519:")
         if rep.get("pinned_key_is_demo") and rep.get("key_matches_pin"):
             print(f"OK  integrity verified -- origin NOT established (demo pin): {path}")
+            _print_withheld(bundle, rep)
             print("    every hash recomputes and the Ed25519 signature is valid under the pinned key, so")
             print("    the record is UNEDITED since it was signed. But that pinned key is the public DEMO")
             print("    identity (its seed ships in signing.py); anyone can reproduce a signature under it,")
@@ -298,6 +367,7 @@ def verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: li
             print(f"      pinned key: {pinned_key_fingerprint()}  (public demo key -- not a trust anchor)")
         else:
             print(f"OK  integrity verified -- origin NOT established: {path}")
+            _print_withheld(bundle, rep)
             print("    every hash recomputes and the Ed25519 signature is valid under the key this bundle")
             print("    carries, so the record is UNEDITED since it was signed -- but that key is not the pin:")
             print(f"      signed by:  {key_label(signer_hex)}")
@@ -308,7 +378,6 @@ def verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: li
         print(f"    next:  proof-reproduce {path} --runner <your ReproduceRunner>   (or --command \"<cmd>\")")
         print("           re-derives the number from its sealed inputs (integrity holds, so it is safe to re-run)")
         print(f"    exit {EXIT_INTEGRITY_ONLY}: NOT a production pass -- an automated origin gate must reject this.")
-        _print_withheld(bundle)
         _print_canon_note(bundle)
         _print_attestations(rep)
         _print_frontier(rep, walked=chain is not None)
@@ -317,10 +386,10 @@ def verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: li
     # origin_ok is True only under a real production pin (never under the demo pin), so reaching here
     # means a pinned-production-key signature over an intact bundle.
     print(f"OK  verified (integrity + origin): {path}")
+    _print_withheld(bundle, rep)
     print(f"    pinned key: {pinned_key_fingerprint()}")
     print("    cross-check this fingerprint against the published trust root before")
     print("    relying on origin -- see docs/TRUST_ROOT.md. Origin holds only if it matches.")
-    _print_withheld(bundle)
     _print_canon_note(bundle)
     _print_attestations(rep)
     _print_frontier(rep, walked=chain is not None)
@@ -328,12 +397,28 @@ def verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: li
     return _chain_gate(chain, _attestation_gate(rep, EXIT_VERIFIED), announce=True)
 
 
-def _print_withheld(bundle: dict) -> None:
+#: The most withheld item paths the text output lists (the JSON lists every one).
+_MAX_PRINTED_ITEMS = 20
+
+
+def _print_withheld(bundle: dict, rep: dict | None = None) -> None:
+    """Say plainly what this run did NOT check: withheld sections and withheld committed items."""
     withheld = _withheld_list(bundle)
     if withheld:
-        print(f"    NOTE: sections withheld ({', '.join(withheld)}); their values are not present in")
+        print(f"    NOTE: sections withheld ({', '.join(withheld)}): NOT CHECKED. Their values are not present in")
         print("          this bundle -- only their sealed digests were checked, so NO value for those")
-        print("          sections (e.g. the result core) was verified here.")
+        print("          sections (e.g. the result core) was verified here. 'UNEDITED' below covers only what is")
+        print("          present.")
+    items = _withheld_items(rep or {})
+    if items:
+        print(f"    NOTE: {len(items)} committed item(s) withheld: NOT CHECKED. Only their sealed commitments were")
+        print("          checked; the withheld values are not in this bundle and were not verified here")
+        print("          ('UNEDITED' below covers only what is present):")
+        for e in items[:_MAX_PRINTED_ITEMS]:
+            marks = e.get("marks") or []
+            print(f"            {e.get('path')}" + (f"  (marks: {', '.join(str(m) for m in marks)})" if marks else ""))
+        if len(items) > _MAX_PRINTED_ITEMS:
+            print(f"            ... and {len(items) - _MAX_PRINTED_ITEMS} more (see --json)")
 
 
 def _print_frontier(rep: dict, *, walked: bool = False) -> None:
@@ -475,6 +560,11 @@ def _resolve_profile(spec: str):
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    with safe_terminal_output(enabled="--json" not in args):
+        return _main(args)
+
+
+def _main(args: list[str]) -> int:
     if args[:1] in (["-h"], ["--help"]):
         print(_USAGE)
         return 0
@@ -487,6 +577,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="pin this 64-hex Ed25519 public key as the origin trust root")
     p.add_argument("--json", action="store_true",
                    help="emit the verdict as a JSON object (same exit code) instead of human text")
+    p.add_argument("--policy", metavar="FILE",
+                   help="a receiver policy JSON file (evidence.receiver-policy.v1); its pins replace the demo pin")
+    p.add_argument("--as-of", dest="as_of", metavar="T",
+                   help="the evaluation instant, a UTC timestamp YYYY-MM-DDTHH:MM:SSZ (default: now)")
     p.add_argument("--upstream", action="append", metavar="PATH",
                    help="an earlier bundle (or a folder of them) to walk the derived_from chain through; repeatable")
     try:
@@ -495,6 +589,14 @@ def main(argv: list[str] | None = None) -> int:
         print("error: expected a bundle path", file=sys.stderr)
         print(_USAGE, file=sys.stderr)
         return EXIT_UNREADABLE
+    if ns.as_of is not None and not _utc_or_null(ns.as_of):
+        # SPEC 13.5: "A malformed value is a usage error with exit 2."
+        msg = f"--as-of must be a UTC timestamp YYYY-MM-DDTHH:MM:SSZ (SPEC 2.3): {ns.as_of!r}"
+        if ns.json:
+            print(json.dumps({"error": "usage", "message": msg}, sort_keys=True))
+        else:
+            print(f"error: {msg}", file=sys.stderr)
+        return EXIT_UNREADABLE
     profile = None
     if ns.profile is not None:
         try:
@@ -502,13 +604,28 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_UNREADABLE
-    if ns.pubkey is not None:
+    policy = pins = None
+    if ns.policy is not None:
+        # SPEC 7.12 / 13.4.1 step 3: pins from outside the policy file -- the CLI's built-in demo pin and
+        # --pubkey -- are MERGED into it with the demo-wins rule, so a demo-signed bundle reads
+        # `integrity-only (demo pin)` under any policy.
+        try:
+            with open(ns.policy, "rb") as handle:
+                policy = loads(handle.read().decode("utf-8"))
+        except (OSError, ValueError, RecursionError) as exc:
+            return _policy_error(PolicyError(f"cannot read policy {ns.policy!r}: {type(exc).__name__}: {exc}"),
+                                 ns.json)
+        pins = [{"key_id": DEMO_KEY_ID, "demo": True}]
+        if ns.pubkey is not None:
+            pins.append({"legacy_raw_key": ns.pubkey, "demo": False})
+    elif ns.pubkey is not None:
         try:
             pin_key(ns.pubkey)
         except (ValueError, TypeError) as exc:
             print(f"error: --pubkey must be 64 lowercase hex characters: {exc}", file=sys.stderr)
             return EXIT_UNREADABLE
-    return verify_path(ns.bundle, profile=profile, as_json=ns.json, upstreams=ns.upstream)
+    return verify_path(ns.bundle, profile=profile, as_json=ns.json, upstreams=ns.upstream, policy=policy,
+                       pins=pins, as_of=ns.as_of)
 
 
 if __name__ == "__main__":

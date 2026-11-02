@@ -49,7 +49,8 @@ import subprocess
 import sys
 import tempfile
 
-from .certify import ReproduceError, reproduce_bundle
+from .certify import ReproduceError, reproduce_bundle, subject_canon
+from .committed import disclosed_values as _disclosed
 from .contract import Case, Fidelity, ReproduceRunner, Result, Verdict
 from .envelope import build_bundle
 
@@ -163,11 +164,25 @@ def _capability_of(bundle: dict) -> str | None:
 
 
 def _subject_canon_version(bundle: dict) -> int:
-    """The subject's sealed canon_version when it is one this producer can mint, else 1 (a subject sealed under
-    an unknown canon cannot have been verified intact, so the re-mint's comparison fails on its own)."""
-    from .envelope import _CANON
-    sv = (bundle.get("sha256sums") or {}).get("canon_version")
-    return sv if type(sv) is int and sv in _CANON else 1
+    """The subject's sealed canon_version, which the re-mint uses. SPEC v4 draft section 15 step 3 (closes open
+    issue 17.3.10): the subject's own canon N, for every N this kernel implements -- no fallback to v1 for a
+    canon it does not implement (ReproduceError instead; unreachable after the integrity check, which an
+    unsupported canon never passes)."""
+    return subject_canon(bundle)[0]
+
+
+def _remint_links(links, sealed_inputs, canon_version: int):
+    """The subject's `derived_from` links the re-mint can carry. A canon-3 link whose consumed input holds a
+    committed item was sealed over that input's PROJECTED (commitment) form; the re-mint carries the disclosed
+    values with fresh salts, so such a link can never bind again and the mint would refuse it. It is left out of
+    the fresh bundle (which is only compared by its outputs); every other link is kept."""
+    if canon_version != 3 or not isinstance(links, list) or not isinstance(sealed_inputs, dict):
+        return links
+    from proof_verify.verify import _has_committed_member
+    kept = [link for link in links
+            if not (isinstance(link, dict) and isinstance(link.get("consumed"), dict)
+                    and _has_committed_member(sealed_inputs.get(link["consumed"].get("input"))))]
+    return kept or None
 
 
 def _rebuild_with_outputs(bundle: dict, fresh_outputs: dict, profile=None) -> dict:
@@ -201,13 +216,16 @@ def _rebuild_with_outputs(bundle: dict, fresh_outputs: dict, profile=None) -> di
         reproduce_tolerance=core.get("reproduce_tolerance"),
     )
     return build_bundle(
-        Case(capability=capability, inputs=case_value["inputs"]), result,
+        # a canon-3 subject is re-minted on its DISCLOSED values: salts are never reused across bundles (SPEC 6.6.4),
+        # and the comparison is by value (15 step 3)
+        Case(capability=capability, inputs=(_disclosed(case_value["inputs"]) if _subject_canon_version(bundle) == 3
+                                            else case_value["inputs"])), result,
         engine=prov["engine"], engine_version=prov["engine_version"],
         reproduce=prov.get("reproduce"),
         data_library=(prov.get("data_library"), prov.get("data_library_sha256")),
         applicability=prov.get("applicability"),
         completeness=prov.get("completeness"),
-        derived_from=prov.get("derived_from"),
+        derived_from=_remint_links(prov.get("derived_from"), case_value["inputs"], _subject_canon_version(bundle)),
         # re-mint under the subject's sealed canon (ADR-053/054): a v2 subject's links were digested under v2,
         # so a v1 re-mint would be refused by the binding belt (and would not be the same computation's seal).
         canon_version=_subject_canon_version(bundle),
@@ -401,10 +419,18 @@ def _emit_json_error(path: str, state: str, code: int, *, integrity_ok=None, **e
 
 
 def main(argv: list[str] | None = None) -> int:
+    from proof_verify.verify import safe_terminal_output
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # text mode: everything printed is escaped to printable ASCII (bundle text never reaches the terminal raw)
+    with safe_terminal_output(enabled="--json" not in argv):
+        return _main(argv)
+
+
+def _main(argv: list[str]) -> int:
     # independent verifier + the ONE guarded loader + the origin-pin setter (for --pubkey)
     from proof_verify.verify import classify_bundle, loads, pin_key
 
-    argv = list(sys.argv[1:] if argv is None else argv)
     try:
         args = _parser().parse_args(argv)
     except SystemExit as exc:  # argparse usage error (-> 2) or --help (-> 0)
