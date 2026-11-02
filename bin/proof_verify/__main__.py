@@ -13,8 +13,10 @@ import sys
 # The parse-time guards (duplicate-key / NaN / depth / size) live in ONE place, `verify.loads`, so every
 # bundle reader shares them. Re-exported here (``cli._text_depth_ok``, ``cli.loads``) for callers/tests
 # that reach for them on the CLI module.
+from .render import RenderError, headline, seal_signer_lines, signoff_lines, time_lines
 from .verify import (  # noqa: F401 -- re-exported for backward-compatible access
     _MAX_JSON_DEPTH,
+    BUILTIN_DEMO_PINS,
     CHAIN_FAIL,
     CHAIN_INCOMPLETE,
     CHAIN_INTEGRITY_ONLY,
@@ -39,9 +41,12 @@ from .verify import (  # noqa: F401 -- re-exported for backward-compatible acces
 )
 
 _USAGE = ("usage: proof-verify <bundle.json> [--profile pkg.module:attr] [--pubkey HEX] [--json]\n"
-          "                    [--policy FILE] [--as-of T] [--upstream PATH ...]   (or: python -m proof_verify ...)\n"
+          "                    [--policy FILE] [--allow-self-verify] [--as-of T] [--upstream PATH ...]\n"
+          "                    (or: python -m proof_verify ...)\n"
           "  --policy FILE    a receiver policy (evidence.receiver-policy.v1) whose pins replace the built-in demo\n"
           "                   pin; --pubkey is then merged into it. A malformed policy exits 2 with no verdict.\n"
+          "  --allow-self-verify  accept a verifier or approver sign-off made with an originator's key or signer\n"
+          "                   id (sets allow_self_verify in the effective policy; rejected by default).\n"
           "  --as-of T        the evaluation instant, a UTC timestamp YYYY-MM-DDTHH:MM:SSZ (default: now, whole\n"
           "                   seconds); echoed in the JSON verdict. A malformed value exits 2.\n"
           "  --upstream PATH  walk the bundle's derived_from chain through these earlier bundles (a file or a\n"
@@ -134,12 +139,43 @@ def _print_attestations(rep: dict) -> None:
         print("          identity step (an approver registry).")
 
 
+def _print_seal_keys(rep: dict, signer_hex: str | None) -> None:
+    """The seal signer lines. v4 input (SPEC 13.6): "A seal signer MUST be shown as `sealed by key <key_id>` and
+    never as a person's sign-off", one line per verified seal signature. v3 input keeps its v3 line."""
+    if rep.get("canon_version") == 3:
+        for line in seal_signer_lines(rep):
+            print(f"      {line}")
+    elif signer_hex is not None:
+        print(f"      signed by:  {key_label(signer_hex)}")
+
+
+def _print_signoffs(rep: dict, policy) -> None:
+    """Sign-offs and seal signers. v3 input keeps its v1 rendering (`_print_attestations`) unchanged. v4 input is
+    rendered per SPEC 13.6 (`proof_verify.render`): the seal signers as `sealed by key <key_id>`, then each
+    sign-off's role, meaning and statement, printed name, signer id, key and roster status, the claimed time, the
+    reviewed copy and prior relations, and its validity, with the caveat sentence. Every bundle string goes through
+    the escape E. A renderer that cannot show a required field refuses and says so."""
+    if rep.get("canon_version") != 3:
+        _print_attestations(rep)
+        return
+    roster = policy.get("roster") if isinstance(policy, dict) else None
+    for line in time_lines(rep):
+        print(f"    {line}")
+    try:
+        lines = signoff_lines(rep, roster)
+    except RenderError as exc:
+        print(f"    sign-offs: cannot render: {exc}", file=sys.stderr)
+        return
+    for line in lines:
+        print(f"    {line}")
+
+
 def _attestation_gate(rep: dict, code: int) -> int:
     """A present-but-INVALID human sign-off must fail the CLI closed: a forged or edited countersignature
     rides a bundle whose decision seal is still intact, so integrity/origin alone would exit 0 (or 3) and a
     `verify && trust` gate would wave the forged sign-off through. If any sign-off does not verify, override
     the exit code to FAIL -- the decision is untampered, but a claim of human approval on it is not."""
-    if not rep.get("attestations_ok", True):
+    if rep.get("canon_version") != 3 and not rep.get("attestations_ok", True):
         if rep.get("attestations_null") is True:
             print("FAIL  the bundle's attestations field is present but null (malformed) -- failing closed.",
                   file=sys.stderr)
@@ -148,8 +184,7 @@ def _attestation_gate(rep: dict, code: int) -> int:
         return EXIT_FAIL
     reasons = _decision_rejects(rep)
     if reasons:
-        print(f"FAIL  the receiver decision rejects this bundle ({', '.join(reasons)}): a timestamp, archive or "
-              "sign-off block is present but could not be accepted -- failing closed.")
+        print(f"FAIL  the receiver decision rejects this bundle ({', '.join(reasons)}) -- failing closed.")
         return EXIT_FAIL
     return code
 
@@ -195,7 +230,7 @@ def _emit_json(path: str, bundle: dict, rep: dict, chain: dict | None = None, as
     out["kind"] = VERIFY_VERDICT_KIND
     out["path"] = path
     out["exit_code"] = code
-    out["as_of"] = as_of or _now_utc()          # SIG-29: the output echoes the as_of used
+    out["as_of"] = rep.get("as_of") or as_of or _now_utc()     # SIG-29: the output echoes the as_of used
     out["withheld"] = _withheld_list(bundle)
     # what this run did NOT check: the values of withheld sections and of withheld committed items (only their
     # sealed digests / commitments were checked)
@@ -296,7 +331,7 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_UNREADABLE
     try:
-        rep = classify_bundle(bundle, profile=profile, policy=policy, pins=pins)
+        rep = classify_bundle(bundle, profile=profile, policy=policy, pins=pins, as_of=as_of)
     except PolicyError as exc:
         return _policy_error(exc, as_json)
     chain = None if ups is None else verify_chain(bundle, index_upstreams(ups, profile=profile).get,
@@ -350,48 +385,62 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
         print(f"FAIL  {path}", file=sys.stderr)
         for problem in rep["problems"]:
             print(f"  - {problem}", file=sys.stderr)
+        if isinstance(bundle, dict) and "attestations" in bundle:
+            print("  sign-offs are not shown: the record failed integrity, so nothing on it is presented as signed.",
+                  file=sys.stderr)
         return EXIT_FAIL
+    # SPEC 13.5 "Human-readable headline": when the decision turns the exit into 1, the first line names the first
+    # reason other than `state_not_accepted`; the verdict lines below then lose their "OK" mark.
+    hl = headline((rep.get("decision") or {}).get("reasons") or [])
+    lead = "OK  "
+    if hl is not None:
+        print(f"FAIL  {hl}: {path}")
+        lead = "    "
     if not rep["origin_ok"]:
         # untampered, but origin not established: say exactly that, calmly. The number is still
         # checkable (by re-derivation, not by us). Two shapes: signed under the pin but the pin is the
         # public demo identity (proof-core's normal verdict today), or signed under some other key.
         signer_hex = (rep["signer"] or "").removeprefix("ed25519:")
         if rep.get("pinned_key_is_demo") and rep.get("key_matches_pin"):
-            print(f"OK  integrity verified -- origin NOT established (demo pin): {path}")
+            print(f"{lead}integrity verified -- origin NOT established (demo pin): {path}")
             _print_withheld(bundle, rep)
             print("    every hash recomputes and the Ed25519 signature is valid under the pinned key, so")
             print("    the record is UNEDITED since it was signed. But that pinned key is the public DEMO")
             print("    identity (its seed ships in signing.py); anyone can reproduce a signature under it,")
             print("    so this proves INTEGRITY, not that the record came from a production signer (ORIGIN).")
-            print(f"      signed by:  {key_label(signer_hex)}")
+            _print_seal_keys(rep, signer_hex)
             print(f"      pinned key: {pinned_key_fingerprint()}  (public demo key -- not a trust anchor)")
         else:
-            print(f"OK  integrity verified -- origin NOT established: {path}")
+            print(f"{lead}integrity verified -- origin NOT established: {path}")
             _print_withheld(bundle, rep)
             print("    every hash recomputes and the Ed25519 signature is valid under the key this bundle")
             print("    carries, so the record is UNEDITED since it was signed -- but that key is not the pin:")
-            print(f"      signed by:  {key_label(signer_hex)}")
+            _print_seal_keys(rep, signer_hex)
             print(f"      pinned key: {pinned_key_fingerprint()}")
             print("    Anyone can sign with a public seed, so this proves INTEGRITY, not that the record came")
             print("    from the pinned signer (ORIGIN). Expected for a bundle you signed yourself (on a")
             print("    machine without the pinned signer's key).")
         print(f"    next:  proof-reproduce {path} --runner <your ReproduceRunner>   (or --command \"<cmd>\")")
         print("           re-derives the number from its sealed inputs (integrity holds, so it is safe to re-run)")
-        print(f"    exit {EXIT_INTEGRITY_ONLY}: NOT a production pass -- an automated origin gate must reject this.")
+        if hl is None:
+            print(f"    exit {EXIT_INTEGRITY_ONLY}: NOT a production pass -- an automated origin gate must reject this.")
+        else:
+            print(f"    exit {EXIT_FAIL}: the receiver decision rejects this record ({hl}); see the first line.")
         _print_canon_note(bundle)
-        _print_attestations(rep)
+        _print_signoffs(rep, policy)
         _print_frontier(rep, walked=chain is not None)
         _print_chain(chain, len(ups or []))
         return _chain_gate(chain, _attestation_gate(rep, EXIT_INTEGRITY_ONLY), announce=True)
     # origin_ok is True only under a real production pin (never under the demo pin), so reaching here
     # means a pinned-production-key signature over an intact bundle.
-    print(f"OK  verified (integrity + origin): {path}")
+    print(f"{lead}verified (integrity + origin): {path}")
     _print_withheld(bundle, rep)
+    _print_seal_keys(rep, None)
     print(f"    pinned key: {pinned_key_fingerprint()}")
     print("    cross-check this fingerprint against the published trust root before")
     print("    relying on origin -- see docs/TRUST_ROOT.md. Origin holds only if it matches.")
     _print_canon_note(bundle)
-    _print_attestations(rep)
+    _print_signoffs(rep, policy)
     _print_frontier(rep, walked=chain is not None)
     _print_chain(chain, len(ups or []))
     return _chain_gate(chain, _attestation_gate(rep, EXIT_VERIFIED), announce=True)
@@ -579,6 +628,8 @@ def _main(args: list[str]) -> int:
                    help="emit the verdict as a JSON object (same exit code) instead of human text")
     p.add_argument("--policy", metavar="FILE",
                    help="a receiver policy JSON file (evidence.receiver-policy.v1); its pins replace the demo pin")
+    p.add_argument("--allow-self-verify", dest="allow_self_verify", action="store_true",
+                   help="accept a verifier/approver sign-off under an originator's key or signer id (SPEC 13.5)")
     p.add_argument("--as-of", dest="as_of", metavar="T",
                    help="the evaluation instant, a UTC timestamp YYYY-MM-DDTHH:MM:SSZ (default: now)")
     p.add_argument("--upstream", action="append", metavar="PATH",
@@ -615,10 +666,24 @@ def _main(args: list[str]) -> int:
         except (OSError, ValueError, RecursionError) as exc:
             return _policy_error(PolicyError(f"cannot read policy {ns.policy!r}: {type(exc).__name__}: {exc}"),
                                  ns.json)
-        pins = [{"key_id": DEMO_KEY_ID, "demo": True}]
+        # "the CLI's built-in demo pin" (13.4.1 step 3): every demo key of SPEC section 2 (the Ed25519 and the P-256
+        # demo key), as a demo pin, so a demo-signed bundle of either suite reads `integrity-only (demo pin)`.
+        pins = [dict(p) for p in BUILTIN_DEMO_PINS]
         if ns.pubkey is not None:
             pins.append({"legacy_raw_key": ns.pubkey, "demo": False})
-    elif ns.pubkey is not None:
+    if ns.allow_self_verify:
+        # SPEC 13.5: "`--allow-self-verify`: sets `allow_self_verify: true` in the effective policy, so
+        # `policy_sha256` reflects it". Without --policy: the default policy with that one member set, plus the
+        # out-of-policy pins the --policy path merges (the built-in demo pins and --pubkey).
+        if policy is None:
+            policy = {"schema": "evidence.receiver-policy.v1"}
+            pins = [dict(p) for p in BUILTIN_DEMO_PINS]
+            if ns.pubkey is not None:
+                pins.append({"legacy_raw_key": ns.pubkey, "demo": False})
+        if not isinstance(policy, dict):
+            return _policy_error(PolicyError("a receiver policy must be a JSON object"), ns.json)
+        policy = {**policy, "allow_self_verify": True}
+    if ns.pubkey is not None and pins is None:
         try:
             pin_key(ns.pubkey)
         except (ValueError, TypeError) as exc:

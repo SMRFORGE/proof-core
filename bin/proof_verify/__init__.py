@@ -3,6 +3,7 @@ nothing from the producer or any domain engine -- so a reviewer verifies a bundl
 none of the code that produced it, enforced by packaging, not promised."""
 from .verify import (
     DEMO_KEY_ID,
+    P256_DEMO_KEY_ID,
     STATE_FAIL,
     STATE_INTEGRITY_ONLY,
     STATE_INTEGRITY_ONLY_DEMO,
@@ -22,10 +23,12 @@ from .verify import (
     resolve_pointer,
     verify_bundle,
     verify_chain,
+    verify_signature,
 )
 
 __all__ = [
     "DEMO_KEY_ID",
+    "P256_DEMO_KEY_ID",
     "STATE_FAIL",
     "STATE_INTEGRITY_ONLY",
     "STATE_INTEGRITY_ONLY_DEMO",
@@ -46,6 +49,7 @@ __all__ = [
     "run_conformance",
     "verify_bundle",
     "verify_chain",
+    "verify_signature",
 ]
 
 

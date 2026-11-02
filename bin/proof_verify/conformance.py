@@ -92,11 +92,13 @@ def _safe_vector_path(d: pathlib.Path, name) -> pathlib.Path:
 
 
 def _policy_entry(d: pathlib.Path, entry: dict, text: str, policy_fn, states: dict) -> tuple[bool, str]:
-    """Run one `expect: "policy"` vector (SPEC v4 draft 13.3). Returns (ok, got)."""
+    """Run one vector under its own policy file (an `expect: "policy"` vector, or a `valid` one that names a policy;
+    SPEC v4 13.3). Returns (ok, got)."""
     if policy_fn is None:
         return False, "not run (the vector has its own policy and no policy_fn was given)"
     try:
-        policy = _loads(_safe_vector_path(d, entry["policy"]).read_text(encoding="utf-8"))
+        # SPEC 13.3: "the vector's policy, or `policy/default.json` when the vector names none"
+        policy = _loads(_safe_vector_path(d, entry.get("policy", "policy/default.json")).read_text(encoding="utf-8"))
         bundle = _loads(text)
     except (OSError, KeyError, ValueError) as exc:
         return False, f"error: {exc}"
@@ -110,6 +112,8 @@ def _policy_entry(d: pathlib.Path, entry: dict, text: str, policy_fn, states: di
     if "expect_error" in entry:
         return False, "a verdict, but the vector expects the policy to be refused"
     state = result.get("state") if isinstance(result, dict) else None
+    if entry.get("expect") == "valid" and not result.get("key_matches_pin"):
+        return False, f"a valid vector, but the verdict does not accept ({state!r})"
     want = states.get(entry["file"])
     if want is None:
         return False, "no expected state for this vector in expected_states.json"
@@ -187,7 +191,9 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
             failures.append({"file": entry.get("file", "<missing>"), "expected": entry.get("expect"),
                              "got": f"error: {exc}", "note": entry.get("note", "")})
             continue
-        if isinstance(entry, dict) and entry.get("expect") == "policy":
+        # a vector that names its own policy runs under it, whatever its `expect` (SPEC 13.3; a `valid` vector with its
+        # own policy, such as the trusted-time vectors that carry test-TSA pins, must reach an accept state under it)
+        if isinstance(entry, dict) and (entry.get("expect") == "policy" or "policy" in entry):
             try:
                 text = raw.decode("utf-8")
             except ValueError as exc:
@@ -198,7 +204,8 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
             if ok:
                 passed += 1
             else:
-                failures.append({"file": entry["file"], "expected": "policy", "got": got, "note": entry.get("note", "")})
+                failures.append({"file": entry["file"], "expected": entry.get("expect"), "got": got,
+                                 "note": entry.get("note", "")})
             continue
         loader_refused = False
         try:

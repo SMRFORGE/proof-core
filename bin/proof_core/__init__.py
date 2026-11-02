@@ -22,7 +22,7 @@ The on-disk schema carries a domain-neutral ``evidence.*`` namespace (e.g. ``evi
 the spine is domain-agnostic and names nothing about any particular producer.
 """
 from .adapter import Adapter
-from .attest import ATTESTATION_SCHEMA, attest_bundle, make_attestation
+from .attest import ATTESTATION_SCHEMA, add_signoff, attest_bundle, make_attestation, make_signoff
 from .certify import (
     REPRODUCTION_CAPABILITY,
     ReproduceError,
@@ -47,7 +47,7 @@ from .testing import assert_integration
 
 #: Single source of truth for the version. pyproject derives the dist version from this
 #: (see [tool.setuptools.dynamic]). Independent of any consumer's version line.
-__version__ = "0.21.3"
+__version__ = "0.22.0"
 
 __all__ = [
     "ATTESTATION_SCHEMA",
@@ -63,6 +63,7 @@ __all__ = [
     "SealedFunction",
     "Verdict",
     "__version__",
+    "add_signoff",
     "assert_integration",
     "attest_bundle",
     "build_bundle",
@@ -70,6 +71,7 @@ __all__ = [
     "canon",
     "certify_bundle",
     "make_attestation",
+    "make_signoff",
     "redact_bundle",
     "reproduce_bundle",
     "seal_certification",
