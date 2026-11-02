@@ -46,6 +46,7 @@ from __future__ import annotations
 import contextvars
 import copy
 import math
+from collections.abc import Callable
 
 from .contract import ReproduceRunner
 from .envelope import _CANON, canon, is_integrity_field, stat_tolerance_problem
@@ -117,6 +118,32 @@ class ReproduceError(RuntimeError):
 #: call in `reproduce_bundle`). Under canon v2 a whole float and its integer (2.0 / 2) seal identically, so a
 #: v2 comparison must not tell them apart either; v1 keeps its exact, type-sensitive comparison.
 _CMP_CANON: contextvars.ContextVar = contextvars.ContextVar("proof_core_cmp_canon", default=canon)
+
+
+def subject_canon(bundle) -> tuple[int, Callable[[object], bytes]]:
+    """The subject's sealed ``canon_version`` N and the canon function ``canon_N`` a re-run is compared under.
+
+    SPEC (evidence.envelope.v4 draft) section 15 step 3: "compare the fresh result with the sealed one under the
+    subject's canon: `canon_N` for the subject's `canon_version` N, for every supported N, including canon 3
+    (this closes open issue 17.3.10)". The lookup is over every canon this kernel implements (`_CANON`: 1, 2 and
+    3), never "2 if N == 2 else 1": open issue 17.3.10 was exactly that a newer canon would silently be compared
+    under v1. Canon 3 is compared on the DISCLOSED values (``canon_disclosed``), not under ``canon_3`` itself,
+    because a fresh bundle has fresh salts. A canon_version this kernel does not
+    implement (or a malformed one) raises ReproduceError instead of falling back. ``reproduce_bundle`` only gets
+    here after the integrity check passed, which an unsupported canon never does, so the raise is a guard
+    against a future caller that skips that check, not a reachable reproduce outcome today."""
+    sums = bundle.get("sha256sums") if isinstance(bundle, dict) else None
+    cv = sums.get("canon_version") if isinstance(sums, dict) else None
+    if type(cv) is not int or cv not in _CANON:
+        raise ReproduceError(f"cannot compare a re-run under canon_version {cv!r}: this kernel implements "
+                             f"canon versions {sorted(_CANON)} only (no fallback to another canon)")
+    if cv == 3:
+        # SPEC 15 step 3: "Under canon 3 a fresh bundle has fresh salts, so the comparison is made on the disclosed
+        # values (T applied to both after full disclosure) rather than on the stored item forms". canon_3 itself
+        # would compare commitments, which differ for every honest re-run (fresh salts).
+        from .committed import canon_disclosed
+        return cv, canon_disclosed
+    return cv, _CANON[cv]
 
 
 def _ccanon(value):
@@ -339,7 +366,18 @@ def _inputs_of(bundle: dict) -> dict:
     value = block["value"]
     if not isinstance(value, dict) or "capability" not in value or "inputs" not in value:
         raise ReproduceError("bundle inputs block is not a {capability, inputs} record")
+    _refuse_withheld(value, "inputs")
     return value
+
+
+def _refuse_withheld(value, section: str) -> None:
+    """SPEC v4 draft 10.6: a plaintext consumer "MUST refuse a value that contains a withheld-form item. They MUST
+    report "N items withheld; reproduce not possible here"" (a named gap, like a withheld section)."""
+    from .committed import refuse_withheld_items
+    try:
+        refuse_withheld_items(value, f"sealed {section}")
+    except ValueError as exc:
+        raise ReproduceError(str(exc)) from None
 
 
 def _result_core_of(bundle: dict) -> dict:
@@ -360,6 +398,7 @@ def _result_core_of(bundle: dict) -> dict:
     value = block["value"]
     if not isinstance(value, dict):
         raise ReproduceError("bundle result block is not a result-core record")
+    _refuse_withheld(value, "result")
     return value
 
 
@@ -447,11 +486,16 @@ def reproduce_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> 
     # ADR-053/054: compare the re-run under the subject's sealed canon (see _CMP_CANON). The runner gets the
     # sealed inputs exactly as parsed: under v2 a whole number may arrive as 2 or 2.0 (the seal cannot tell them
     # apart), so a v2 runner must accept either -- see docs/INTEGRATING.md.
-    sums = bundle.get("sha256sums") if isinstance(bundle, dict) else None
-    subject_cv = sums.get("canon_version") if isinstance(sums, dict) else None
-    v2 = type(subject_cv) is int and subject_cv == 2
+    # SPEC v4 draft 15 step 3 (closes 17.3.10): canon_N for the subject's N, for every supported N.
+    subject_cv, cmp_canon = subject_canon(bundle)
     run_inputs = spec["inputs"]
-    token = _CMP_CANON.set(_CANON[2] if v2 else canon)
+    if subject_cv == 3:
+        # the engine computes on VALUES, never on item wrappers (salts are not inputs): hand it the disclosed values,
+        # and compare cores by value (15 steps 3-4)
+        from .committed import disclosed_values
+        run_inputs = disclosed_values(run_inputs)
+        orig_core = disclosed_values(orig_core)
+    token = _CMP_CANON.set(cmp_canon)
     try:
         return _reproduce_compare(bundle, runner, spec, capability, orig_core, run_inputs, profile, verify_fields)
     finally:
@@ -461,6 +505,12 @@ def reproduce_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> 
 def _reproduce_compare(bundle, runner, spec, capability, orig_core, run_inputs, profile, verify_fields) -> dict:
     fresh = runner.run(capability, run_inputs)
     fresh_core = fresh["manifest"]["result"]["value"]
+    if subject_canon(bundle)[0] == 3:
+        from .committed import disclosed_values
+        try:
+            fresh_core = disclosed_values(fresh_core)
+        except ValueError:
+            pass                       # a fresh bundle with withheld items cannot match; the comparison says so
     result_match, reproduce_detail = _cores_match(orig_core, fresh_core)
     # The re-run must have honored the SEALED inputs, not substituted its own. `reproduce_bundle` hands
     # the runner the sealed inputs, but a runner that ignores a field, drops a sealed threshold, or

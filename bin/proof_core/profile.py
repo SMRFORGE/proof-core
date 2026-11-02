@@ -47,6 +47,10 @@ class Profile:
     #: v2 -> v3 for the one-time header-shape move (`canon_version` added inside `sha256sums`); the tag names
     #: the structural SHAPE, orthogonal to `canon_version`, which names the canonicalization ALGORITHM.
     envelope_schema: str = "evidence.envelope.v3"
+    #: the v4 envelope tag (SPEC v4 draft 11.5: "A profile dialect MUST apply the same pairing to its own v3 and v4
+    #: tags (`envelope_schema` and `envelope_schema_v4`, `redaction_schema` and `redaction_schema_v2`)"). A v4 tag
+    #: pairs with canon_version 3 only; the v3 tag with canon_version 1 or 2.
+    envelope_schema_v4: str = "evidence.envelope.v4"
     #: embedded result-core `schema` literal and its integer `schema_version` (mint).
     result_schema: str = "evidence.result.v1"
     result_schema_version: int = 1
@@ -55,6 +59,8 @@ class Profile:
         "schema", "schema_version", "result", "fidelity", "verdict")
     #: the (unsigned) redaction-record `schema` literal (mint-side producers / verify-side shape check).
     redaction_schema: str = "evidence.envelope.redaction.v1"
+    #: the redaction record v2 tag (SPEC v4 draft 10.4), used by v4 bundles only.
+    redaction_schema_v2: str = "evidence.envelope.redaction.v2"
 
     # --- provenance sentinels (mint) ------------------------------------------------------------- #
     #: the `produced_by` sentinel meaning "the open engine produced/reproduced this".
@@ -98,6 +104,11 @@ class Profile:
     #: the public key the ORIGIN check pins, as 64 lowercase hex (no ``ed25519:`` prefix). None = use the
     #: verifier's module-global pin unchanged (the neutral default; keeps the single-pin design intact).
     pinned_pubkey: str | None = None
+    #: VERIFY: a data-only PIN SET (SPEC v4 draft 7.12: "Python `Profile.pinned_keys` is a data-only list that
+    #: replaces `pinned_pubkey`; the old field maps to a one-element list"). Each entry is a closed pin object with
+    #: exactly one of ``key_id`` / ``legacy_raw_key``, a required boolean ``demo`` and an optional ``label``. None =
+    #: not set. Mutually exclusive with ``pinned_pubkey``. ``pin_is_demo = True`` marks every entry as demo.
+    pinned_keys: tuple[Mapping[str, Any], ...] | None = None
     #: VERIFY: declare that the pinned key is a DEMO / test identity, so origin can NEVER be established
     #: under this profile even if the signature validates under the pin -- the honest verdict is integrity
     #: only. Default False = unchanged: the verifier decides demo-ness solely by the literal match against
@@ -133,6 +144,13 @@ class Profile:
         if pin is not None and not (isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin)):
             raise ValueError("Profile.pinned_pubkey must be 64 lowercase hex characters (an Ed25519 "
                              f"public key, no 'ed25519:' prefix) or None; got {pin!r}")
+        if self.pinned_keys is not None:
+            if pin is not None:
+                raise ValueError("Profile.pinned_keys replaces pinned_pubkey; set one or the other, not both")
+            keys = tuple(dict(k) if isinstance(k, Mapping) else k for k in self.pinned_keys)
+            from proof_verify.verify import resolve_pins  # the verifier's rule, not a second copy
+            resolve_pins(list(keys), where="Profile.pinned_keys")   # PolicyError (a ValueError) on a bad entry
+            object.__setattr__(self, "pinned_keys", keys)
 
 
 #: The neutral profile singleton. `build_bundle(profile=None)` resolves to THIS, and its emitted bytes

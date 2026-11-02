@@ -15,6 +15,7 @@ import json
 import math
 import re
 from decimal import Decimal
+from json.encoder import encode_basestring as _json_escape  # stdlib C escaper, ensure_ascii=False
 from typing import Any
 
 from . import provenance as prov
@@ -81,7 +82,29 @@ _SAFE_INT = 2**53 - 1   # Number.MAX_SAFE_INTEGER -- the largest bare integer ca
 _V2_SHORT_ESCAPE = {0x08: "\\b", 0x09: "\\t", 0x0A: "\\n", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\"}
 
 
+_V2_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _v2_surrogate_escape(m: re.Match) -> str:
+    return f"\\u{ord(m.group()):04x}"
+
+
 def _v2_guard(obj: Any) -> None:
+    t = type(obj)
+    if t is str or t is bool or obj is None:          # exact-type fast paths; subclasses take the generic path
+        return
+    if t is dict:
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise TypeError(f"canon v2: object key must be a string, got {type(k).__name__}")
+            if type(v) is not str:                    # a str value is always representable
+                _v2_guard(v)
+        return
+    if t is list:
+        for v in obj:
+            if type(v) is not str:
+                _v2_guard(v)
+        return
     if isinstance(obj, bool):
         return
     if isinstance(obj, int):
@@ -107,17 +130,15 @@ def _v2_guard(obj: Any) -> None:
 
 
 def _v2_string(s: str) -> str:
-    out = ['"']
-    for ch in s:
-        c = ord(ch)
-        if c in _V2_SHORT_ESCAPE:
-            out.append(_V2_SHORT_ESCAPE[c])
-        elif c < 0x20 or 0xD800 <= c <= 0xDFFF:  # C0 controls AND lone surrogates -> \uXXXX (ECMAScript
-            out.append(f"\\u{c:04x}")            # JSON.stringify / RFC 8785), so the UTF-8 encode never sees one
-        else:
-            out.append(ch)
-    out.append('"')
-    return "".join(out)
+    # The stdlib's C JSON escaper with ensure_ascii=False already writes the RFC 8785 form for every scalar value:
+    # the short escapes \b \t \n \f \r \" \\, every other C0 control as lowercase \u00xx, and everything else raw
+    # (DEL, U+2028/U+2029, all other non-ASCII, astral characters). The one difference: it passes a lone surrogate
+    # through raw, where JCS / JSON.stringify write lowercase \uXXXX. That is fixed up here; an escape the C
+    # escaper wrote is pure ASCII, so the fix-up can never touch one.
+    out = _json_escape(s)
+    if _V2_SURROGATE.search(out) is None:
+        return out
+    return _V2_SURROGATE.sub(_v2_surrogate_escape, out)
 
 
 def _v2_number(n: Any) -> str:
@@ -127,6 +148,14 @@ def _v2_number(n: Any) -> str:
         raise ValueError("canon v2: NaN/Infinity are not valid JSON")
     if n == 0:
         return "0"
+    if type(n) is float:
+        # Fast path. repr() picks the shortest round-trip digits (the digits the general path below starts from)
+        # and writes positional notation exactly when the decimal exponent is in [-4, 16), inside ECMAScript's
+        # positional range (-7, 21). There the two agree except that repr() writes a whole value as "2.0" where
+        # ES writes "2". A value repr() writes in exponent form takes the general path.
+        r = repr(n)
+        if "e" not in r:
+            return r.removesuffix(".0")
     neg = n < 0
     _, digs, exp = Decimal(repr(abs(n))).as_tuple()
     digs = list(digs)
@@ -149,23 +178,76 @@ def _v2_number(n: Any) -> str:
     return "-" + out if neg else out
 
 
+def _v2_utf16_key(kv: tuple) -> bytes:
+    return kv[0].encode("utf-16-be", "surrogatepass")
+
+
+def _v2_write(obj: Any, w) -> None:
+    """Append the JCS text of `obj` to the output through `w` (a list's append): one join at the end, instead of
+    re-copying every nested container's text into its parent's string at each level."""
+    t = type(obj)                                     # exact-type dispatch first: the shapes json.loads produces
+    if t is str:
+        w(_v2_string(obj))
+        return
+    if t is dict:
+        keys = list(obj)
+        if all(type(k) is str and k.isascii() for k in keys):
+            # all-ASCII keys: code-point order IS UTF-16 code-unit order, and dict keys are distinct, so a plain
+            # sort gives exactly the order of the UTF-16 sort below
+            keys.sort()
+            items = [(k, obj[k]) for k in keys]
+        else:
+            items = sorted(obj.items(), key=_v2_utf16_key)
+    elif t is list:
+        items = None
+    elif t is int:
+        w(str(obj))
+        return
+    elif t is float:
+        w(_v2_number(obj))
+        return
+    elif obj is None:
+        w("null")
+        return
+    elif obj is True:
+        w("true")
+        return
+    elif obj is False:
+        w("false")
+        return
+    elif isinstance(obj, str):
+        w(_v2_string(obj))
+        return
+    elif isinstance(obj, (int, float)):
+        w(_v2_number(obj))
+        return
+    elif isinstance(obj, (list, tuple)):
+        items = None
+    elif isinstance(obj, dict):
+        items = sorted(obj.items(), key=_v2_utf16_key)
+    else:
+        raise TypeError(f"not a JSON value: {type(obj).__name__}")
+    if items is None:                                 # an array
+        sep = "["
+        for v in obj:
+            w(sep)
+            sep = ","
+            _v2_write(v, w)
+        w("]" if sep == "," else "[]")
+    else:                                             # an object, members in JCS order
+        sep = "{"
+        for k, v in items:
+            w(sep)
+            sep = ","
+            w(_v2_string(k) + ":")
+            _v2_write(v, w)
+        w("}" if sep == "," else "{}")
+
+
 def _v2_emit(obj: Any) -> str:
-    if obj is None:
-        return "null"
-    if obj is True:
-        return "true"
-    if obj is False:
-        return "false"
-    if isinstance(obj, str):
-        return _v2_string(obj)
-    if isinstance(obj, (int, float)):
-        return _v2_number(obj)
-    if isinstance(obj, (list, tuple)):
-        return "[" + ",".join(_v2_emit(v) for v in obj) + "]"
-    if isinstance(obj, dict):
-        items = sorted(obj.items(), key=lambda kv: kv[0].encode("utf-16-be", "surrogatepass"))
-        return "{" + ",".join(_v2_string(k) + ":" + _v2_emit(v) for k, v in items) + "}"
-    raise TypeError(f"not a JSON value: {type(obj).__name__}")
+    parts: list[str] = []
+    _v2_write(obj, parts.append)
+    return "".join(parts)
 
 
 def canon_v2(obj: Any) -> bytes:
@@ -174,8 +256,15 @@ def canon_v2(obj: Any) -> bytes:
     return _v2_emit(obj).encode("utf-8")
 
 
+def canon_v3(obj: Any) -> bytes:
+    """canon_version 3 bytes (SPEC v4 draft 5.6.1): ``canon_2(T(x))``, T the committed-item projection. T is the
+    verifier's own (``proof_verify.verify.project``), so a minted digest is the one every verifier recomputes."""
+    from proof_verify.verify import project
+    return canon_v2(project(obj))
+
+
 #: version -> mint canon (mirrors proof_verify.verify._CANON). APPEND-ONLY and FROZEN: v1 stays verbatim.
-_CANON = {1: canon, 2: canon_v2}
+_CANON = {1: canon, 2: canon_v2, 3: canon_v3}
 
 
 def _assert_sealed_provenance_honest(capability: str, core: dict, repro: dict, *, profile=None,
@@ -292,6 +381,7 @@ def _assert_sealed_provenance_honest(capability: str, core: dict, repro: dict, *
             raise ValueError(f"{capability}: derived_from needs the sealed inputs to bind against; none were given")
         canon_fn = _CANON[canon_version]
         for i, link in enumerate(links):
+            link_fn = canon_fn
             # ADR-054: the citing canon must be at least the upstream's. A v1 digest is spelling-sensitive
             # (`2.0` != `2`) while a v2 upstream's seal is not, so a v1 link to a v2 upstream would bind or not
             # depending on how the upstream's JSON is spelled. The verifier's walker refuses it; so does the mint.
@@ -306,8 +396,21 @@ def _assert_sealed_provenance_honest(capability: str, core: dict, repro: dict, *
                 raise ValueError(
                     f"{capability}: derived_from[{i}] says it consumed input {key!r}, but the sealed inputs carry "
                     "no such key -- a chain link must name a value this run actually took as input")
+            if canon_version == 3 and up_cv != 3:
+                # SPEC v4 draft 9.4 rule 2: to a canon-1/2 upstream both ends digest under canon_2 with NO
+                # projection, and the citing input "MUST NOT contain an object member named `$committed`". Rule 5
+                # asks producers to meet rules 2 and 3 at mint; this mint enforces rule 2 only. Rule 3 (a
+                # consumed.path that resolves to, or passes through, an item in the upstream) is NOT checked here:
+                # the verifier's chain walk reports such a link as `consumed-mismatch`.
+                from proof_verify.verify import _has_committed_member
+                if _has_committed_member(own_inputs[key]):
+                    raise ValueError(
+                        f"{capability}: derived_from[{i}] binds a canon_version {up_cv} upstream through input "
+                        f"{key!r}, which holds a committed item; a link to a canon-1/2 upstream cannot bind an item "
+                        "(SPEC 9.4 rule 2)")
+                link_fn = canon_v2
             # under the canon THIS bundle seals with (ADR-054): the walker re-derives it the same way.
-            got = sha(canon_fn(own_inputs[key]))
+            got = sha(link_fn(own_inputs[key]))
             if got != link["consumed"]["sha256"]:
                 raise ValueError(
                     f"{capability}: derived_from[{i}] consumed.sha256 {link['consumed']['sha256']} != the digest of "
@@ -475,7 +578,23 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
         # this result was built from (run_step), each with its input/output digests. In the SIGNED
         # provenance, so the derivation is tamper-evident; a leaf card composes nothing -> no lineage.
         repro["lineage"] = {"count": len(lineage), "steps": lineage}
+    if canon_version == 3:
+        # SPEC v4 draft 7.9 SIG-18: "In v4, `manifest.provenance.value` MUST contain `seal_signers`". This release
+        # seals with the one primary signature, so the declared list is that signer alone (7.10 G2).
+        repro["seal_signers"] = [{"alg": "ed25519", "public_key": signing.public_key_hex()}]
     repro = normalize_floats(repro)
+    withheld_at_mint: list[str] = []
+    if canon_version == 3:
+        # Producer side of SPEC 6.6: refuse any `$committed` object that is not a well-formed, well-placed item --
+        # 6.6.1 "A producer MUST refuse domain data that uses the key `$committed` outside an item" -- and items in
+        # provenance (P2). The rules are the VERIFIER's item walk, so the mint can never seal what it rejects.
+        from proof_verify.verify import _v4_item_walk
+        walk_problems: list[str] = []
+        walk = _v4_item_walk({"inputs": {"value": inputs_value}, "result": {"value": core},
+                              "provenance": {"value": repro}}, {"inputs", "result", "provenance"}, walk_problems)
+        if walk_problems:
+            raise ValueError(f"{case.capability}: refusing to mint a canon-3 bundle: {walk_problems[:5]}")
+        withheld_at_mint = sorted(walk["W"])
     manifest = {
         "inputs": {"sha256": sha(_c(inputs_value)), "value": inputs_value},
         "result": {"sha256": sha(_c(core)), "value": core},   # the result.v1 core, unchanged
@@ -503,7 +622,7 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
     _assert_sealed_provenance_honest(case.capability, core, repro, profile=p, inputs_value=inputs_value,
                                      canon_version=canon_version)
     bundle = {
-        "schema": p.envelope_schema,
+        "schema": p.envelope_schema_v4 if canon_version == 3 else p.envelope_schema,
         "result": core,                       # the envelope is a superset that embeds the result core shape
         "reproducibility": repro,             # readable copy of the signed provenance block
         "manifest": manifest,
@@ -514,6 +633,10 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
     # verifiers' header recompute explicitly (not just coincidentally for ASCII).
     bundle["bundle_sha256"] = sha(canon(sha256sums))
     bundle["signature"] = signing.sign_bundle_digest(bundle["bundle_sha256"])
+    if withheld_at_mint:
+        # SPEC 10.4 R5: "A record MUST be present whenever W is non-empty ... That includes items withheld at mint."
+        bundle["redaction"] = {"schema": p.redaction_schema_v2, "parent_bundle_sha256": bundle["bundle_sha256"],
+                               "withheld_sections": [], "withheld_items": withheld_at_mint}
     # BELT (S1/S2, producer side): the block just minted is exactly {alg, public_key, signature, message}
     # with message == "bundle_sha256". Anything else rides UNSIGNED and every conforming verifier rejects
     # it, so a producer whose signing backend drifted must fail HERE, not at a reviewer's desk.

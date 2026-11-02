@@ -90,8 +90,17 @@ class Adapter:
         return classify_bundle(bundle)
 
     def sealed_inputs(self, bundle):
-        """The sealed re-run recipe (the ``inputs`` passed to ``seal``)."""
-        return bundle["manifest"]["inputs"]["value"]["inputs"]
+        """The sealed re-run recipe (the ``inputs`` passed to ``seal``), as the VALUES the engine computes on: every
+        disclosed committed item is unwrapped to its plain value, as ``reproduce_bundle`` does (salts and marks are
+        not inputs). Raises ValueError ("N items withheld; reproduce not possible here", SPEC v4 draft 10.6) when
+        it holds a withheld committed item."""
+        from .committed import disclosed_values, refuse_withheld_items
+        inputs = bundle["manifest"]["inputs"]["value"]["inputs"]
+        sums = bundle.get("sha256sums") if isinstance(bundle, dict) else None
+        if not (isinstance(sums, dict) and sums.get("canon_version") == 3):
+            return inputs                   # under canon 1 and 2 a `$committed` object is plain data (6.6.1)
+        refuse_withheld_items(inputs, "sealed inputs")
+        return disclosed_values(inputs)
 
     def sealed_outcome_sha(self, bundle):
         """The sealed outcome digest (under ``outcome_key``), or ``None`` if this bundle carries no result for
@@ -132,7 +141,11 @@ class Adapter:
             return {"reproduced": False, "expected_sha": None, "got_sha": None,
                     "error": f"no {self.outcome_key!r} under capability {self.capability!r} "
                              "(foreign or incompatible bundle)"}
-        got = self.digest(run(self.sealed_inputs(bundle)))
+        try:
+            recipe = self.sealed_inputs(bundle)
+        except ValueError as exc:                        # SPEC v4 draft 10.6: a named refusal, never a re-run
+            return {"reproduced": False, "expected_sha": expected, "got_sha": None, "error": str(exc)}
+        got = self.digest(run(recipe))
         return {"reproduced": got == expected, "expected_sha": expected, "got_sha": got}
 
 
