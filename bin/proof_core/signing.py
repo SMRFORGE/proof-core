@@ -19,7 +19,9 @@ uses a hardware-held key.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
+import re
 
 # --- RFC 8032 Ed25519, compact form (the builtin pow() does the heavy lifting) ---
 _q = 2**255 - 19
@@ -245,6 +247,332 @@ def verify(signature: bytes, msg: bytes, pk: bytes) -> bool:
     return _scalarmult_base(s) == _edwards(r_point, _scalarmult(a_point, k))
 
 
+# --- ECDSA P-256 (SPEC v4 7.6), producer side ---------------------------------------------------------------------
+# The curve constants are copied from NIST SP 800-186 (Feb 2023) section 3.2.1.3 "P-256" and SECG SEC 2 v2.0 section
+# 2.4.2 "secp256r1" (the two agree; phase-0 constants register rows P1-P9). The curve is y^2 = x^3 - 3x + b over
+# GF(p). Points are held in Jacobian coordinates (X, Y, Z) with x = X/Z^2, y = Y/Z^3, so additions and doublings need
+# no modular inverse; the point at infinity is any point with Z == 0. Fixed-base multiples of G use a table of
+# [j * 16^i]G (i < 64, 1 <= j <= 15), built once at import, so [k]G is at most 64 mixed additions and no doubling.
+#
+# This is the PRODUCER's copy: it signs (RFC 6979 deterministic k, low-S normalized; SPEC 7.16 SIG-35 and item 4) and
+# self-verifies at mint. The standalone verifier (proof_verify/verify.py) keeps its OWN independent copy; no code is
+# shared. The signer is NOT constant-time (it branches on secret scalar bits): it is for the published demo key and
+# tests only. Production P-256 keys are injected through `use_signer` / `build_bundle(cosigners=...)`.
+P256_P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
+P256_B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
+P256_GX = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296
+P256_GY = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5
+P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+P256_HALF_N = 0x7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8   # floor(n/2), the low-S bound
+
+# Import-time self-checks of the copied constants (the register's computed cross-checks, repeated here).
+if not (P256_P == 2**256 - 2**224 + 2**192 + 2**96 - 1 and P256_HALF_N == (P256_N - 1) // 2 and P256_P % 4 == 3
+        and (P256_GY * P256_GY - (P256_GX ** 3 - 3 * P256_GX + P256_B)) % P256_P == 0):
+    raise ImportError("P-256 constants failed their self-check")
+
+_P256_INF = (1, 1, 0)
+
+
+def _p256_dbl(pt: tuple[int, int, int]) -> tuple[int, int, int]:
+    # "dbl-2001-b" (a = -3). P-256 has no point of order 2 (n is odd), so Y == 0 only at infinity.
+    x1, y1, z1 = pt
+    if z1 == 0 or y1 == 0:
+        return _P256_INF
+    p = P256_P
+    delta = z1 * z1 % p
+    gamma = y1 * y1 % p
+    beta = x1 * gamma % p
+    alpha = 3 * (x1 - delta) * (x1 + delta) % p
+    x3 = (alpha * alpha - 8 * beta) % p
+    z3 = ((y1 + z1) * (y1 + z1) - gamma - delta) % p
+    y3 = (alpha * (4 * beta - x3) - 8 * gamma * gamma) % p
+    return (x3, y3, z3)
+
+
+def _p256_add(p1: tuple[int, int, int], p2: tuple[int, int, int]) -> tuple[int, int, int]:
+    # General Jacobian addition; it handles P + P (doubling), P + (-P) (infinity) and infinity on either side, so the
+    # verify combination u1*G + u2*Q is right for every input, including the adversarial ones of SPEC 7.6 step 5.
+    x1, y1, z1 = p1
+    x2, y2, z2 = p2
+    if z1 == 0:
+        return p2
+    if z2 == 0:
+        return p1
+    p = P256_P
+    z1z1 = z1 * z1 % p
+    z2z2 = z2 * z2 % p
+    u1 = x1 * z2z2 % p
+    u2 = x2 * z1z1 % p
+    s1 = y1 * z2 * z2z2 % p
+    s2 = y2 * z1 * z1z1 % p
+    h = (u2 - u1) % p
+    r = (s2 - s1) % p
+    if h == 0:
+        return _p256_dbl(p1) if r == 0 else _P256_INF
+    hh = h * h % p
+    hhh = h * hh % p
+    v = u1 * hh % p
+    x3 = (r * r - hhh - 2 * v) % p
+    y3 = (r * (v - x3) - s1 * hhh) % p
+    return (x3, y3, z1 * z2 % p * h % p)
+
+
+def _p256_madd(p1: tuple[int, int, int], x2: int, y2: int) -> tuple[int, int, int]:
+    # Mixed addition: p1 Jacobian, (x2, y2) affine (Z2 = 1). Same special cases as _p256_add.
+    x1, y1, z1 = p1
+    if z1 == 0:
+        return (x2, y2, 1)
+    p = P256_P
+    z1z1 = z1 * z1 % p
+    h = (x2 * z1z1 - x1) % p
+    r = (y2 * z1 * z1z1 - y1) % p
+    if h == 0:
+        return _p256_dbl(p1) if r == 0 else _P256_INF
+    hh = h * h % p
+    hhh = h * hh % p
+    v = x1 * hh % p
+    x3 = (r * r - hhh - 2 * v) % p
+    y3 = (r * (v - x3) - y1 * hhh) % p
+    return (x3, y3, z1 * h % p)
+
+
+def _p256_affine_all(pts: list[tuple[int, int, int]]) -> list[tuple[int, int]]:
+    """Batch Jacobian -> affine with ONE inversion (Montgomery's trick). No point may be the point at infinity."""
+    p = P256_P
+    prefix, acc = [], 1
+    for _x, _y, z in pts:
+        prefix.append(acc)
+        acc = acc * z % p
+    inv = pow(acc, -1, p)
+    out: list[tuple[int, int]] = [(0, 0)] * len(pts)
+    for i in range(len(pts) - 1, -1, -1):
+        x, y, z = pts[i]
+        zi = inv * prefix[i] % p
+        inv = inv * z % p
+        zi2 = zi * zi % p
+        out[i] = (x * zi2 % p, y * zi2 * zi % p)
+    return out
+
+
+def _p256_build_g_table() -> list[list[tuple[int, int]]]:
+    rows: list[tuple[int, int, int]] = []
+    base = (P256_GX, P256_GY, 1)
+    for _i in range(64):
+        cur = base
+        for _j in range(15):
+            rows.append(cur)
+            cur = _p256_add(cur, base)
+        for _ in range(4):
+            base = _p256_dbl(base)
+    flat = _p256_affine_all(rows)
+    return [flat[15 * i:15 * i + 15] for i in range(64)]
+
+
+#: _P256_G_TABLE[i][j - 1] = [j * 16^i]G, affine.
+_P256_G_TABLE = _p256_build_g_table()
+
+
+def _p256_mul_g(k: int) -> tuple[int, int, int]:
+    """[k]G (Jacobian), k reduced mod n first: G has prime order n."""
+    k %= P256_N
+    acc = _P256_INF
+    i = 0
+    while k:
+        j = k & 15
+        if j:
+            x, y = _P256_G_TABLE[i][j - 1]
+            acc = _p256_madd(acc, x, y)
+        k >>= 4
+        i += 1
+    return acc
+
+
+def _p256_mul(x: int, y: int, k: int) -> tuple[int, int, int]:
+    """[k](x, y) for an affine point of order n: fixed 4-bit windows over [1..15](x, y), made affine with one
+    inversion, so every addition in the loop is a mixed one."""
+    k %= P256_N
+    if k == 0:
+        return _P256_INF
+    pts = [(x, y, 1)]
+    for _ in range(14):
+        pts.append(_p256_madd(pts[-1], x, y))
+    table = _p256_affine_all(pts)
+    acc = _P256_INF
+    for shift in range(252, -4, -4):
+        acc = _p256_dbl(_p256_dbl(_p256_dbl(_p256_dbl(acc))))
+        j = (k >> shift) & 15
+        if j:
+            acc = _p256_madd(acc, *table[j - 1])
+    return acc
+
+
+def _p256_x_affine(pt: tuple[int, int, int]) -> int:
+    zi = pow(pt[2], -1, P256_P)
+    return pt[0] * zi * zi % P256_P
+
+
+def p256_decode_point(pk: bytes) -> tuple[int, int]:
+    """SEC 1 section 2.3.4 for the COMPRESSED form only (SPEC 7.6 "Key encoding (proof-core keys only)"): 33 bytes,
+    prefix 02 (y even) or 03 (y odd). Raises ValueError for any other length or prefix, x >= p, or an x with no
+    point on the curve. The result is on the curve and is not infinity, so (h = 1) it has order n."""
+    if len(pk) != 33 or pk[0] not in (2, 3):
+        raise ValueError("a proof-core P-256 key is a 33-byte SEC 1 compressed point (prefix 02 or 03)")
+    x = int.from_bytes(pk[1:], "big")
+    if x >= P256_P:
+        raise ValueError("P-256 key x coordinate is not below p (SEC 1 2.3.6)")
+    alpha = (x * x * x - 3 * x + P256_B) % P256_P
+    beta = pow(alpha, (P256_P + 1) // 4, P256_P)
+    if beta * beta % P256_P != alpha:
+        raise ValueError("P-256 key is not on the curve (x^3 - 3x + b has no square root mod p)")
+    y = beta if beta % 2 == pk[0] - 2 else P256_P - beta
+    return (x, y)
+
+
+def p256_encode_point(x: int, y: int) -> bytes:
+    """SEC 1 section 2.3.3 compressed form: 02 (y even) or 03 (y odd), then x as 32 big-endian bytes."""
+    return bytes([2 + (y & 1)]) + x.to_bytes(32, "big")
+
+
+def p256_publickey(d: int) -> bytes:
+    """The 33-byte compressed public key of the private scalar d (1 <= d <= n - 1)."""
+    _p256_check_scalar(d)
+    return p256_encode_point(*_p256_affine_all([_p256_mul_g(d)])[0])
+
+
+def _rfc6979_k(d: int, h1: bytes) -> int:
+    """RFC 6979 section 3.2 deterministic nonce for P-256 with HMAC-SHA-256 (qlen = hlen = 256, so bits2int is a
+    plain big-endian read and bits2octets(h1) is int2octets(h1 mod q))."""
+    x = d.to_bytes(32, "big")
+    h = (int.from_bytes(h1, "big") % P256_N).to_bytes(32, "big")
+    v, k = b"\x01" * 32, b"\x00" * 32
+    k = hmac.new(k, v + b"\x00" + x + h, hashlib.sha256).digest()
+    v = hmac.new(k, v, hashlib.sha256).digest()
+    k = hmac.new(k, v + b"\x01" + x + h, hashlib.sha256).digest()
+    v = hmac.new(k, v, hashlib.sha256).digest()
+    while True:
+        v = hmac.new(k, v, hashlib.sha256).digest()
+        cand = int.from_bytes(v, "big")
+        if 1 <= cand < P256_N:
+            return cand
+        k = hmac.new(k, v + b"\x00", hashlib.sha256).digest()
+        v = hmac.new(k, v, hashlib.sha256).digest()
+
+
+def p256_low_s(s: int) -> int:
+    """SPEC 7.16 SIG-35: s -> n - s when s > floor(n/2)."""
+    return P256_N - s if s > P256_HALF_N else s
+
+
+def _p256_check_scalar(d) -> int:
+    """A P-256 private scalar must be an int (not a bool) in [1, n - 1]. Raises ValueError otherwise."""
+    if type(d) is not int or not 1 <= d < P256_N:
+        raise ValueError("a P-256 private scalar must be an int in [1, n - 1]")
+    return d
+
+
+def _p256_mul_g_ladder(k: int) -> tuple[int, int, int]:
+    """[k]G for a SECRET k with a fixed number of iterations: k' = k + n or k + 2n (the same point, since G has
+    order n) is always exactly 257 bits, and the Montgomery ladder does one addition and one doubling for every one
+    of its 256 lower bits, so the work does not depend on k's bit length or on how many of its bits are set. CPython
+    integer arithmetic is not constant-time, so this narrows the timing channel; it does not close it (see p256_sign)."""
+    k1 = k + P256_N
+    k2 = k1 + P256_N
+    kk = (k2, k1)[k1 >> 256]
+    r0 = (P256_GX, P256_GY, 1)
+    r1 = _p256_dbl(r0)
+    for i in range(255, -1, -1):
+        if (kk >> i) & 1:
+            r0, r1 = _p256_add(r0, r1), _p256_dbl(r1)
+        else:
+            r1, r0 = _p256_add(r0, r1), _p256_dbl(r0)
+    return r0
+
+
+def _p256_sign_k(msg: bytes, d: int, k: int) -> bytes:
+    h1 = hashlib.sha256(msg).digest()
+    e = int.from_bytes(h1, "big")
+    r = _p256_x_affine(_p256_mul_g_ladder(k)) % P256_N
+    # Fermat inverse: a fixed 256-bit exponent, so its cost does not track k's bit length as pow(k, -1, n) does
+    s = pow(k, P256_N - 2, P256_N) * (e + r * d) % P256_N
+    if r == 0 or s == 0:                           # probability ~2^-256; refusing is safe
+        raise ValueError("degenerate P-256 signature")
+    return r.to_bytes(32, "big") + p256_low_s(s).to_bytes(32, "big")
+
+
+def p256_sign(msg: bytes, d: int) -> bytes:
+    """ECDSA P-256 / SHA-256 over ``msg``: raw r || s (64 bytes), s normalized to the low half (SPEC 7.16 SIG-35:
+    "MUST normalize s to n - s when s > floor(n/2)"). Deterministic k (RFC 6979, SPEC 7.16 item 4).
+
+    FOR DEMO AND DEVELOPMENT KEYS ONLY. This is pure-Python signing: the nonce multiply runs a fixed-length ladder and
+    the inverse a fixed exponent, but Python integers are not constant-time and the private scalar lives in process
+    memory. A production P-256 key belongs in an HSM, KMS or token, used through an external signer
+    (`use_signer(...)` or `build_bundle(cosigners=[...])`), never here."""
+    d = _p256_check_scalar(d)
+    k = _rfc6979_k(d, hashlib.sha256(msg).digest())
+    return _p256_sign_k(msg, d, k)
+
+
+def _der_ecdsa_sig(der: bytes) -> tuple[int, int]:
+    """A strict DER ``ECDSA-Sig-Value`` (SEQUENCE of two minimal positive INTEGERs, short-form lengths)."""
+    def _int(i: int) -> tuple[int, int]:
+        if i + 2 > len(der) or der[i] != 0x02:
+            raise ValueError("DER ECDSA signature: INTEGER expected")
+        n = der[i + 1]
+        body = der[i + 2:i + 2 + n]
+        if not 1 <= n <= 33 or len(body) != n or body[0] & 0x80 or (n > 1 and body[0] == 0 and not body[1] & 0x80):
+            raise ValueError("DER ECDSA signature: INTEGER is not a minimal positive encoding")
+        return int.from_bytes(body, "big"), i + 2 + n
+    if len(der) < 8 or der[0] != 0x30 or der[1] != len(der) - 2:
+        raise ValueError("P-256 signature is neither 64 raw bytes nor a DER SEQUENCE")
+    r, i = _int(2)
+    s, i = _int(i)
+    if i != len(der):
+        raise ValueError("DER ECDSA signature: trailing bytes")
+    return r, s
+
+
+def p256_raw_low_s(sig: bytes) -> bytes:
+    """A signer adapter's output -> the proof-core encoding (SPEC 7.6, 7.16 SIG-35): raw r || s with low S.
+
+    HSM, PIV and PKCS#11 devices and native libraries emit DER ``ECDSA-Sig-Value`` or raw P1363 r || s, and neither
+    normalizes S, so a signer adapter that skips this step has about half its signatures rejected. Accepts 64 raw
+    bytes or a strict DER SEQUENCE; r and s must lie in [1, n - 1]. Raises ValueError for anything else."""
+    sig = bytes(sig)
+    if len(sig) == 64:
+        r, s = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")
+    else:
+        r, s = _der_ecdsa_sig(sig)
+    if not (1 <= r < P256_N and 1 <= s < P256_N):
+        raise ValueError("P-256 signature r or s is outside [1, n - 1]")
+    return r.to_bytes(32, "big") + p256_low_s(s).to_bytes(32, "big")
+
+
+def p256_verify(signature: bytes, msg: bytes, pk: bytes) -> bool:
+    """Producer-side ECDSA P-256 check, SPEC 7.6 steps 2-5 on bytes (self-verify at mint, cross-validation). The
+    standalone bundle verifier keeps its OWN independent copy -- this one is not it."""
+    if len(signature) != 64:
+        return False
+    try:
+        qx, qy = p256_decode_point(pk)
+    except ValueError:
+        return False
+    r, s = int.from_bytes(signature[:32], "big"), int.from_bytes(signature[32:], "big")
+    if not (1 <= r < P256_N and 1 <= s <= P256_HALF_N):       # FIPS 186-5 6.4.2 step 1, plus low-S (SIG-10)
+        return False
+    e = int.from_bytes(hashlib.sha256(msg).digest(), "big")
+    w = pow(s, -1, P256_N)
+    pt = _p256_add(_p256_mul_g(e * w % P256_N), _p256_mul(qx, qy, r * w % P256_N))
+    if pt[2] == 0:                                            # step 6: R is the point at infinity
+        return False
+    return _p256_x_affine(pt) % P256_N == r
+
+
+#: The published P-256 DEMO private scalar (SPEC section 2 "demo key"). Anyone can sign under it, so a signature
+#: under its public key proves format and integrity, never origin. Tests, vectors and demos only.
+P256_DEMO_D = 0x2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a
+P256_DEMO_PUBLIC_KEY = p256_publickey(P256_DEMO_D)
+
+
 # --- the signing identity ---
 # proof-core is KEYLESS by design: the only identity it ships is the public DEV seed. The built-in
 # "seed" backend signs in-process from a 32-byte hex seed in PROOF_SIGNING_SEED (a secret manager /
@@ -321,31 +649,109 @@ def use_signer(signer) -> None:
         raise ValueError(
             "use_signer() refuses to install a signer while PROOF_SIGNING_SEED / PROOF_SIGNING_BACKEND is "
             "set: a process must hold exactly one signing identity. Unset the variable, or pass None.")
-    pk = signer.public_key()
-    if not isinstance(pk, (bytes, bytearray)) or len(pk) != 32:
-        raise ValueError("signer.public_key() must return 32 bytes (an Ed25519 public key)")
-    if bytes(pk) in _LOW_ORDER_ENCODINGS:
-        raise ValueError("signer public key is a low-order point encoding (order divides 8; rejected)")
+    signer_key_problems(signer, where="signer")      # raises ValueError for a bad key of the signer's suite
     _ACTIVE_SIGNER = signer
 
 
+#: The seal suites this kernel can sign AND verify itself (SPEC 7.5: S_sup = {ed25519, ecdsa-p256}).
+SUPPORTED_SUITES = ("ed25519", "ecdsa-p256")
+_SUITE_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9.+\-]{0,31}", re.ASCII)
+_GENERIC_HEX_RE = re.compile(r"(?:[0-9a-f]{2}){1,65536}", re.ASCII)
+
+
+def signer_alg(signer) -> str:
+    """A signer's suite token: its ``alg`` attribute, default ``"ed25519"`` (the ADR-048 hook's original shape)."""
+    return getattr(signer, "alg", "ed25519") if signer is not None else "ed25519"
+
+
+def signer_key_problems(signer, *, where: str) -> None:
+    """Refuse a signer whose public key does not fit its suite (SPEC 7.5 rows, 7.6 key encoding, 7.3 small order).
+    Raises ValueError."""
+    alg = signer_alg(signer)
+    if not (isinstance(alg, str) and _SUITE_TOKEN_RE.fullmatch(alg)):
+        raise ValueError(f"{where}.alg must be a suite token [a-z0-9][a-z0-9.+-]{{0,31}}, got {alg!r}")
+    pk = signer.public_key()
+    pk = bytes(pk) if isinstance(pk, (bytes, bytearray)) else b""
+    if alg == "ed25519":
+        if len(pk) != 32:
+            raise ValueError(f"{where}.public_key() must return 32 bytes (an Ed25519 public key)")
+        if pk in _LOW_ORDER_ENCODINGS:
+            raise ValueError(f"{where} public key is a low-order point encoding (order divides 8; rejected)")
+    elif alg == "ecdsa-p256":
+        p256_decode_point(pk)            # 33-byte compressed, x < p, on the curve (SPEC 7.6 step 2)
+    elif not 1 <= len(pk) <= 65536:
+        raise ValueError(f"{where}.public_key() must return 1 to 65,536 bytes (SPEC 7.5 generic row)")
+
+
 def _active_public_key() -> bytes:
-    return _ACTIVE_SIGNER.public_key() if _ACTIVE_SIGNER is not None else _PK
+    return bytes(_ACTIVE_SIGNER.public_key()) if _ACTIVE_SIGNER is not None else _PK
 
 
 def _active_sign(msg: bytes) -> bytes:
     return _ACTIVE_SIGNER.sign(msg) if _ACTIVE_SIGNER is not None else _raw_sign(msg)
 
 
+def active_alg() -> str:
+    """The suite of the active (primary) signing identity."""
+    return signer_alg(_ACTIVE_SIGNER)
+
+
 def public_key_hex() -> str:
     return _active_public_key().hex()
 
 
+def is_demo_key(alg: str, public_key: bytes) -> bool:
+    """True for one of the published demo keys (SPEC section 2): the Ed25519 DEV key or the P-256 demo key."""
+    return ((alg == "ed25519" and bytes(public_key) == publickey(_DEV_SEED))
+            or (alg == "ecdsa-p256" and bytes(public_key) == P256_DEMO_PUBLIC_KEY))
+
+
 def is_demo_identity() -> bool:
-    """True when the active signing key is the public DEV key -- signatures then prove format/integrity,
+    """True when the active signing key is a public demo key -- signatures then prove format/integrity,
     not origin. Derived from the key itself (never a self-asserted flag), so an injected production key
-    reads non-demo and an injected copy of the public demo seed reads demo, both correctly."""
-    return _active_public_key() == publickey(_DEV_SEED)
+    reads non-demo and an injected copy of a public demo key reads demo, both correctly."""
+    return is_demo_key(active_alg(), _active_public_key())
+
+
+class Ed25519Signer:
+    """A software Ed25519 signer from a 32-byte seed (tests, demos, air-gapped dev keys; not constant-time)."""
+
+    alg = "ed25519"
+
+    def __init__(self, seed: bytes):
+        if len(seed) != 32:
+            raise ValueError("an Ed25519 seed is 32 bytes")
+        self._seed = bytes(seed)
+        self._pk = publickey(self._seed)
+
+    def public_key(self) -> bytes:
+        return self._pk
+
+    def sign(self, msg: bytes) -> bytes:
+        return sign(msg, self._seed, self._pk)
+
+
+class P256Signer:
+    """A software ECDSA P-256 signer from a private scalar (RFC 6979 deterministic k, low-S; SPEC 7.16 items 1 and
+    4). Tests and development only: it is not constant-time. Production keys come from an external signer."""
+
+    alg = "ecdsa-p256"
+
+    def __init__(self, d: int):
+        # FOR DEMO AND DEVELOPMENT KEYS ONLY: production keys stay in an HSM behind an external signer (use_signer).
+        self._d = _p256_check_scalar(d)
+        self._pk = p256_publickey(d)
+
+    def public_key(self) -> bytes:
+        return self._pk
+
+    def sign(self, msg: bytes) -> bytes:
+        return p256_sign(msg, self._d)
+
+
+def demo_p256_signer() -> P256Signer:
+    """The published P-256 demo key (SPEC section 2) as a signer: integrity-only, never origin."""
+    return P256Signer(P256_DEMO_D)
 
 
 #: The ONLY keys a bundle's signature block may carry, and the ONLY value `message` may take. The seal
@@ -377,8 +783,35 @@ def signature_block_problems(sig: object) -> list[str]:
     return problems
 
 
+def _encode_sig(alg: str, sig: bytes) -> bytes:
+    """SPEC 7.16 SIG-35: a P-256 signature leaves the producer as raw r || s with low S, whatever the signer
+    emitted (DER or raw, either S). Other suites are passed through as the signer produced them."""
+    return p256_raw_low_s(sig) if alg == "ecdsa-p256" else bytes(sig)
+
+
+def verify_suite(alg: str, public_key: bytes, msg: bytes, sig: bytes) -> bool | None:
+    """Producer-side check of one seal signature: True/False for a suite this kernel implements, None for any
+    other (the caller must then use the signing library's own verify, SPEC 7.16 SIG-37)."""
+    if alg == "ed25519":
+        return verify(sig, msg, public_key)
+    if alg == "ecdsa-p256":
+        return p256_verify(sig, msg, public_key)
+    return None
+
+
+def sign_block(signer, digest: str) -> dict:
+    """One seal signature block {alg, public_key, message, signature} from an explicit signer (a co-signer, SPEC
+    7.8), signed over the 71 ASCII bytes of ``digest`` (7.2). The signer's key is checked against its suite first."""
+    signer_key_problems(signer, where="cosigner")
+    alg = signer_alg(signer)
+    sig = _encode_sig(alg, signer.sign(digest.encode()))
+    return {"alg": alg, "public_key": bytes(signer.public_key()).hex(), "message": SIGNATURE_MESSAGE,
+            "signature": sig.hex()}
+
+
 def _sign_digest(digest: str, message_label: str) -> dict:
-    sig = _active_sign(digest.encode())
+    alg = active_alg()
+    sig = _encode_sig(alg, _active_sign(digest.encode()))
     # NOTE: no "identity" field. Origin (demo vs production) is a property of the PINNED KEY, decided
     # by the VERIFIER at check time (proof_verify.pinned_key_is_demo / pinned_key_fingerprint), never a
     # self-asserted label carried in the bundle: such a label rode UNSIGNED in the signature block and
@@ -387,7 +820,7 @@ def _sign_digest(digest: str, message_label: str) -> dict:
     # proof of origin, and REJECTED by every conforming verifier under the S1 key allowlist. (The
     # producer still knows its own backend via is_demo_identity() / IS_DEMO_IDENTITY.)
     return {
-        "alg": "ed25519",
+        "alg": alg,
         "public_key": _active_public_key().hex(),
         "message": message_label,
         "signature": sig.hex(),

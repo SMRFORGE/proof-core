@@ -40,6 +40,8 @@ import sys
 from decimal import Decimal
 from typing import Any
 
+from . import tsp as _tsp
+
 
 def safe_text(text: Any) -> str:
     """Make text safe to print on a terminal: printable ASCII and newlines pass through, every other character
@@ -158,6 +160,9 @@ _MAX_BUNDLE_BYTES = 8_000_000
 # its own production trust root does not edit this file: it calls `pin_key(pubkey_hex)` (process-wide) or
 # supplies `Profile.pinned_pubkey` (per call) -- proof-core embeds no production key value.
 _DEMO_PUBKEY = "069aba87747dd9c1f46f24004eb79e05eb8f2e0f2c3adfdde60c1e2e00bac838"
+#: The P-256 demo key (SPEC section 2), a 33-byte SEC 1 compressed point. Its private scalar is public
+#: (proof_core/signing.py `P256_DEMO_D`), so a signature under it proves integrity, never origin.
+_P256_DEMO_PUBKEY = "029536638e2f36388e2ded33e30d24af780556cc79a9d14d66e5c444e49349cf16"
 _PINNED_PUBKEY = _DEMO_PUBKEY
 
 #: The verdicts of `classify_bundle`.
@@ -176,6 +181,7 @@ STATE_FAIL = "fail"                      # a hash/seal/schema problem, or the si
 STATE_UNSUPPORTED_CANON = "unsupported-canon"
 STATE_UNSUPPORTED_ALG = "unsupported-alg"
 _ALG_SUPPORTED = frozenset({"ed25519"})
+_SUITE_NAME = {"ed25519": "Ed25519", "ecdsa-p256": "ECDSA P-256"}
 _ALG_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9.+\-]{0,31}")
 
 
@@ -265,6 +271,10 @@ def pinned_key_fingerprint() -> str:
 def key_label(pubkey_hex: str | None) -> str:
     """A human label for a signing key: names the public demo key; anything else is an unrecognised key,
     shown by fingerprint."""
+    if isinstance(pubkey_hex, str) and _KEY_ID_RE.fullmatch(pubkey_hex):        # a v4 signer is a key id (7.15)
+        alg, _, digest = pubkey_hex.partition(":sha256:")
+        return (f"the PUBLIC DEMO key ({alg}:sha256:{digest[:16]}...)" if pubkey_hex in _DEMO_KEY_IDS
+                else f"an unrecognised key ({alg}:sha256:{digest[:16]}...)")
     if pubkey_hex == _DEMO_PUBKEY:
         return f"the PUBLIC DEMO key (ed25519:{pubkey_hex[:16]}...)"
     if isinstance(pubkey_hex, str) and pubkey_hex:
@@ -289,7 +299,8 @@ class PolicyError(ValueError):
 class PolicyUnsupportedError(PolicyError):
     """A WELL-FORMED receiver policy member this release does not evaluate (any value other than its default).
     Refused rather than ignored, so a caller who sets one never believes it ran; a distinct kind from a malformed
-    policy (``policy``). Full policy evaluation (quorum, suites, aging, roles, TSAs, archive) comes in later releases."""
+    policy (``policy``). The members that read the archive (`require_archive`, `min_archive_tsas`) come in a later
+    release."""
 
     kind = "policy_unsupported"
 
@@ -307,10 +318,15 @@ def key_id(alg: str, public_key_hex: str) -> str:
     return f"{alg}:sha256:" + hashlib.sha256(bytes.fromhex(public_key_hex)).hexdigest()
 
 
-#: The demo key's id (SPEC section 2: "key id `ed25519:sha256:7cb4fd86...`"). The P-256 demo key joins this set when
-#: section 2 names its value (SIG-28: "The P-256 part takes effect when the P-256 demo key is written into section 2").
+#: The demo keys' ids (SPEC section 2 "demo key"): the Ed25519 demo key (`ed25519:sha256:7cb4fd86...`) and the P-256
+#: demo key, whose private scalar proof-core publishes in `proof_core/signing.py` (`P256_DEMO_D`). SIG-28: "Every
+#: demo key (section 2) MUST be treated as a demo pin whatever its entry's `demo` value says, in every suite."
 DEMO_KEY_ID = key_id("ed25519", _DEMO_PUBKEY)
-_DEMO_KEY_IDS = frozenset({DEMO_KEY_ID})
+P256_DEMO_KEY_ID = key_id("ecdsa-p256", _P256_DEMO_PUBKEY)
+_DEMO_KEY_IDS = frozenset({DEMO_KEY_ID, P256_DEMO_KEY_ID})
+#: The built-in demo pins (SPEC 7.12 / 13.4.1 step 3: "the CLI's built-in demo pin"): every demo key, as a demo pin.
+#: Pinning a demo key can never grant origin (SIG-28), so the built-in set only names demo-signed bundles as such.
+BUILTIN_DEMO_PINS = ({"key_id": DEMO_KEY_ID, "demo": True}, {"key_id": P256_DEMO_KEY_ID, "demo": True})
 
 #: SPEC 2.2: the frozen DICP-18 table (Unicode 18.0.0 Default_Ignorable_Code_Point, 27 ranges, 4,174 code points).
 #: Rule 1: "An implementation MUST test DICP-18 membership against exactly this table. It MUST NOT consult its
@@ -393,15 +409,18 @@ def resolve_pins(pins: Any, *, where: str = "pins", duplicates: str = "merge",
     return out
 
 
-#: The members of the receiver policy (SPEC 13.4.1) with their defaults. This release implements `schema` and
-#: `pins`; every other member is accepted only AT ITS DEFAULT (where it changes nothing), and a non-default value is
-#: refused rather than ignored, so a caller who sets one never believes it ran. Quorum, required suites and aging
-#: (7.13) arrive with co-signatures; sign-offs, time and archive in later releases.
+#: The members of the receiver policy (SPEC 13.4.1) with their defaults. This release evaluates `schema`, `pins`,
+#: `min_envelope`, the origin members of 7.13 (quorum, required suites, aging) and the sign-off members of 13.4.4
+#: (roster, roles, order, self-verification) and the trusted-time members of 10.7 (TSA pins, `min_seal_tsas`,
+#: `require_signoff_timestamps`, `max_attest_lag_s`, `allow_ess_v1`) and `require_full_copy_review` (13.4.4); every
+#: other member is accepted only AT ITS DEFAULT
+#: (where it changes nothing), and a non-default value is refused rather than ignored, so a caller who sets one never
+#: believes it ran. The archive arrives in a later release.
 _POLICY_DEFAULTS: dict[str, Any] = {
     "origin_quorum": 1, "require_seal_suites": [], "min_envelope": "v3", "suites": {}, "hashes": {}, "tsas": [],
     "min_seal_tsas": 0, "require_archive": False, "min_archive_tsas": 1, "roster": [], "require_roles": [],
     "require_order": True, "require_signoff_timestamps": False, "allow_self_verify": False, "originator_keys": [],
-    "originator_signer_ids": [], "max_attest_lag_s": 86400, "allow_ess_v1": False,
+    "originator_signer_ids": [], "max_attest_lag_s": 86400, "allow_ess_v1": False, "require_full_copy_review": False,
 }
 
 
@@ -431,7 +450,6 @@ def _json_int(v: Any, lo: int, hi: int) -> bool:
 
 
 _UTC_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", re.ASCII)
-_ROLE_RE = re.compile(r"[a-z0-9][a-z0-9.\-]{0,63}", re.ASCII)
 _SIGNER_ID_RE = re.compile(r"[!-~]{1,256}", re.ASCII)
 
 
@@ -460,20 +478,72 @@ def _str_list(v: Any, n: int, pattern=None, unique: bool = True) -> bool:
             and (pattern is None or all(pattern.fullmatch(x) for x in v)))
 
 
-#: SPEC 13.4.1: the TYPE and range of each member (a breach makes the policy malformed). Members whose inner object
-#: shapes belong to later phases (`tsas`, `roster`) are checked here only as arrays of objects of the right length.
+#: SPEC 10.3.3: the three role names ("The role names are domain-neutral"). 13.4.1 `require_roles` and a roster
+#: person's `roles` hold role names, so any other string makes the policy malformed.
+_ROLE_NAMES = ("originator", "verifier", "approver")
+#: SPEC 13.4.1 "Person object": `person_id` matches `[a-z0-9][a-z0-9.\-]{0,63}`.
+_PERSON_ID_RE = re.compile(r"[a-z0-9][a-z0-9.\-]{0,63}", re.ASCII)
+_PERSON_KEYS = frozenset({"person_id", "printed_name", "signer_id", "keys", "roles"})
+_MAX_ROSTER = 1024
+
+
+def _role_list(v: Any, n: int, unique: bool) -> bool:
+    return _str_list(v, n, unique=unique) and all(x in _ROLE_NAMES for x in v)
+
+
+def _check_roster(roster: Any) -> None:
+    """SPEC 13.4.1 "Person object" and its uniqueness rules. Raises PolicyError (the policy is malformed)."""
+    if not (isinstance(roster, list) and len(roster) <= _MAX_ROSTER):
+        raise PolicyError(f"policy member 'roster' must be an array of 0 to {_MAX_ROSTER} person objects")
+    ids: set[str] = set()
+    signer_ids: set[str] = set()
+    keys: set[str] = set()
+    for i, person in enumerate(roster):
+        where = f"policy.roster[{i}]"
+        if not isinstance(person, dict) or set(person) != _PERSON_KEYS:
+            raise PolicyError(f"{where} must be an object with exactly the keys {sorted(_PERSON_KEYS)}")
+        pid, name, sid, pkeys, roles = (person[k] for k in ("person_id", "printed_name", "signer_id", "keys",
+                                                            "roles"))
+        if not (isinstance(pid, str) and _PERSON_ID_RE.fullmatch(pid)):
+            raise PolicyError(f"{where}.person_id must match [a-z0-9][a-z0-9.-]{{0,63}}")
+        if not is_restricted_text(name, 1, 256):
+            raise PolicyError(f"{where}.printed_name must be restricted text of 1 to 256 code points (SPEC 2.2)")
+        if not (isinstance(sid, str) and _SIGNER_ID_RE.fullmatch(sid)):
+            raise PolicyError(f"{where}.signer_id must match [!-~]{{1,256}}")
+        if not (_str_list(pkeys, 8, _KEY_ID_RE) and pkeys):
+            raise PolicyError(f"{where}.keys must be 1 to 8 unique key ids (SPEC 7.11)")
+        if not (_role_list(roles, 3, unique=True) and roles):
+            raise PolicyError(f"{where}.roles must be 1 to 3 unique role names {list(_ROLE_NAMES)}")
+        demo = sorted(k for k in pkeys if k in _DEMO_KEY_IDS)
+        if demo:
+            raise PolicyError(f"{where}.keys holds a demo key id {demo}: anyone can sign with a demo key, so a "
+                              "roster person never holds one (SPEC 13.4.1)")
+        if pid in ids or sid in signer_ids:
+            raise PolicyError(f"{where} repeats a person_id or signer_id of an earlier person (SPEC 13.4.1)")
+        twice = sorted(k for k in pkeys if k in keys)
+        if twice:
+            raise PolicyError(f"{where} holds key id(s) {twice} that another person already holds: a key is held by "
+                              "one person only (SPEC 13.4.1)")
+        ids.add(pid)
+        signer_ids.add(sid)
+        keys.update(pkeys)
+
+
+#: SPEC 13.4.1: the TYPE and range of each member (a breach makes the policy malformed). `tsas` is checked in full by
+#: `proof_verify.tsp.pin_problem` (the 10.7.3 table, TT-9) and `roster` by `_check_roster` (its person objects and
+#: uniqueness rules).
 _POLICY_SHAPES = {
     "origin_quorum": lambda v: _json_int(v, 1, 8),
     "require_seal_suites": lambda v: _str_list(v, 8, _ALG_TOKEN_RE),
     "min_envelope": lambda v: isinstance(v, str) and v in ("v3", "v4"),
     "suites": lambda v: _trust_map(v),
     "hashes": lambda v: _trust_map(v, ("sha256", "sha384", "sha512")),
-    "tsas": lambda v: isinstance(v, list) and len(v) <= 16 and all(isinstance(x, dict) for x in v),
+    "tsas": lambda v: _tsp.pin_problem(v) is None,
     "min_seal_tsas": lambda v: _json_int(v, 0, 16),
     "require_archive": lambda v: isinstance(v, bool),
     "min_archive_tsas": lambda v: _json_int(v, 1, 4),
-    "roster": lambda v: isinstance(v, list) and len(v) <= 1024 and all(isinstance(x, dict) for x in v),
-    "require_roles": lambda v: _str_list(v, 16, _ROLE_RE, unique=False),
+    "roster": lambda v: isinstance(v, list) and len(v) <= _MAX_ROSTER and all(isinstance(x, dict) for x in v),
+    "require_roles": lambda v: _role_list(v, 16, unique=False),
     "require_order": lambda v: isinstance(v, bool),
     "require_signoff_timestamps": lambda v: isinstance(v, bool),
     "allow_self_verify": lambda v: isinstance(v, bool),
@@ -481,13 +551,30 @@ _POLICY_SHAPES = {
     "originator_signer_ids": lambda v: _str_list(v, 64, _SIGNER_ID_RE),
     "max_attest_lag_s": lambda v: _json_int(v, 0, 31_622_400),
     "allow_ess_v1": lambda v: isinstance(v, bool),
+    "require_full_copy_review": lambda v: isinstance(v, bool),
 }
 #: The members whose type is "JSON integer" (SPEC 2): a whole double such as `1.0` is the same value as `1`, so it is
 #: normalized to the integer before the policy is hashed (13.4.1: policies with the same meaning have the same digest).
 _POLICY_INT_MEMBERS = frozenset({"origin_quorum", "min_seal_tsas", "min_archive_tsas", "max_attest_lag_s"})
-#: Members this release EVALUATES at a non-default value (13.4.3 row 2). Every other member is accepted only at its
-#: default; a well-formed other value raises PolicyUnsupportedError (a limitation of this release, see CHANGELOG).
-_POLICY_EVALUATED = frozenset({"min_envelope"})
+#: Members this release EVALUATES at a non-default value: `min_envelope` (13.4.3 row 2), the origin members of 7.13
+#: (`origin_quorum`, `require_seal_suites`, `suites`, `hashes`) and the sign-off members of 13.4.4 (`roster`,
+#: `require_roles`, `require_order`, `allow_self_verify`, `originator_keys`, `originator_signer_ids`) and the
+#: trusted-time members of 10.7 and 13.4.1 (`tsas`, `min_seal_tsas`, `require_signoff_timestamps`, `max_attest_lag_s`,
+#: `allow_ess_v1`). The archive members are accepted only at their default; a well-formed other value raises
+#: PolicyUnsupportedError (a limitation of this release, see CHANGELOG).
+_POLICY_EVALUATED = frozenset({"min_envelope", "origin_quorum", "require_seal_suites", "suites", "hashes",
+                               "roster", "require_roles", "require_order", "allow_self_verify", "originator_keys",
+                               "originator_signer_ids", "tsas", "min_seal_tsas", "require_signoff_timestamps",
+                               "max_attest_lag_s", "allow_ess_v1", "require_full_copy_review"})
+
+
+def _derived_signoff_timestamps(policy: dict) -> bool:
+    """SPEC 13.4.1 "Derived default": a receiver that pins a TSA (whose tokens give sign-off time under 10.3.8 step
+    11) and does not state `require_signoff_timestamps` gets it as true, so a sign-off whose token is deleted fails
+    closed (13.4.3 row 12) instead of escaping the time check. `max_attest_lag_s` alone derives nothing: without a
+    pinned TSA no token can be accepted. A receiver that writes `require_signoff_timestamps: false` keeps false, and
+    the verdict carries the advisory note `signoff_timestamps_not_required`."""
+    return "require_signoff_timestamps" not in policy and bool(policy.get("tsas"))
 
 
 def _policy_members(policy: Any) -> dict[str, Any]:
@@ -503,14 +590,22 @@ def _policy_members(policy: Any) -> dict[str, Any]:
     if unknown:
         raise PolicyError(f"policy has unknown key(s) {unknown}")
     for k in sorted(set(policy) & set(_POLICY_DEFAULTS)):
-        if not _POLICY_SHAPES[k](policy[k]):
+        if k == "tsas":
+            bad = _tsp.pin_problem(policy[k])
+            if bad:
+                raise PolicyError(f"policy member 'tsas' is malformed (SPEC 10.7.3, TT-9): {bad}")
+        elif not _POLICY_SHAPES[k](policy[k]):
             raise PolicyError(f"policy member {k!r} has a wrong type or a value out of range: {policy[k]!r}")
+    if "roster" in policy:
+        _check_roster(policy["roster"])
     for k in sorted(set(policy) & set(_POLICY_DEFAULTS) - _POLICY_EVALUATED):
         if not _same_json(policy[k], _POLICY_DEFAULTS[k]):
             raise PolicyUnsupportedError(
                 f"policy member {k!r} is well-formed but not evaluated by this release except at its default "
                 f"{_POLICY_DEFAULTS[k]!r}; it is refused rather than ignored")
     given = {k: (int(policy[k]) if k in _POLICY_INT_MEMBERS else policy[k]) for k in _POLICY_DEFAULTS if k in policy}
+    if _derived_signoff_timestamps(policy):          # step 1: the derived default, before the policy digest
+        given["require_signoff_timestamps"] = True
     return {**_POLICY_DEFAULTS, **given}
 
 
@@ -547,11 +642,14 @@ def policy_sha256(members: dict, pin_set: dict[str, bool]) -> str:
     pins sorted by key_id; the string lists sorted by code point; a pin's label kept only when present)."""
     labels = members.get("_labels", {})
     eff = {k: copy.deepcopy(v) for k, v in members.items() if k != "_labels"}
+    eff["tsas"] = sorted(eff["tsas"], key=lambda p: p["id"])
     eff["schema"] = POLICY_SCHEMA
     for m in ("suites", "hashes"):
         eff[m] = {k: e for k, e in eff[m].items() if e.get("trusted_until") is not None}
     for m in ("require_seal_suites", "originator_keys", "originator_signer_ids", "require_roles"):
         eff[m] = sorted(eff[m])
+    eff["roster"] = sorted(({**p, "keys": sorted(p["keys"]), "roles": sorted(p["roles"])} for p in eff["roster"]),
+                           key=lambda p: p["person_id"])
     eff["pins"] = [{"key_id": k, "demo": pin_set[k], **({"label": labels[k]} if k in labels else {})}
                    for k in sorted(pin_set)]
     return _sha(_canon(eff))
@@ -564,18 +662,44 @@ def _verdict_pins(rep: dict) -> dict[str, bool] | None:
         return {e["key_id"]: bool(e["demo"]) for e in ps if isinstance(e, dict) and "key_id" in e and "demo" in e}
     pk = rep.get("pinned_key")
     if isinstance(pk, str) and pk.startswith("ed25519:"):
-        return {key_id("ed25519", pk.removeprefix("ed25519:")): bool(rep.get("pinned_key_is_demo"))}
+        return _default_pin_set(pk.removeprefix("ed25519:"), bool(rep.get("pinned_key_is_demo")))
     return None
 
 
+def _default_pin_set(pubkey_hex: str, demo: bool) -> dict[str, bool]:
+    """The pin set of the single-pin path (no policy, no caller pins): the module or profile pin, plus the built-in
+    demo pins (every demo key, demo; SIG-28 keeps a demo key a demo pin even when it is also the module pin)."""
+    out = {e["key_id"]: True for e in BUILTIN_DEMO_PINS}
+    kid = key_id("ed25519", pubkey_hex)
+    out[kid] = out.get(kid, False) or demo
+    return out
+
+
+def _aged(entry: Any, as_of: str) -> bool:
+    """SPEC 7.13 "Aged": `trusted_until` is non-null and `trusted_until < as_of`; equality is not aged (the inclusive
+    end of K2 and 10.7.6). Both are UTC timestamps of the one fixed-width form of 2.3, so string order is time order."""
+    return isinstance(entry, dict) and entry.get("trusted_until") is not None and entry["trusted_until"] < as_of
+
+
+def utc_now() -> str:
+    """SPEC 7.13: the default `as_of`, the current time floored to whole seconds, as a UTC timestamp (2.3)."""
+    import time
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -> list[str]:
-    """SPEC 13.4.3, the reason codes in table order, for the rows this release can evaluate. Rows 4-12 read v2
-    sign-off entries, rows 15 and 18 TSA and archive evaluation: they cannot apply until those blocks are checked,
-    and a PRESENT unchecked block already rejects through rows 3, 14 and 17 (see `_dims`).
+    """SPEC 13.4.3, the reason codes in table order, for the rows this release can evaluate. Rows 3 to 12 read the
+    `signoffs` dimension and its entries (`signoff_reasons`), rows 13 to 15 the `time` dimension. Row 18 reads the
+    archive, which this release does not check: a PRESENT archive block already rejects through row 17 (`_dims`),
+    and `require_archive` is refused (`PolicyUnsupportedError`). Row 19 reads the `signoffs` entries again
+    (`partial_copy_reasons`, `require_full_copy_review`).
 
     13.4.2: "`verdict` MUST have been produced under the same effective policy ... If the hashes differ, `evaluate`
     MUST refuse (an error, not a decision)". A verdict records its `policy_sha256`; ``members`` (with ``pin_set``,
     or the verdict's own pins when it is None) must hash to it, else PolicyError is raised."""
+    missing = sorted(k for k in _POLICY_DEFAULTS if k not in members)
+    if missing:          # the members form needs every member, defaults filled in (as @proof-core/verify refuses)
+        raise TypeError(f"evaluate: the members form needs every policy member, defaults filled in; missing {missing}")
     recorded = rep.get("policy_sha256")
     if recorded is None and isinstance(rep.get("decision"), dict):
         recorded = rep["decision"].get("policy_sha256")
@@ -592,14 +716,21 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
     dims = rep.get("dims", {})
     if dims.get("signoffs") == "invalid":
         reasons.append("signoffs_invalid")
+    signoffs = rep.get("signoffs") if isinstance(rep.get("signoffs"), dict) else {"state": dims.get("signoffs")}
+    reasons += signoff_reasons(signoffs, members, v2=rep.get("canon_version") == 3)
     if dims.get("time") == "invalid":
         reasons.append("time_invalid")
     if dims.get("time") == "malformed":
         reasons.append("time_malformed")
+    t = rep.get("time") if isinstance(rep.get("time"), dict) else {}
+    distinct = t.get("distinct_tsas") if t.get("state") == "valid" and isinstance(t.get("distinct_tsas"), int) else 0
+    if distinct < members.get("min_seal_tsas", 0):
+        reasons.append("seal_tsas_insufficient")
     if dims.get("archive") == "broken":
         reasons.append("archive_broken")
     if dims.get("archive") == "malformed":
         reasons.append("archive_malformed")
+    reasons += partial_copy_reasons(signoffs, members, v2=rep.get("canon_version") == 3)
     return reasons
 
 
@@ -1401,6 +1532,220 @@ def _ed25519_verify(signature: bytes, msg: bytes, pubkey: bytes) -> bool:
     return _mul_base(s) == _add(r_point, _mul(a_point, k))
 
 
+# --- independent ECDSA P-256 verify (SPEC v4 7.6; its own field arithmetic; no shared code) -------------------------
+# Parameters copied from NIST SP 800-186 section 3.2.1.3 and SEC 2 v2.0 section 2.4.2 (they agree): the curve
+# y^2 = x^3 + a*x + b over GF(p) with a = p - 3. Written for this verifier alone; it shares no code or imports with
+# proof_core.signing. As for Ed25519 that is code independence, NOT independent derivation (both copies transcribe
+# the same standards), so the independent references are the NIST CAVP SigVer / PKV vectors, the Wycheproof P1363
+# vectors and the OpenSSL (`cryptography`) differential test in tests/test_p256.py.
+# Verification handles only public data, so it is not constant-time (SPEC 7.6: "constant-time arithmetic is not
+# required").
+_EC_P = int("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff", 16)
+_EC_A = _EC_P - 3
+_EC_B = int("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b", 16)
+_EC_GX = int("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296", 16)
+_EC_GY = int("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5", 16)
+_EC_N = int("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+_EC_HALF_N = int("7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8", 16)   # floor(n/2)
+if (_EC_GY ** 2 - _EC_GX ** 3 - _EC_A * _EC_GX - _EC_B) % _EC_P or _EC_HALF_N != _EC_N // 2 or _EC_P % 4 != 3:
+    raise ImportError("P-256 parameters failed their self-check")
+
+#: A Jacobian point (X, Y, Z) is (X/Z^2, Y/Z^3); Z == 0 is the point at infinity.
+_EC_O = (0, 1, 0)
+
+
+def _ec_dbl(q: tuple[int, int, int]) -> tuple[int, int, int]:
+    """2Q in Jacobian coordinates for a = -3 (the "dbl-2001-b" formulas)."""
+    X, Y, Z = q
+    if not Z or not Y:
+        return _EC_O
+    m = _EC_P
+    zz = Z * Z % m
+    yy = Y * Y % m
+    xyy = X * yy % m
+    t = 3 * (X - zz) * (X + zz) % m
+    X3 = (t * t - 8 * xyy) % m
+    return (X3, (t * (4 * xyy - X3) - 8 * yy * yy) % m, ((Y + Z) ** 2 - yy - zz) % m)
+
+
+def _ec_sum(q1: tuple[int, int, int], q2: tuple[int, int, int], affine2: bool = False) -> tuple[int, int, int]:
+    """Q1 + Q2 in Jacobian coordinates; ``affine2`` says Z2 == 1. Complete for P-256: equal points are doubled and
+    opposite points give infinity, so u1*G + u2*Q is computed correctly whatever an adversary chose."""
+    X1, Y1, Z1 = q1
+    X2, Y2, Z2 = q2
+    if not Z1:
+        return q2
+    if not Z2:
+        return q1
+    m = _EC_P
+    z1s = Z1 * Z1 % m
+    if affine2:
+        a1, b1 = X1, Y1
+        z2s = 1
+    else:
+        z2s = Z2 * Z2 % m
+        a1, b1 = X1 * z2s % m, Y1 * Z2 * z2s % m
+    a2, b2 = X2 * z1s % m, Y2 * Z1 * z1s % m
+    dx, dy = (a2 - a1) % m, (b2 - b1) % m
+    if not dx:
+        return _ec_dbl(q1) if not dy else _EC_O
+    dx2 = dx * dx % m
+    dx3 = dx * dx2 % m
+    w = a1 * dx2 % m
+    X3 = (dy * dy - dx3 - 2 * w) % m
+    Y3 = (dy * (w - X3) - b1 * dx3) % m
+    Z3 = Z1 * dx % m if affine2 else Z1 * Z2 * dx % m
+    return (X3, Y3, Z3)
+
+
+def _ec_to_affine(points: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
+    """Normalize finite Jacobian points to Z = 1 with a single field inversion (simultaneous inversion)."""
+    m = _EC_P
+    run = [1]
+    for _X, _Y, Z in points:
+        run.append(run[-1] * Z % m)
+    inv = pow(run[-1], -1, m)
+    out = [None] * len(points)
+    for i in reversed(range(len(points))):
+        X, Y, Z = points[i]
+        zinv = run[i] * inv % m
+        inv = inv * Z % m
+        z2 = zinv * zinv % m
+        out[i] = (X * z2 % m, Y * z2 * zinv % m, 1)
+    return out
+
+
+def _ec_comb() -> list[tuple[tuple[int, int, int], ...]]:
+    """_EC_COMB[w][d - 1] = [d * 2^(4w)]G for w < 64, 1 <= d <= 15, normalized to Z = 1."""
+    flat: list[tuple[int, int, int]] = []
+    g = (_EC_GX, _EC_GY, 1)
+    for _w in range(64):
+        acc = _EC_O
+        for _d in range(15):
+            acc = _ec_sum(acc, g)
+            flat.append(acc)
+        g = _ec_dbl(_ec_dbl(_ec_dbl(_ec_dbl(g))))
+    flat = _ec_to_affine(flat)
+    return [tuple(flat[15 * w:15 * (w + 1)]) for w in range(64)]
+
+
+_EC_COMB = _ec_comb()
+
+
+def _ec_mul_g(k: int) -> tuple[int, int, int]:
+    """[k]G by the fixed-base comb: one mixed addition per non-zero 4-bit digit of k mod n, no doubling."""
+    k %= _EC_N
+    acc = _EC_O
+    for row in _EC_COMB:
+        if not k:
+            break
+        d = k & 15
+        if d:
+            acc = _ec_sum(acc, row[d - 1], affine2=True)
+        k >>= 4
+    return acc
+
+
+def _ec_mul(q: tuple[int, int, int], k: int) -> tuple[int, int, int]:
+    """[k]Q for a finite affine Q (Z = 1) of order n: 4-bit fixed windows, most significant first."""
+    k %= _EC_N
+    if not k:
+        return _EC_O
+    odd = [q]
+    while len(odd) < 15:
+        odd.append(_ec_sum(odd[-1], q, affine2=True))
+    odd = _ec_to_affine(odd)
+    acc = _EC_O
+    for i in range(63, -1, -1):
+        acc = _ec_dbl(_ec_dbl(_ec_dbl(_ec_dbl(acc))))
+        d = (k >> (4 * i)) & 15
+        if d:
+            acc = _ec_sum(acc, odd[d - 1], affine2=True)
+    return acc
+
+
+def _p256_point(key: bytes) -> tuple[int, int, int]:
+    """SPEC 7.6 step 2 (SEC 1 2.3.4, compressed only): 33 bytes, prefix 02/03 (SIG-6), x < p (SIG-7), and
+    x^3 - 3x + b a square mod p (SIG-8). The point returned is on the curve and finite, so it has order n (h = 1):
+    full public-key validation (SP 800-186 Appendix D.1). Raises ValueError otherwise."""
+    if len(key) != 33 or key[0] not in (2, 3):
+        raise ValueError("not a 33-byte SEC 1 compressed P-256 point")
+    x = int.from_bytes(key[1:], "big")
+    if x >= _EC_P:
+        raise ValueError("x is not below p")
+    rhs = (pow(x, 3, _EC_P) + _EC_A * x + _EC_B) % _EC_P
+    y = pow(rhs, (_EC_P + 1) // 4, _EC_P)            # p = 3 mod 4: SP 800-186 Appendix E.3
+    if y * y % _EC_P != rhs:
+        raise ValueError("x is not the abscissa of a curve point")
+    if y & 1 != key[0] & 1:
+        y = _EC_P - y
+    return (x, y, 1)
+
+
+def _p256_verify(signature: bytes, msg: bytes, pubkey: bytes) -> bool:
+    """SPEC 7.6 steps 2-5 on raw bytes (the hex shape gate, step 1, is the caller's). Never raises."""
+    if len(signature) != 64:
+        return False
+    try:
+        q = _p256_point(pubkey)
+    except ValueError:
+        return False
+    r = int.from_bytes(signature[:32], "big")
+    s = int.from_bytes(signature[32:], "big")
+    if not 0 < r < _EC_N:                         # SIG-9 (FIPS 186-5 6.4.2 step 1)
+        return False
+    if not 0 < s <= _EC_HALF_N:                   # SIG-10 low-S; SIG-11: a high s is never normalized here
+        return False
+    e = int.from_bytes(hashlib.sha256(msg).digest(), "big")    # step 4: n is 256 bits, no truncation
+    sinv = pow(s, -1, _EC_N)
+    R = _ec_sum(_ec_mul_g(e * sinv % _EC_N), _ec_mul(q, r * sinv % _EC_N))
+    if not R[2]:                                  # SIG-12: R is the point at infinity (step 6)
+        return False
+    zinv = pow(R[2], -1, _EC_P)
+    return R[0] * zinv * zinv % _EC_P % _EC_N == r    # SIG-13 (step 9)
+
+
+#: SPEC 7.5 SIG-2: S_sup, the seal suites a v4 verifier checks. (Canon 1 and 2 keep the v3 rule: Ed25519 only.)
+_ALG_SUPPORTED_V4 = frozenset({"ed25519", "ecdsa-p256"})
+
+
+def _suite_verify(alg: str, public_key_hex: str, msg: bytes, sig_hex: str) -> bool:
+    """7.3 or 7.6 on hex fields that already passed their suite row. Never raises."""
+    try:
+        pk, sig = bytes.fromhex(public_key_hex), bytes.fromhex(sig_hex)
+    except (ValueError, TypeError):
+        return False
+    if alg == "ed25519":
+        return _ed25519_verify(sig, msg, pk)
+    if alg == "ecdsa-p256":
+        return _p256_verify(sig, msg, pk)
+    return False
+
+
+def verify_signature(alg: str, public_key_hex: str, msg_bytes: bytes, sig_hex: str) -> bool | None:
+    """SPEC 7.15: the domain-neutral signature check both reference verifiers export, so a product layer that signs
+    with these suites applies the same encoding gates as the seal check.
+
+    - ``ed25519`` (7.3) and ``ecdsa-p256`` (7.6): the hex fields are first matched against the suite's row of the
+      7.5 table as strings (SIG-1: lowercase, no whitespace, no prefix; for P-256 the 33-byte compressed key and the
+      64-byte raw r || s, SIG-6), then verified over ``msg_bytes``. Returns True or False.
+    - a reserved or unknown suite token (well-formed per 7.5) whose hex fields match the generic row: returns
+      **None**, "not checked" (SIG-2: the hex of any other suite is never verified and never treated as checked).
+      None is falsy on purpose, so a caller that tests the result for truth fails closed.
+    - anything malformed (a non-token ``alg``, a hex field off its row, a non-bytes message): False.
+    Never raises."""
+    if not (isinstance(alg, str) and _ALG_TOKEN_RE.fullmatch(alg) and isinstance(public_key_hex, str)
+            and isinstance(sig_hex, str) and isinstance(msg_bytes, (bytes, bytearray))):
+        return False
+    key_rx = _SUITE_KEY_RE.get(alg, _GENERIC_HEX_RE)
+    sig_rx = _SIGNATURE_HEX_RE if alg in _ALG_SUPPORTED_V4 else _GENERIC_HEX_RE
+    if not (key_rx.fullmatch(public_key_hex) and sig_rx.fullmatch(sig_hex)):
+        return False
+    if alg not in _ALG_SUPPORTED_V4:
+        return None
+    return _suite_verify(alg, public_key_hex, bytes(msg_bytes), sig_hex)
+
+
 def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
                      origin_problems: list[str], profile=None, sig_out: dict | None = None,
                      pin_set: dict[str, bool] | None = None, v4_suites: bool = False) -> str | None:
@@ -1437,7 +1782,8 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
     if sig.get("message") != _SIGNATURE_MESSAGE:
         problems.append(f"signature.message must be {_SIGNATURE_MESSAGE!r} (got {sig.get('message')!r})")
     alg = sig.get("alg")
-    if not (isinstance(alg, str) and alg in _ALG_SUPPORTED):
+    supported = _ALG_SUPPORTED_V4 if v4_suites else _ALG_SUPPORTED
+    if not (isinstance(alg, str) and alg in supported):
         signer_v, sig_hex_v = sig.get("public_key"), sig.get("signature")
         # mirror the JS `blockShapeOk` gate: grant the soft fail-forward ONLY when the block is OTHERWISE
         # well-formed (hex fields valid; S1/S2 above already recorded any extra/missing key or bad message).
@@ -1446,10 +1792,8 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
         # Canon 3 and newer (`v4_suites`): the v4 suite table (SPEC 7.5). A suite this release does not implement
         # is shape-checked against its row, and for every reserved or unknown token that row is the GENERIC hex
         # row, so a real-size ML-DSA key and signature are `unsupported-alg` (SIG-1, SIG-2, 11.4), consistent with
-        # `provenance.seal_signers` (7.9). `ecdsa-p256` is a supported suite in v4 that this release does not
-        # implement yet (a declared limitation): it keeps the Ed25519 shapes and so reads `fail`. Canon 1 and 2
-        # keep the v3 rule (Ed25519 shapes for any suite), unchanged.
-        if v4_suites and isinstance(alg, str) and alg != "ecdsa-p256":
+        # `provenance.seal_signers` (7.9). Canon 1 and 2 keep the v3 rule (Ed25519 shapes for any suite), unchanged.
+        if v4_suites and isinstance(alg, str):
             key_rx, sig_rx = _GENERIC_HEX_RE, _GENERIC_HEX_RE
         else:
             key_rx, sig_rx = _PUBKEY_HEX_RE, _SIGNATURE_HEX_RE
@@ -1458,9 +1802,10 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
         if isinstance(alg, str) and _ALG_TOKEN_RE.fullmatch(alg) and signer_ok and sighex_ok:
             if sig_out is not None:
                 sig_out["unsupported_alg"] = True
+                sig_out["primary"] = {"alg": alg, "public_key": signer_v, "checked": False, "valid": None}
             problems.append(
                 f"{STATE_UNSUPPORTED_ALG}: signed with signature suite {alg!r}; this verifier can check "
-                f"{sorted(_ALG_SUPPORTED)} and so CANNOT check this signature -- use a newer verifier "
+                f"{sorted(supported)} and so CANNOT check this signature -- use a newer verifier "
                 "(integrity and origin UNDETERMINED; this verdict can be produced from any content and "
                 "attests nothing about the sections)")
         else:
@@ -1485,22 +1830,25 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
     # BEFORE `bytes.fromhex`, which is case-insensitive and skips ASCII whitespace -- so an upper-cased or
     # space-separated key/signature is rejected with a pointed message instead of silently verifying
     # (== a strict JSON-Schema / browser check). A producer writes lowercase, unbroken hex.
-    if not (isinstance(signer, str) and _PUBKEY_HEX_RE.fullmatch(signer)):
+    if alg == "ecdsa-p256":          # only reachable on the newer-canon branch (v4_suites), SPEC 7.17 SIG-38
+        if not (isinstance(signer, str) and _SUITE_KEY_RE[alg].fullmatch(signer)):
+            problems.append("signature public_key is not a 33-byte SEC 1 compressed P-256 key (02 or 03 then 64 "
+                            "lowercase hex characters, SPEC 7.6 SIG-6)")
+            return None
+    elif not (isinstance(signer, str) and _PUBKEY_HEX_RE.fullmatch(signer)):
         problems.append("signature public_key is not a 32-byte hex Ed25519 key (64 lowercase hex characters)")
         return None
-    pk = bytes.fromhex(signer)
     sig_hex = sig.get("signature")
     if not (isinstance(sig_hex, str) and _SIGNATURE_HEX_RE.fullmatch(sig_hex)):
-        problems.append("signature.signature is not a 64-byte Ed25519 signature (128 lowercase hex "
+        problems.append(f"signature.signature is not a 64-byte {_SUITE_NAME[alg]} signature (128 lowercase hex "
                         "characters, no whitespace)")
         ok = False
     else:
-        try:
-            ok = _ed25519_verify(bytes.fromhex(sig_hex), bundle_sha256.encode(), pk)
-        except (ValueError, TypeError):
-            ok = False
+        ok = _suite_verify(alg, signer, bundle_sha256.encode(), sig_hex)
+    if sig_out is not None:
+        sig_out["primary"] = {"alg": alg, "public_key": signer, "checked": True, "valid": bool(ok)}
     if not ok:
-        problems.append("Ed25519 signature does not verify under the bundle's own embedded public key")
+        problems.append(f"{_SUITE_NAME[alg]} signature does not verify under the bundle's own embedded public key")
     # ORIGIN pin: a dialect may pin its OWN trust root (profile.pinned_pubkey, 64 hex). None keeps the
     # verifier's module-global pin unchanged -- the neutral default -- so the deliberate single-pin design
     # is intact unless a caller opts a profile in. This never affects INTEGRITY (checked above under the
@@ -1509,7 +1857,7 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
         # SPEC 7.12 (v3 input, E = [signature]): key_matches_pin iff the verified block's key id is in the pin set;
         # the matched pin's EFFECTIVE demo flag decides demo-ness (7.4 "with a pin set of one entry the outcome is
         # exactly the v3 outcome").
-        kid = key_id("ed25519", signer)
+        kid = key_id(alg, signer)
         if kid not in pin_set:
             origin_problems.append("signature key is not in the pin set")
         elif sig_out is not None:
@@ -2412,46 +2760,635 @@ def _check_v4(bundle: dict, problems: list[str], origin_problems: list[str],
                     and "inputs" in core_src["provenance"]:
                 problems.append("inputs declared withheld but still present in the result core's provenance")
                 break
-    # unsigned v4 blocks this release does not check: never a pass by omission
-    if "signatures" in bundle:
-        problems.append("signatures: co-signatures (SPEC 7.8) are not checked by this verifier release; a bundle "
-                        "that carries them is not verified")
-    if attestation_problems is not None and "attestations" in bundle:
-        attestation_problems.append("attestations: v2 entries (SPEC 10.3) are not checked by this verifier release")
+    # unsigned v4 blocks this release does not check: never a pass by omission. `attestations` (sign-offs v2) is
+    # checked in `classify_bundle` (`check_signoffs_v2`, 10.3.8), whatever the integrity verdict, and `timestamps`
+    # there too (`_time_dimension`, 10.7.7), once integrity holds.
     if v4_out is not None:
-        v4_out["unchecked_blocks"] = sorted(k for k in ("timestamps", "archive", "attestations") if k in bundle)
-    # step 19, the primary seal signature over the RECOMPUTED seal, and G2 for E = [signature]
-    signer = _check_signature(bundle, recomputed, problems, origin_problems, profile, sig_out=sig_out,
-                              pin_set=pin_set, v4_suites=True)
-    sig = bundle.get("signature")
+        v4_out["unchecked_blocks"] = sorted(k for k in ("archive",) if k in bundle)
+    # step 19, the seal signatures E = [signature] + signatures over the RECOMPUTED seal (7.10 G1-G6). Origin
+    # (pins, quorum, required suites, aging, 7.13) is decided from the recorded blocks in `classify_bundle`.
     declared_signers = ([(e["alg"], e["public_key"]) for e in prov_val["seal_signers"]]
                         if isinstance(prov_val, dict) and not ss_problems else None)
-    if declared_signers is not None and isinstance(sig, dict) \
-            and declared_signers != [(sig.get("alg"), sig.get("public_key"))]:
-        problems.append("the seal signatures do not equal provenance.seal_signers (SIG-20, G2): the declared "
-                        "signer list is [the primary signature] in this release")
-    return signer
+    return _check_seal_signatures(bundle, recomputed, problems, declared_signers,
+                                  sig_out if sig_out is not None else {})
 
 
-def _dims(bundle: Any, cv: int | None, integrity: bool, att_problems: list[str], atts: list, items: dict) -> dict:
+#: SPEC 7.8 SIG-16: "If present, it MUST be an array of 1 to 7 blocks".
+_MAX_COSIGNATURES = 7
+
+
+def _v4_block_problems(blk: Any, where: str) -> list[str]:
+    """SPEC 7.8 and 7.5 (G1): one seal signature block has exactly the keys alg, public_key, signature, message;
+    `message` is "bundle_sha256"; `alg` is a suite token; and both hex fields match the suite's row as strings
+    (SIG-1, SIG-6). Empty list == well-formed."""
+    if not isinstance(blk, dict):
+        return [f"{where} is not a JSON object (SIG-15, SIG-16)"]
+    out = []
+    extra = sorted(set(blk) - _SIGNATURE_KEYS)
+    missing = sorted(_SIGNATURE_KEYS - set(blk))
+    label = "signature block" if where == "signature" else where
+    if extra:
+        out.append(f"unsigned key in {label}: {extra}")
+    if missing:
+        out.append(f"{label} is missing required keys: {missing}")
+    if "message" in blk and blk["message"] != _SIGNATURE_MESSAGE:
+        out.append(f"{where}.message must be {_SIGNATURE_MESSAGE!r} (got {_shown(blk['message'])})")
+    alg = blk.get("alg")
+    if "alg" in blk and not (isinstance(alg, str) and _ALG_TOKEN_RE.fullmatch(alg)):
+        out.append(f"{where}.alg {_shown(alg)} is not a suite token of the suite table (SPEC 7.5, SIG-1)")
+        return out
+    if not isinstance(alg, str):
+        return out
+    key_rx = _SUITE_KEY_RE.get(alg, _GENERIC_HEX_RE)
+    sig_rx = _SIGNATURE_HEX_RE if alg in _ALG_SUPPORTED_V4 else _GENERIC_HEX_RE
+    pk, sh = blk.get("public_key"), blk.get("signature")
+    if "public_key" in blk and not (isinstance(pk, str) and key_rx.fullmatch(pk)):
+        out.append(f"{where}.public_key does not match the {alg} row of the suite table (SPEC 7.5 SIG-1"
+                   + ("; a P-256 key is 02 or 03 then 64 lowercase hex, SIG-6)" if alg == "ecdsa-p256" else ")"))
+    if "signature" in blk and not (isinstance(sh, str) and sig_rx.fullmatch(sh)):
+        out.append(f"{where}.signature does not match the {alg} row of the suite table (SPEC 7.5 SIG-1"
+                   + ("; raw r || s, 128 lowercase hex, never DER, SIG-6)" if alg == "ecdsa-p256" else ")"))
+    return out
+
+
+def _check_seal_signatures(bundle: dict, recomputed: str, problems: list[str],
+                           declared: list[tuple[str, str]] | None, sig_out: dict) -> str | None:
+    """SPEC 7.10, the seal signature checks for a canon-3 bundle, over E = [signature] + signatures (7.8).
+
+    - G1 shape (SIG-15, SIG-16, SIG-1, SIG-6): every block is well-formed; `signatures`, when present, is an array of
+      1 to 7 blocks. Otherwise fail, and nothing below runs.
+    - G2 set equality (SIG-20): the (alg, public_key) sequence over E equals `seal_signers` exactly.
+    - G3 partition: S_sup are the blocks of a supported suite, S_nc the others.
+    - G4 (SIG-21, SIG-3): every S_sup block verifies under its own key over the RECOMPUTED seal (7.3, 7.6).
+    - G5 (SIG-22): S_sup empty is `unsupported-alg` when it is the only problem (one problem recorded and
+      `sig_out["unsupported_alg"]`), else `fail`.
+    - G6 (SIG-23): each S_nc block is reported "not checked (suite <alg> not supported by this verifier)" and never
+      parsed as a signature.
+    Records `sig_out["v4_blocks"]` (one row per block of E: key_id, alg, checked, valid) and
+    `sig_out["not_checked"]`. Returns the public key hex of the first verified S_sup block (7.15 `signer`)."""
+    shape: list[str] = []
+    entries: list[tuple[str, Any]] = []
+    if not isinstance(bundle.get("signature"), dict):
+        shape.append("bundle is not signed: the primary seal signature block is missing or not an object (SIG-15)")
+    else:
+        entries.append(("signature", bundle["signature"]))
+    if "signatures" in bundle:
+        cs = bundle["signatures"]
+        if not isinstance(cs, list) or not 1 <= len(cs) <= _MAX_COSIGNATURES:
+            shape.append(f"signatures must be an array of 1 to {_MAX_COSIGNATURES} seal signature blocks; no "
+                         "co-signatures is written by leaving the key out (SIG-16)")
+        else:
+            entries += [(f"signatures[{i}]", blk) for i, blk in enumerate(cs)]
+    for where, blk in entries:
+        shape += _v4_block_problems(blk, where)
+    if shape:
+        problems.extend(shape)
+        return None
+    pairs = [(blk["alg"], blk["public_key"]) for _w, blk in entries]
+    if declared is not None and pairs != declared:
+        problems.append("the seal signatures do not equal provenance.seal_signers (SIG-20, G2): the (alg, "
+                        "public_key) sequence over [signature] + signatures must equal the declared signer list "
+                        "exactly, in order; a stripped, added, reordered, duplicated or substituted seal signature "
+                        "fails")
+    msg = recomputed.encode()
+    rows, not_checked = [], []
+    for where, blk in entries:
+        alg, pk = blk["alg"], blk["public_key"]
+        row = {"key_id": key_id(alg, pk), "alg": alg, "public_key": pk}
+        if alg in _ALG_SUPPORTED_V4:
+            ok = _suite_verify(alg, pk, msg, blk["signature"])
+            if not ok:
+                problems.append(
+                    f"{_SUITE_NAME[alg]} signature does not verify under the bundle's own embedded public key"
+                    if where == "signature" else
+                    f"{where}: {_SUITE_NAME[alg]} co-signature does not verify under its own embedded public key over "
+                    "the recomputed seal (SIG-21, G4): a bad co-signature fails the bundle even when the primary is "
+                    "good")
+            row.update(checked=True, valid=ok)
+        else:
+            row.update(checked=False, valid=None)
+            not_checked.append(f"{where}: not checked (suite {alg} not supported by this verifier)")
+        rows.append(row)
+    sig_out["v4_blocks"] = rows
+    sig_out["not_checked"] = not_checked
+    if not any(r["checked"] for r in rows):
+        sig_out["unsupported_alg"] = True
+        problems.append(
+            f"{STATE_UNSUPPORTED_ALG}: every seal signature is of a suite this verifier does not check "
+            f"({sorted({r['alg'] for r in rows})}; it checks {sorted(_ALG_SUPPORTED_V4)}) -- use a newer verifier "
+            "(integrity and origin UNDETERMINED; SIG-22, G5)")
+    first = next((r for r in rows if r["checked"] and r["valid"]), None)
+    return first["public_key"] if first else None
+
+
+# --- sign-offs v2 (SPEC 10.3.2 to 10.3.9): the `signoffs` dimension of a canon-3 bundle -------------------------
+# Attestations sit OUTSIDE the seal and never gate integrity, origin or the 13.1 state (10.3): a forged, malformed or
+# stapled sign-off is reported here, and the receiver policy decides what it means (`evaluate`, 13.4.3 rows 3-12).
+# A valid entry shows only that the holder of the key signed this text over this recomputed seal (10.3.9).
+
+_ATT2_SCHEMA = "evidence.attestation.v2"
+_ATT2_MESSAGE = "attests:v2"
+#: SPEC 10.3.7 "Signed object": the 13 members of O (every required key except `signature`).
+_ATT2_SIGNED = ("alg", "attests", "meaning", "message", "printed_name", "prior", "public_key", "reviewed_copy",
+                "role", "schema", "signed_at", "signer_id", "statement")
+#: SPEC 10.3.3: "Its keys MUST be exactly the fourteen required keys below, plus `timestamps` if present."
+_ATT2_KEYS = frozenset(_ATT2_SIGNED) | {"signature"}
+_ATT2_OPTIONAL = frozenset({"timestamps"})
+_MEANINGS = frozenset({"authorship", "review", "approval", "responsibility", "rejection"})
+#: SPEC 10.3.3: "an extension meaning matching `x-[a-z0-9][a-z0-9-]{0,30}`" (the `x-` grammar is reserved now so
+#: that defining one later, `x-redaction` included, changes no verdict).
+_EXT_MEANING_RE = re.compile(r"x-[a-z0-9][a-z0-9-]{0,30}", re.ASCII)
+#: SPEC 13.4.4 "A meaning approves for a role": `rejection` and every `x-` meaning approve for no role.
+_APPROVES = {"verifier": frozenset({"review"}), "approver": frozenset({"approval"}),
+             "originator": frozenset({"authorship", "responsibility"})}
+_MAX_ATTESTATIONS_V2 = 256
+_MAX_PRIOR = 16
+_MAX_ENTRY_TOKENS = 4
+_MAX_WITHHELD_ITEMS_RC = 16_384
+_REVIEWED_COPY_KEYS = frozenset({"withheld_sections", "withheld_items_count", "withheld_items_sha256"})
+#: SPEC 10.3.6: "If `withheld_items_count` is 0, it MUST equal `digest(canon_1([]))`".
+_EMPTY_LIST_DIGEST = "sha256:" + hashlib.sha256(b"[]").hexdigest()
+_TOKEN_MAX_CHARS = 200_000
+_TOKEN_MAX_BYTES = 150_000
+#: SPEC 10.3.8 step 6 / TT-36: an attestation token on a bundle whose 13.1 state is not an integrity state is not
+#: evaluated; it is reported with this class, gives no time bound, and the entry's `time_ok` is null.
+TOKEN_NOT_CHECKED = "not_checked"
+_TOKEN_NOT_CHECKED_DETAIL = ("not checked: the bundle's 13.1 state is not an integrity state, so no token is "
+                             "evaluated (SPEC 10.7.7 TT-36); this token establishes no time")
+#: SPEC 10.7.2 / 10.7.8: the schema of the datum a token's imprint covers.
+_TS_SUBJECT = "evidence.timestamp.subject.v1"
+#: SPEC 10.3.8 step 11: `signed_at <= T_e + 300 s`.
+_SIGNED_AT_SLACK_S = 300
+
+
+def _token_shape_problem(tok: Any) -> str | None:
+    """SPEC 10.7.2 TT-6 to TT-8 for one `token` string. None == well-formed."""
+    import base64
+    import binascii
+    if not isinstance(tok, str) or len(tok) > _TOKEN_MAX_CHARS or not _TIMESTAMP_TOKEN_RE.fullmatch(tok):
+        return "token is not strict base64 of at most 200,000 characters starting like a DER SEQUENCE (TT-6)"
+    try:
+        raw = base64.b64decode(tok, validate=True)
+    except (binascii.Error, ValueError):
+        return "token is not strict base64 (TT-6)"
+    if base64.b64encode(raw).decode("ascii") != tok:
+        return "token does not re-encode to itself: non-zero unused bits in its last character (TT-7)"
+    if len(raw) > _TOKEN_MAX_BYTES:
+        return "token decodes to more than 150,000 bytes (TT-8)"
+    return None
+
+
+def _suite_shape_problems(alg: Any, pk: Any, sig: Any, where: str) -> list[str]:
+    """SPEC 7.5 (SIG-1) and 7.6 (SIG-6): `alg` is a suite token and both hex fields match the suite's row as strings.
+    Shared by seal signature blocks (G1) and attestation entries (10.3.3)."""
+    if not (isinstance(alg, str) and _ALG_TOKEN_RE.fullmatch(alg)):
+        return [f"{where}.alg {_shown(alg)} is not a suite token of the suite table (SPEC 7.5, SIG-1)"]
+    out = []
+    key_rx = _SUITE_KEY_RE.get(alg, _GENERIC_HEX_RE)
+    sig_rx = _SIGNATURE_HEX_RE if alg in _ALG_SUPPORTED_V4 else _GENERIC_HEX_RE
+    if not (isinstance(pk, str) and key_rx.fullmatch(pk)):
+        out.append(f"{where}.public_key does not match the {alg} row of the suite table (SPEC 7.5 SIG-1"
+                   + ("; a P-256 key is 02 or 03 then 64 lowercase hex, SIG-6)" if alg == "ecdsa-p256" else ")"))
+    if not (isinstance(sig, str) and sig_rx.fullmatch(sig)):
+        out.append(f"{where}.signature does not match the {alg} row of the suite table (SPEC 7.5 SIG-1"
+                   + ("; raw r || s, 128 lowercase hex, never DER, SIG-6)" if alg == "ecdsa-p256" else ")"))
+    return out
+
+
+def _reviewed_copy_problems(rc: Any) -> list[str]:
+    """SPEC 10.3.6. A verifier checks the shape and the zero-count digest only; it MUST NOT judge whether the copy
+    described is the copy being verified."""
+    if not isinstance(rc, dict) or set(rc) != _REVIEWED_COPY_KEYS:
+        return [f"reviewed_copy must be an object with exactly the keys {sorted(_REVIEWED_COPY_KEYS)}"]
+    out = []
+    ws = rc["withheld_sections"]
+    if not (isinstance(ws, list) and all(isinstance(x, str) and x in ("inputs", "result") for x in ws)
+            and ws == sorted(set(ws))):
+        out.append("reviewed_copy.withheld_sections must be a sorted, unique array drawn from inputs and result "
+                   "(provenance is never withheld in v4)")
+    n = rc["withheld_items_count"]
+    if not _json_int(n, 0, _MAX_WITHHELD_ITEMS_RC):
+        out.append("reviewed_copy.withheld_items_count must be a JSON integer from 0 to 16,384")
+    d = rc["withheld_items_sha256"]
+    if not _is_digest(d):
+        out.append("reviewed_copy.withheld_items_sha256 is not a well-formed digest")
+    elif _json_int(n, 0, 0) and d != _EMPTY_LIST_DIGEST:
+        out.append("reviewed_copy.withheld_items_count is 0 but withheld_items_sha256 is not digest(canon_1([]))")
+    return out
+
+
+def _att2_shape_problems(e: Any, seal: str | None) -> list[str]:
+    """SPEC 10.3.3 to 10.3.6 and the suite shape for one entry (step 3 of 10.3.8). Empty list == well-formed."""
+    if not isinstance(e, dict):
+        return ["entry is not a JSON object"]
+    out = []
+    missing = sorted(_ATT2_KEYS - set(e))
+    extra = sorted(set(e) - _ATT2_KEYS - _ATT2_OPTIONAL)
+    if missing:
+        out.append(f"entry is missing required key(s) {missing}")
+    if extra:
+        out.append(f"entry has unexpected key(s) {[_shown(k) for k in extra]}")
+    if "schema" in e and e["schema"] != _ATT2_SCHEMA:
+        out.append(f"schema must be {_ATT2_SCHEMA!r} (an evidence.attestation.v1 entry is invalid in a v4 bundle)")
+    if "message" in e and e["message"] != _ATT2_MESSAGE:
+        out.append(f"message must be {_ATT2_MESSAGE!r}")
+    if "attests" in e and not (_is_digest(e["attests"]) and seal is not None and e["attests"] == seal):
+        out.append("attests is not the seal this verifier recomputed: a sign-off copied from another bundle never "
+                   "verifies")
+    if "role" in e and e["role"] not in _ROLE_NAMES:
+        out.append("role is not one of originator, verifier, approver")
+    if "meaning" in e:
+        m = e["meaning"]
+        if not (isinstance(m, str) and (m in _MEANINGS or _EXT_MEANING_RE.fullmatch(m))):
+            out.append("meaning is not authorship, review, approval, responsibility, rejection or an extension "
+                       "meaning x-[a-z0-9][a-z0-9-]{0,30}")
+    if "statement" in e and not is_restricted_text(e["statement"], 1, 1024):
+        out.append("statement must be restricted text (SPEC 2.2) of 1 to 1,024 code points")
+    if "printed_name" in e and not is_restricted_text(e["printed_name"], 1, 256):
+        out.append("printed_name must be restricted text (SPEC 2.2) of 1 to 256 code points")
+    if "signer_id" in e and not (isinstance(e["signer_id"], str) and _SIGNER_ID_RE.fullmatch(e["signer_id"])):
+        out.append("signer_id must be 1 to 256 printable ASCII characters U+0021 to U+007E (no space)")
+    if "signed_at" in e and not (isinstance(e["signed_at"], str) and _utc_or_null(e["signed_at"])):
+        out.append("signed_at is not a UTC timestamp YYYY-MM-DDTHH:MM:SSZ naming a real instant (SPEC 2.3)")
+    if "reviewed_copy" in e:
+        out += _reviewed_copy_problems(e["reviewed_copy"])
+    if "prior" in e:
+        pr = e["prior"]
+        if not (isinstance(pr, list) and len(pr) <= _MAX_PRIOR and all(_is_digest(d) for d in pr)):
+            out.append("prior must be an array of 0 to 16 well-formed digests")
+        elif pr != sorted(set(pr)):
+            out.append("prior must be unique and sorted ascending")
+    if {"alg", "public_key", "signature"} <= set(e):
+        out += _suite_shape_problems(e["alg"], e["public_key"], e["signature"], "entry")
+    if "timestamps" in e:
+        ts = e["timestamps"]
+        if not (isinstance(ts, list) and 1 <= len(ts) <= _MAX_ENTRY_TOKENS):
+            out.append("timestamps must be an array of 1 to 4 token objects (omit the key for none)")
+        else:
+            for j, t in enumerate(ts):
+                if not (isinstance(t, dict) and set(t) == {"format", "token"}):
+                    out.append(f"timestamps[{j}] must be an object with exactly the keys format and token")
+                    continue
+                if t["format"] != "rfc3161":
+                    out.append(f"timestamps[{j}].format must be 'rfc3161'")
+                bad = _token_shape_problem(t["token"])
+                if bad:
+                    out.append(f"timestamps[{j}]: {bad}")
+    return out
+
+
+def _entry_sha256(e: dict) -> str | None:
+    """SPEC 10.3.7 "Entry digest": `digest(canon_1(e minus "timestamps"))`, over the entry as stored."""
+    try:
+        return _sha(_canon({k: v for k, v in e.items() if k != "timestamps"}))
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def attestation_signed_bytes(entry: dict, seal: str) -> bytes:
+    """SPEC 10.3.7: M = canon_1(O), O the 13 signed members with `attests` set to the RECOMPUTED seal ``seal``.
+    Raises KeyError when a signed member is missing."""
+    o = {k: entry[k] for k in _ATT2_SIGNED}
+    o["attests"] = seal
+    return _canon(o)
+
+
+def _seal_signer_ids(bundle: Any) -> list[str]:
+    """The key ids of the well-formed `provenance.seal_signers` entries (7.9), for the originator key set (10.3.8
+    step 10 a). A malformed list already failed integrity; what can be read of it still counts as originator keys."""
+    try:
+        ss = bundle["manifest"]["provenance"]["value"]["seal_signers"]
+    except (KeyError, TypeError):
+        return []
+    out = []
+    for e in ss if isinstance(ss, list) else []:
+        if isinstance(e, dict) and isinstance(e.get("alg"), str) and _ALG_TOKEN_RE.fullmatch(e["alg"]) \
+                and isinstance(e.get("public_key"), str) and _GENERIC_HEX_RE.fullmatch(e["public_key"]):
+            out.append(key_id(e["alg"], e["public_key"]))
+    return out
+
+
+def signoffs_none(checked: bool = True) -> dict:
+    return {"state": "none", "checked": checked, "problems": [], "entries": []}
+
+
+def _entry_tokens(d: dict, seal: str | None, tok: dict | None) -> list[dict]:
+    """SPEC 10.3.8 step 6 / 10.7.8: the per-token reports of one shape-valid entry. ``tok`` is the token context of
+    `classify_bundle`: None, or integrity not held, gives every token `not_checked` (TT-36); over the TT-13 cap every
+    token is `malformed` and none is evaluated."""
+    n = len(d["timestamps"])
+    # Order (as for the `time` dimension): TT-36 first, so a bundle without integrity reports every token
+    # `not_checked` whatever the count; then the TT-13 cap; then each token by 10.7.6.
+    if tok is None or not tok["check"] or seal is None:
+        return [{"index": j, "tsa": None, "gen_time": None, "accuracy": None, "policy": None,
+                 "class": TOKEN_NOT_CHECKED, "problems": [_TOKEN_NOT_CHECKED_DETAIL]} for j in range(n)]
+    if tok["over_cap"]:
+        why = f"not evaluated: more than {_tsp.MAX_TOKENS} tokens in the bundle (TT-13)"
+        return [_tsp.report(j, "malformed", [why]) for j in range(n)]
+    try:
+        m = attestation_signed_bytes(d, seal)
+        sig = bytes.fromhex(d["signature"])
+    except (KeyError, TypeError, ValueError):
+        return [_tsp.report(j, "malformed", ["the entry's signed bytes cannot be formed"]) for j in range(n)]
+    imprint = hashlib.sha256(_canon({"schema": _TS_SUBJECT, "attestation": _sha(m + sig)})).digest()
+    return _future_advisory([_tsp.classify_token(t, j, imprint, tok["tsas"], allow_ess_v1=tok["allow_ess_v1"],
+                                                 aged=tok["aged"]) for j, t in enumerate(d["timestamps"])], tok)
+
+
+#: Advisory (never a class; SPEC 10.7 is silent on a genTime after the check time): an accepted token whose genTime is
+#: later than `as_of`. The bound it gives is still an "existed no later than" claim, but a TSA clock error or a key
+#: misuse is the likely cause, so the report and the render say so.
+TSA_TIME_AFTER_AS_OF = "advisory: TSA time is later than the check time (as_of)"
+NOTE_TSA_TIME_AFTER_AS_OF = "tsa_time_after_as_of"
+#: SPEC 13.4.1 "Derived default": the receiver policy pins TSAs but states `require_signoff_timestamps: false`, so a
+#: sign-off without an accepted token (its token may have been deleted) is not rejected by row 12.
+NOTE_SIGNOFF_TIMESTAMPS_NOT_REQUIRED = "signoff_timestamps_not_required"
+
+
+def _future_advisory(reports: list[dict], tok: dict) -> list[dict]:
+    limit = _tsp.utc_instant(tok["as_of"])
+    for r in reports:
+        if r["class"] == "accepted" and r["_instant"] > limit:
+            r["problems"].append(TSA_TIME_AFTER_AS_OF)
+    return reports
+
+
+def check_signoffs_v2(bundle: Any, seal: str | None, pins: dict[str, bool], members: dict, as_of: str,
+                      tok: dict | None = None) -> dict:
+    """SPEC 10.3.8, the verifier steps for a canon-3 bundle's `attestations`, run whatever the 13.1 state is.
+
+    ``seal`` is the seal this verifier recomputed (None when the header cannot be canonicalized, so no entry can
+    match it); ``pins`` the effective pin set (key id -> effective demo flag); ``members`` the effective policy members.
+    Returns the library output of 10.3.8: ``{state, checked, problems, entries}``."""
+    b = bundle if isinstance(bundle, dict) else {}
+    if "attestations" not in b:                                                     # step 1
+        return signoffs_none()
+    atts = b["attestations"]
+    if atts is None or not isinstance(atts, list) or len(atts) > _MAX_ATTESTATIONS_V2:     # step 2
+        why = ("attestations is present but null; omit the key instead" if atts is None else
+               f"attestations is not an array (got {type(atts).__name__})" if not isinstance(atts, list) else
+               f"attestations has {len(atts)} entries (at most {_MAX_ATTESTATIONS_V2})")
+        return {"state": "invalid", "checked": True, "problems": [why], "entries": []}
+    roster = members.get("roster") or []
+    holder = {k: p for p in roster for k in p["keys"]}              # key id -> person (unique: 13.4.1)
+    entries = []
+    digests = [(_entry_sha256(e) if isinstance(e, dict) else None) for e in atts]   # step 4 (digests)
+    shapes = [_att2_shape_problems(e, seal) for e in atts]                          # step 3
+    hash_aged = _aged(members.get("hashes", {}).get("sha256"), as_of)
+    for i, e in enumerate(atts):
+        problems = list(shapes[i])
+        shape_ok = not problems
+        d = e if isinstance(e, dict) else {}
+        suite_ok = ({"alg", "public_key", "signature"} <= set(d)
+                    and not _suite_shape_problems(d["alg"], d["public_key"], d["signature"], "entry"))
+        kid = key_id(d["alg"], d["public_key"]) if suite_ok else None                # step 9
+        if shape_ok:                                                                # step 4 (prior resolution)
+            for ref in d["prior"]:
+                if not any(j != i and digests[j] == ref for j in range(len(atts))):
+                    problems.append(f"prior {ref} is not the entry digest of another entry in this array")
+        supported = suite_ok and d["alg"] in _ALG_SUPPORTED_V4
+        if shape_ok and supported:                                                  # step 5
+            try:
+                ok = _suite_verify(d["alg"], d["public_key"], attestation_signed_bytes(d, seal), d["signature"])
+            except (KeyError, TypeError, ValueError, RecursionError):
+                ok = False
+            if not ok:
+                problems.append(f"the {_SUITE_NAME[d['alg']]} signature does not verify over the signed object under "
+                                "the entry's own key (SPEC 10.3.7)")
+        tokens = []
+        if shape_ok and "timestamps" in d:                                          # step 6
+            tokens = _entry_tokens(d, seal, tok)
+            bad = [t for t in tokens if t["class"] in ("invalid", "malformed")]
+            if tok is not None and tok["check"] and tok["over_cap"]:
+                problems.append(f"the bundle carries more than {_tsp.MAX_TOKENS} timestamp tokens: no token is "
+                                "evaluated, and an entry that carries tokens is invalid (SPEC 10.7.4 TT-13)")
+            elif bad:
+                problems.append("a timestamp token of the entry is " + "/".join(sorted({t["class"] for t in bad}))
+                                + " (SPEC 10.3.8 step 6, TT-42): "
+                                + "; ".join(f"token {t['index']}: {t['problems'][0]}" for t in bad if t["problems"]))
+        if shape_ok and (hash_aged or _aged(members.get("suites", {}).get(d["alg"]), as_of)):   # step 7
+            problems.append(f"the entry's suite {d['alg']} or its hash sha256 is aged at as_of {as_of} and no archive "
+                            "rescues it (SPEC 7.13, 10.3.8 step 7)")
+        state = "invalid" if problems else ("valid" if supported else "not_checked")   # step 8
+        if state == "not_checked":
+            problems = [f"not checked (suite {d['alg']} not supported by this verifier)"]
+        entries.append({"index": i, "entry_sha256": digests[i], "state": state,
+                        "role": d.get("role"), "meaning": d.get("meaning"), "key_id": kid,
+                        "signer_id": d.get("signer_id"), "printed_name": d.get("printed_name"),
+                        "signed_at": d.get("signed_at"), "self_verify": None, "time_ok": None, "roster": None,
+                        # beside the 10.3.8 members, for rule O (13.4.4) and the render (13.6): the stored values
+                        "alg": d.get("alg"), "statement": d.get("statement"),
+                        "reviewed_copy": d.get("reviewed_copy"),
+                        "prior": list(d["prior"]) if shape_ok else None,
+                        "tokens": _tsp.public(tokens), "time_bound": None, "problems": problems,
+                        "_shape_ok": shape_ok, "_tokens": tokens})
+    # step 10, distinctness: the originator key set and the originator signer ids
+    orig_keys = set(_seal_signer_ids(b)) | set(members.get("originator_keys") or [])
+    orig_ids = set(members.get("originator_signer_ids") or [])
+    for x in entries:
+        if x["_shape_ok"] and x["role"] == "originator":
+            orig_keys.add(x["key_id"])
+            orig_ids.add(x["signer_id"])
+    orig_persons = {holder[k]["person_id"] for k in orig_keys if k in holder}
+    for x in entries:
+        if x["_shape_ok"] and x["role"] in ("verifier", "approver"):
+            x["self_verify"] = (x["key_id"] in orig_keys or x["signer_id"] in orig_ids
+                                or (bool(roster) and x["key_id"] in holder
+                                    and holder[x["key_id"]]["person_id"] in orig_persons))
+    # step 11, `time_ok` of every valid entry from the EARLIEST accepted token's genTime T_e (exact instants). The
+    # signed-after test against T_e is the test against every accepted token, so adding a token never relaxes it; the
+    # lag test passes on the earliest, so deleting a token never relaxes it.
+    lag = members.get("max_attest_lag_s", 86400)
+    for x in entries:
+        inst, shown = _tsp.earliest_of(x["_tokens"])
+        if x["state"] != "valid" or inst is None:
+            continue
+        sa = _tsp.utc_instant(x["signed_at"])[0]
+        x["time_bound"] = shown
+        x["time_ok"] = (sa - _SIGNED_AT_SLACK_S, "") <= inst <= (sa + lag, "")
+    # step 12, the roster status of every valid entry
+    for x in entries:
+        if x["state"] != "valid":
+            continue
+        kid = x["key_id"]
+        if kid in _DEMO_KEY_IDS or pins.get(kid) is True:
+            x["roster"] = {"status": "demo_key", "person_id": None, "name_differs": False,
+                           "signer_id_differs": False, "role_not_held": False}
+        elif roster and kid in holder:
+            p = holder[kid]
+            x["roster"] = {"status": "pinned_person", "person_id": p["person_id"],
+                           "name_differs": x["printed_name"] != p["printed_name"],
+                           "signer_id_differs": x["signer_id"] != p["signer_id"],
+                           "role_not_held": x["role"] not in p["roles"]}
+        else:
+            x["roster"] = {"status": "pinned_key" if kid in pins else "unpinned_key", "person_id": None,
+                           "name_differs": False, "signer_id_differs": False, "role_not_held": False}
+    for x in entries:
+        del x["_shape_ok"], x["_tokens"]
+    # step 13, the dimension's state from the entries alone (total precedence)
+    if any(x["state"] == "invalid" for x in entries):
+        state = "invalid"
+    elif any(x["self_verify"] for x in entries):
+        state = "self_verified"
+    else:
+        state = "ok" if entries else "none"
+    return {"state": state, "checked": True, "problems": [], "entries": entries}
+
+
+def _eligible(x: dict, r: str, members: dict) -> bool:
+    """SPEC 13.4.4: is the v2 entry ``x`` eligible for role ``r``?"""
+    if x.get("state") != "valid" or x.get("role") != r or x.get("meaning") not in _APPROVES[r]:
+        return False
+    if x.get("time_ok") is False:
+        return False
+    if members.get("require_full_copy_review") and not full_copy(x.get("reviewed_copy")):
+        return False
+    if r in ("verifier", "approver") and x.get("self_verify") and not members.get("allow_self_verify"):
+        return False
+    ro = x.get("roster") or {}
+    if members.get("roster"):
+        return (ro.get("status") == "pinned_person" and not ro.get("role_not_held") and not ro.get("name_differs")
+                and not ro.get("signer_id_differs"))
+    return ro.get("status") == "pinned_key"
+
+
+def full_copy(rc: Any) -> bool:
+    """SPEC 10.3.6: does `reviewed_copy` name the full copy (no section and no item withheld)?"""
+    n = rc.get("withheld_items_count") if isinstance(rc, dict) else None
+    return isinstance(rc, dict) and rc.get("withheld_sections") == [] and not isinstance(n, bool) and n == 0
+
+
+def _pinned(x: dict) -> bool:
+    """SPEC 13.4.3 rows 12 and 19: the entry's key is pinned (`pinned_key`, or `pinned_person` under a roster). Every
+    entry eligible for a role (13.4.4) is pinned, so these rows also cover every entry rule R counts."""
+    return (x.get("roster") or {}).get("status") in ("pinned_key", "pinned_person")
+
+
+def partial_copy_reasons(signoffs: dict, members: dict, *, v2: bool) -> list[str]:
+    """SPEC 13.4.3 row 19: under `require_full_copy_review`, a valid v2 entry under a pinned key made on a copy with
+    something withheld counts toward no rule (13.4.4) and rejects with `partial_copy_review`."""
+    if not (v2 and members.get("require_full_copy_review")):
+        return []
+    entries = [x for x in (signoffs.get("entries") or []) if isinstance(x, dict)]
+    if any(x.get("state") == "valid" and _pinned(x) and not full_copy(x.get("reviewed_copy")) for x in entries):
+        return ["partial_copy_review"]
+    return []
+
+
+def _principal(x: dict, members: dict) -> str:
+    """SPEC 13.4.4 "Principal": the `person_id` under a roster, else the `key_id`."""
+    return (x.get("roster") or {}).get("person_id") if members.get("roster") else x.get("key_id")
+
+
+def signoff_reasons(signoffs: dict, members: dict, *, v2: bool) -> list[str]:
+    """SPEC 13.4.3 rows 4 to 12. ``v2`` is False for v3 input: v1 entries never trigger rows 4 to 12 and never count toward rule R
+    (13.4.6), so only rule R can apply there (it is then unsatisfied whenever a role is required)."""
+    entries = [x for x in (signoffs.get("entries") or []) if isinstance(x, dict)] if v2 else []
+    valid = [x for x in entries if x.get("state") == "valid"]
+    out = []
+    if signoffs.get("state") == "self_verified" and not members.get("allow_self_verify"):
+        out.append("self_verified")
+    if any(x.get("meaning") == "rejection" for x in valid):
+        out.append("signed_rejection")
+    pp = [x["roster"] for x in valid if (x.get("roster") or {}).get("status") == "pinned_person"]
+    if any(r["name_differs"] for r in pp):
+        out.append("name_mismatch_roster")
+    if any(r["signer_id_differs"] for r in pp):
+        out.append("signer_id_mismatch_roster")
+    if any(r["role_not_held"] for r in pp):
+        out.append("role_not_held")
+    if any(x.get("time_ok") is False for x in valid):
+        out.append("signoff_time_inconsistent")
+    required = members.get("require_roles") or []
+    for r in sorted(set(required)):
+        principals = {_principal(x, members) for x in entries if _eligible(x, r, members)}
+        if len(principals) < required.count(r):
+            out.append("role_unsatisfied")
+            break
+    if members.get("require_order", True):
+        reviews = {x.get("entry_sha256") for x in valid
+                   if x.get("role") == "verifier" and x.get("meaning") == "review"}
+        if any(x.get("role") == "approver" and not reviews & set(x.get("prior") or []) for x in valid):
+            out.append("order_unsatisfied")
+    # row 12: under `require_signoff_timestamps` (stated, or derived by 13.4.1), every valid v2 entry whose key is
+    # pinned (a pinned key or a roster person, any role) needs an accepted token; an unpinned entry anyone could
+    # append is ignored here. An entry without one has no time bound, so row 9 cannot check it; deleting a token (it is unsigned) must
+    # not turn a `signoff_time_inconsistent` rejection into an acceptance.
+    if members.get("require_signoff_timestamps") and any(
+            not any(t.get("class") == "accepted" for t in x.get("tokens") or []) for x in valid if _pinned(x)):
+        out.append("signoff_timestamp_missing")
+    return out
+
+
+def _token_context(bundle: Any, members: dict, as_of: str, integrity: bool) -> dict:
+    """What every token check of one verification shares: the effective TSA pins with their parsed certificates (in
+    effective order, sorted by id, 13.4.1 step 5), `allow_ess_v1`, the aged suite and hash names (K2, 7.13), whether
+    tokens are evaluated at all (TT-36: only on an integrity state) and whether the TT-13 cap is exceeded."""
+    pins = []
+    for p in sorted(members.get("tsas") or [], key=lambda p: p["id"]):
+        pins.append({**p, "_cert": _tsp.pin_cert(p)})
+    aged = {k for k, e in (members.get("suites") or {}).items() if _aged(e, as_of)}
+    aged |= {k for k, e in (members.get("hashes") or {}).items() if _aged(e, as_of)}
+    return {"tsas": pins, "allow_ess_v1": bool(members.get("allow_ess_v1")), "aged": aged, "check": integrity,
+            "over_cap": _tsp.count_tokens(bundle) > _tsp.MAX_TOKENS, "as_of": as_of}
+
+
+def _time_dimension(bundle: Any, tok: dict) -> dict:
+    """SPEC 10.7.7 (TT-35 to TT-39) for a canon-3 bundle: {state, bound, distinct_tsas, tokens}, over the tokens of
+    `timestamps` only, each checked against the imprint SHA-256(seal datum) (TT-5)."""
+    b = bundle if isinstance(bundle, dict) else {}
+
+    def out(state, tokens=(), bound=None, distinct=None):
+        notes = [NOTE_TSA_TIME_AFTER_AS_OF] if any(TSA_TIME_AFTER_AS_OF in r["problems"] for r in tokens) else []
+        return {"state": state, "bound": bound, "distinct_tsas": distinct, "tokens": _tsp.public(list(tokens)),
+                "problems": problems, "notes": notes}
+    problems: list[str] = []
+    if not tok["check"]:
+        return out("not_checked")                                                     # TT-36
+    if tok["over_cap"]:                                                               # TT-13
+        problems.append(f"the bundle carries more than {_tsp.MAX_TOKENS} timestamp tokens in total; none is "
+                        "evaluated (SPEC 10.7.4 TT-13)")
+        return out("malformed")
+    if "timestamps" not in b:
+        return out("none")
+    ts = b["timestamps"]
+    if not (isinstance(ts, list) and 1 <= len(ts) <= 16):                             # TT-1
+        problems.append("timestamps must be an array of 1 to 16 token objects; omit the key for none (TT-1)")
+        return out("malformed")
+    blocks = [b.get("signature")] + (b.get("signatures") if isinstance(b.get("signatures"), list) else [])
+    datum = _canon({"schema": _TS_SUBJECT, "bundle_sha256": b.get("bundle_sha256"),
+                    "signatures": [blk.get("signature") if isinstance(blk, dict) else None for blk in blocks]})
+    imprint = hashlib.sha256(datum).digest()                                          # TT-5
+    reports = _future_advisory([_tsp.classify_token(t, i, imprint, tok["tsas"], allow_ess_v1=tok["allow_ess_v1"],
+                                                    aged=tok["aged"]) for i, t in enumerate(ts)], tok)
+    classes = {r["class"] for r in reports}
+    if "malformed" in classes:
+        return out("malformed", reports)
+    if "invalid" in classes:
+        return out("invalid", reports)
+    inst, shown, distinct = _tsp.bound_of(reports)
+    if inst is not None:
+        return out("valid", reports, shown, distinct)                                 # TT-38
+    return out("insufficient", reports)
+
+
+def _dims(bundle: Any, cv: int | None, integrity: bool, signoffs: dict, items: dict, time_out: dict) -> dict:
     """The v4 dimensions (SPEC 13.7 item 4) as runner protocol v2 reports them (`dims`), plus `items` (6.6.8).
 
     - canon 1/2 (13.4.6): `signoffs` is `invalid` exactly when the v1 attestation check fails, `ok` when a valid block
       has an entry, else `none`; `time` and `archive` are `none`.
-    - canon 3: this release checks no sign-off v2, timestamp or archive. An absent block reads `none`; a
-      PRESENT one cannot be checked here and reads fail-closed (`signoffs: invalid`; `time`/`archive: malformed`
-      once integrity holds, else `not_checked`, 13.7 table), so the default policy rejects it (13.4.3 rows 3, 14,
-      17; 13.4.5 "a timestamp or archive that is present but invalid or malformed").
+    - canon 3: `signoffs` is the state of 10.3.8 (`check_signoffs_v2`) and `time` that of 10.7.7
+      (`_time_dimension`). This release checks no archive: an absent block reads `none`; a PRESENT one cannot be
+      checked here and reads fail-closed (`malformed` once integrity holds, else `not_checked`, 13.7 table), so the
+      default policy rejects it (13.4.3 row 17; 13.4.5 "a timestamp or archive that is present but invalid or
+      malformed").
     - canon >= 4, or an unreadable header: `signoffs: none`, `time: not_checked`, `archive: not_checked` (11.6)."""
     b = bundle if isinstance(bundle, dict) else {}
     if cv in (1, 2):
-        signoffs = "invalid" if att_problems else ("ok" if atts else "none")
-        return {"signoffs": signoffs, "time": "none", "archive": "none", "items": items}
+        return {"signoffs": signoffs["state"], "time": "none", "archive": "none", "items": items}
     if cv == 3:
-        signoffs = "invalid" if "attestations" in b else "none"
-        time = "not_checked" if not integrity else ("malformed" if "timestamps" in b else "none")
         archive = "not_checked" if not integrity else ("malformed" if "archive" in b else "none")
-        return {"signoffs": signoffs, "time": time, "archive": archive, "items": items}
+        return {"signoffs": signoffs["state"], "time": time_out["state"], "archive": archive, "items": items}
     return {"signoffs": "none", "time": "not_checked", "archive": "not_checked", "items": items}
 
 
@@ -2484,7 +3421,7 @@ _RESOURCE_PROBLEM = ("bundle could not be checked: verification ran out of resou
 _MAX_REPORTED_PROBLEMS = 200
 
 
-def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None) -> dict:
+def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_of: str | None = None) -> dict:
     """The THREE-state verdict. Recompute every hash, check the embedded result.v1 core, validate the
     signature under the bundle's own key (integrity) and check that key against the pin (origin).
 
@@ -2522,6 +3459,12 @@ def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None) -> di
     if pins is None and profile_keys is not None:
         pins = list(profile_keys)
     pin_set, members = effective_policy(policy, pins)
+    # SPEC 7.13: "The caller supplies `as_of`, which defaults to the current time floored to whole seconds, at every
+    # entry point", so that it is always a UTC timestamp (2.3). SIG-29: the output echoes it.
+    if as_of is None:
+        as_of = utc_now()
+    elif not (isinstance(as_of, str) and _utc_or_null(as_of)):
+        raise ValueError(f"as_of must be a UTC timestamp YYYY-MM-DDTHH:MM:SSZ (SPEC 2.3), got {as_of!r}")
     problems: list[str] = []
     origin_problems: list[str] = []
     attestation_problems: list[str] = []
@@ -2580,9 +3523,24 @@ def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None) -> di
     else:
         effective_pin = profile_pin
         demo_pin = (effective_pin == _DEMO_PUBKEY) or profile_declares_demo
-    if demo_pin and key_matches_pin:
-        origin_problems.append("pinned key is the public demo identity; origin cannot be established")
-    origin_ok = integrity_ok and not origin_problems
+    # the pin set this verdict was made under (13.4.1): the caller's, or the single-pin path's pin plus the built-in
+    # demo pins (`_default_pin_set`)
+    eff_pins = pin_set if pin_set is not None else _default_pin_set(effective_pin, bool(demo_pin))
+    v4_blocks = sig_info.get("v4_blocks")
+    if v4_blocks is not None:
+        # SPEC 7.12-7.14 for v4 input: E evaluated per 7.10 (G1-G6 in `_check_seal_signatures`), origin per 7.13
+        origin_problems = []
+        pins_v4 = eff_pins
+        if pin_set is None and _malformed:
+            origin_problems.append(_MALFORMED_PIN_PROBLEM)
+            pins_v4 = {}
+        signers, origin_ok, key_matches_pin, demo_pin = _v4_origin(
+            v4_blocks, pins_v4, members, as_of, integrity_ok, profile_declares_demo, origin_problems)
+    else:
+        if demo_pin and key_matches_pin:
+            origin_problems.append("pinned key is the public demo identity; origin cannot be established")
+        origin_ok = integrity_ok and not origin_problems
+        signers = _v3_signers(sig_info.get("primary"), eff_pins, integrity_ok, origin_ok, bool(demo_pin))
     if not integrity_ok:
         # ADR-050: a bundle sealed under a newer-than-supported canon whose header seal + signature are
         # valid is a DISTINCT, NAMED fail-FORWARD verdict, not a plain integrity failure. integrity_ok is
@@ -2599,6 +3557,44 @@ def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None) -> di
         state = STATE_INTEGRITY_ONLY_DEMO
     else:
         state = STATE_INTEGRITY_ONLY
+    # SPEC 10.3 / 13.4.6 / 11.6: the `signoffs` dimension. Canon 3: the 10.3.8 procedure over the recomputed seal,
+    # whatever the integrity verdict. Canon 1/2: the v3 result mapped (13.4.6). Canon >= 4 or no readable header:
+    # `{state: none, checked: false}`.
+    cv = canon_info.get("version")
+    tok = _token_context(bundle, members, as_of, integrity_ok) if cv == 3 else None
+    if cv == 3:
+        try:
+            seal = _sha(_canon(bundle["sha256sums"])) if isinstance(bundle.get("sha256sums"), dict) else None
+        except (TypeError, ValueError, RecursionError):
+            seal = None
+        try:
+            signoffs = check_signoffs_v2(bundle, seal, eff_pins, members, as_of, tok)
+        except (MemoryError, RecursionError) as exc:
+            signoffs = {"state": "invalid", "checked": True, "entries": [],
+                        "problems": [_RESOURCE_PROBLEM.format(type(exc).__name__)]}
+        attestation_problems = list(signoffs["problems"]) + [
+            f"attestation[{x['index']}]: {pr}" for x in signoffs["entries"] if x["state"] == "invalid"
+            for pr in x["problems"]]
+    elif cv in (1, 2):
+        signoffs = {"state": "invalid" if attestation_problems else ("ok" if attestations else "none"),
+                    "checked": True, "problems": list(attestation_problems), "entries": []}
+    else:
+        signoffs = signoffs_none(checked=False)
+    # SPEC 10.7.7: the `time` dimension over the seal tokens (canon 3); `none` for v3 input, `not_checked` for a
+    # newer canon (TT-36, 11.6)
+    if cv == 3:
+        time_out = _time_dimension(bundle, tok)
+    else:
+        time_out = {"state": "none" if cv in (1, 2) else "not_checked", "bound": None, "distinct_tsas": None,
+                    "tokens": [], "problems": [], "notes": []}
+    # SPEC 13.7 item 4 `notes` (advisory codes, never a state): a TSA time later than as_of, on a seal token or a
+    # sign-off token
+    if time_out["notes"] or any(TSA_TIME_AFTER_AS_OF in (t.get("problems") or []) for x in signoffs["entries"]
+                                for t in x.get("tokens") or []):
+        notes = notes + [NOTE_TSA_TIME_AFTER_AS_OF]
+    # 13.4.1 "Derived default": the policy pins TSAs and states require_signoff_timestamps false
+    if cv == 3 and members.get("tsas") and members.get("require_signoff_timestamps") is False:
+        notes = notes + [NOTE_SIGNOFF_TIMESTAMPS_NOT_REQUIRED]
     out = {
         "state": state,
         "integrity_ok": integrity_ok,
@@ -2617,6 +3613,13 @@ def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None) -> di
         "frontier": _frontier_report(bundle),
         "signer": ("ed25519:" + signer) if isinstance(signer, str) else None,
         "signer_is_demo": signer == _DEMO_PUBKEY,
+        # SPEC 7.15 (v4 output; for v3 input added beside the v3 fields): one entry per block of E, the basis of the
+        # origin answer, and the evaluation instant
+        "signers": signers,
+        "origin_basis": "current",
+        "as_of": as_of,
+        # SPEC 7.10 G6 / SIG-23: each S_nc block, "not checked (suite <alg> not supported by this verifier)"
+        "signatures_not_checked": sig_info.get("not_checked", []),
         "pinned_key_is_demo": demo_pin,
         "pinned_key": ("ed25519:" + effective_pin) if effective_pin is not None else sig_info.get("pin_key_id"),
         # SPEC 7.11: the signer's key id, and (when a pin set is in force) the pin set as {key_id: effective demo}
@@ -2627,16 +3630,31 @@ def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None) -> di
         "canon_version": canon_info.get("version"),
         "supported_canon_max": canon_info.get("supported_max", _CANON_SUPPORTED_MAX),
         "items": _items_report(v4_info.get("walk")),
-        "dims": _dims(bundle, canon_info.get("version"), integrity_ok, attestation_problems, attestations,
-                      _items_report(v4_info.get("walk"))),
+        "dims": _dims(bundle, cv, integrity_ok, signoffs, _items_report(v4_info.get("walk")), time_out),
+        # SPEC 10.3.8 library output (v4 entries; for v3 input the 13.4.6 mapping, with the v1 entries in
+        # `attestations`)
+        "signoffs": signoffs,
+        # SPEC 10.7.7 TT-39: {state, bound, distinct_tsas, tokens}
+        "time": time_out,
         "notes": notes,
         "note_details": {NOTE_COMMITTED_KEY_PLAIN_DATA: plain} if plain else {},
-        # v4 unsigned blocks this release reports but does not check (timestamps, archive, attestations v2)
+        # v4 unsigned blocks this release reports but does not check (the archive)
         "unchecked_blocks": v4_info.get("unchecked_blocks", []),
     }
+    # SPEC 7.15 / 13.3: the `signers` output is asserted through runner protocol v2 `expect_dims` (vector:
+    # valid/v4_ed25519_plus_p256.json), so the dims carry it beside `items`
+    out["dims"]["signers"] = signers
+    if v4_blocks is not None:
+        # SPEC 7.15: for v4 input `signer` is "the key id of the first **verified** S_sup block in E order ... or
+        # `null` when integrity does not hold"
+        first = next((e for e in signers if e["checked"] and e["valid"]), None) if integrity_ok else None
+        out["signer"] = out["signer_key_id"] = first["key_id"] if first else None
+        out["signer_is_demo"] = bool(first) and first["key_id"] in _DEMO_KEY_IDS
+        if pin_set is not None:
+            matched = next((e for e in signers if e["checked"] and e["valid"] and e["pinned"]), None)
+            out["pinned_key"] = matched["key_id"] if matched else None
     # SPEC 13.4.2: decision = evaluate(verdict, policy) -> {accept, policy_sha256, reasons}, under the EFFECTIVE
-    # policy (the default policy plus the single v3 pin when no policy or pin set was given).
-    eff_pins = pin_set if pin_set is not None else {key_id("ed25519", effective_pin): bool(demo_pin)}
+    # policy (the default policy plus the single-pin path's pins when no policy or pin set was given).
     # the verdict records the policy it was made under (13.4.2), so `evaluate` can refuse a different one
     out["policy_sha256"] = policy_sha256(members, eff_pins)
     reasons = evaluate(out, members, eff_pins)
@@ -2649,6 +3667,72 @@ def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None) -> di
             out[key] = out[key][:_MAX_REPORTED_PROBLEMS] + [
                 f"... and {len(out[key]) - _MAX_REPORTED_PROBLEMS} more problems not shown"]
     return out
+
+
+def _v4_origin(blocks: list[dict], pins: dict[str, bool], members: dict, as_of: str, integrity_ok: bool,
+               all_demo: bool, origin_problems: list[str]) -> tuple[list[dict], bool, bool, bool]:
+    """SPEC 7.12 to 7.14 for v4 input. Returns (signers, origin_ok, key_matches_pin, demo_match).
+
+    - 7.12 "Key matches pin": "at least one verified S_sup block has a key id in the pin set (demo or not)".
+    - 7.13 "Counted entry": a verified S_sup block whose key id is pinned by a non-demo pin and, SIG-30, whose suite and
+      `sha256` (the seal hash, and e for P-256) are not aged at `as_of`, or are rescued. Rescue needs a `valid`
+      archive dimension (10.8.6), which this release does not compute, so an aged entry is never rescued here.
+    - SIG-31: origin iff integrity, (a) at least `origin_quorum` distinct counted entries, (b) every suite in
+      `require_seal_suites` is the suite of a counted entry (a reserved or unknown suite never is), (c) aging.
+    - SIG-32: aging never relaxes G4 (an aged block that does not verify already failed integrity).
+    - 7.14: without origin, `integrity-only (demo pin)` iff a verified S_sup block matches a demo pin.
+    ``all_demo`` is a profile's `pin_is_demo` (every entry is a demo pin, 7.12 informative)."""
+    hash_aged = _aged(members["hashes"].get("sha256"), as_of)
+    signers = []
+    for b in blocks:
+        verified = bool(b["checked"] and b["valid"])
+        pinned = b["key_id"] in pins
+        demo = pinned and (pins[b["key_id"]] or all_demo)
+        aged = hash_aged or _aged(members["suites"].get(b["alg"]), as_of)
+        counted = integrity_ok and verified and pinned and not demo and not aged
+        signers.append({"key_id": b["key_id"], "alg": b["alg"], "checked": b["checked"], "valid": b["valid"],
+                        "pinned": pinned, "demo": demo, "counted": counted, "_aged": aged})
+    matched = [e for e in signers if e["checked"] and e["valid"] and e["pinned"]]
+    counted_ids = {e["key_id"] for e in signers if e["counted"]}
+    counted_suites = {e["alg"] for e in signers if e["counted"]}
+    key_matches_pin = integrity_ok and bool(matched)
+    demo_match = integrity_ok and any(e["demo"] for e in matched)
+    if integrity_ok:
+        if not matched:
+            origin_problems.append("no verified seal signature is under a key in the pin set (SPEC 7.12)")
+        aged_real = [e["key_id"] for e in matched if not e["demo"] and e["_aged"]]
+        if aged_real:
+            origin_problems.append(f"pinned seal signature(s) {aged_real} are of an aged suite or hash at as_of "
+                                   f"{as_of} and are not rescued by an archive, so they do not count (SIG-30)")
+        quorum = members["origin_quorum"]
+        if matched and len(counted_ids) < quorum:
+            origin_problems.append(f"origin quorum not met: {len(counted_ids)} counted entr"
+                                   f"{'y' if len(counted_ids) == 1 else 'ies'} (a verified signature under a "
+                                   f"non-demo pin, not aged), origin_quorum {quorum} (SIG-31 a)")
+        missing = sorted(su for su in set(members["require_seal_suites"]) if su not in counted_suites)
+        if missing:
+            origin_problems.append(f"required seal suite(s) {missing} are not the suite of any counted entry (SIG-31 b"
+                                   "; a reserved or unknown suite can never be satisfied by this verifier)")
+        if demo_match and not counted_ids:
+            origin_problems.append("pinned key is the public demo identity; origin cannot be established")
+    for e in signers:
+        del e["_aged"]
+    return signers, integrity_ok and not origin_problems, key_matches_pin, demo_match
+
+
+def _v3_signers(primary: dict | None, pins: dict[str, bool], integrity_ok: bool, origin_ok: bool,
+                demo_pin: bool) -> list[dict]:
+    """SPEC 7.15 for v3 (and newer-canon) input: E = [signature], one entry, beside the unchanged v3 fields."""
+    if not primary or not isinstance(primary.get("public_key"), str):
+        return []
+    alg, pk = primary["alg"], primary["public_key"]
+    try:
+        kid = key_id(alg, pk)
+    except ValueError:
+        return []
+    pinned = kid in pins
+    return [{"key_id": kid, "alg": alg, "checked": primary["checked"], "valid": primary["valid"],
+             "pinned": pinned, "demo": pinned and (pins[kid] or demo_pin), "counted": bool(origin_ok)}]
 
 
 def verify_bundle(bundle: dict, *, profile=None) -> tuple[bool, list[str]]:

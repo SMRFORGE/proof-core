@@ -464,6 +464,64 @@ def stat_tolerance_problem(tol: dict, outputs: dict) -> str | None:
     return None
 
 
+#: SPEC 7.8 SIG-16 / 7.9 SIG-19: at most 7 co-signatures, so at most 8 declared seal signers.
+_MAX_COSIGNERS = 7
+
+
+def _seal_signer_set(canon_version: int, cosigners) -> list[dict]:
+    """The declared seal signer set `provenance.seal_signers` (SPEC 7.9) the mint will write: entry 0 is the primary,
+    entries 1 onward the co-signers in order. Refuses (ValueError) whatever the verifier would fail: co-signers on a
+    v3 bundle (SIG-17), a non-Ed25519 primary on a v3 bundle (7.1: `alg` is "ed25519"), more than 7 co-signers,
+    a key that does not fit its suite, or a repeated (alg, public_key) pair (SIG-19)."""
+    cosigners = list(cosigners or [])
+    if canon_version != 3:
+        if cosigners:
+            raise ValueError("co-signatures (SPEC 7.8 `signatures`) exist only in evidence.envelope.v4 "
+                             "(canon_version=3); a v3 bundle carries one Ed25519 signature")
+        if signing.active_alg() != "ed25519":
+            raise ValueError(f"a v3 bundle is signed with Ed25519 only (SPEC 7.1); the active signer is "
+                             f"{signing.active_alg()!r}; mint with canon_version=3 instead")
+        return []
+    if len(cosigners) > _MAX_COSIGNERS:
+        raise ValueError(f"at most {_MAX_COSIGNERS} co-signers (SPEC 7.8 SIG-16), got {len(cosigners)}")
+    for i, c in enumerate(cosigners):
+        signing.signer_key_problems(c, where=f"cosigners[{i}]")
+    out = [{"alg": signing.active_alg(), "public_key": signing.public_key_hex()}]
+    out += [{"alg": signing.signer_alg(c), "public_key": bytes(c.public_key()).hex()} for c in cosigners]
+    pairs = [(e["alg"], e["public_key"]) for e in out]
+    if len(set(pairs)) != len(pairs):
+        raise ValueError("the seal signer set repeats an (alg, public_key) pair (SPEC 7.9 SIG-19): a key signs a "
+                         "seal at most once")
+    return out
+
+
+def _self_verify_seal_signatures(capability: str, bundle: dict, seal_signers: list[dict], cosigners: list) -> None:
+    """SPEC 7.16 SIG-36 / SIG-37, at mint: E = [signature] + signatures equals `seal_signers` (G2), and every
+    co-signature (and a primary of any suite other than the built-in Ed25519 path) verifies over the seal. A suite
+    this kernel implements is checked with its own code; any other suite needs the signer's own ``verify(msg, sig)``
+    (the signing library's verify), so an honest hybrid keeps its verdict when the suite is activated (7.18)."""
+    if not seal_signers:
+        return
+    blocks = [bundle["signature"]] + bundle.get("signatures", [])
+    if [(b["alg"], b["public_key"]) for b in blocks] != [(e["alg"], e["public_key"]) for e in seal_signers]:
+        raise ValueError(f"{capability}: refusing to mint: the seal signatures do not equal seal_signers (SIG-36)")
+    msg = bundle["bundle_sha256"].encode()
+    checks = [(bundle["signature"], signing._ACTIVE_SIGNER)] if signing.active_alg() != "ed25519" else []
+    checks += list(zip(bundle.get("signatures", []), cosigners))
+    for blk, signer in checks:
+        sig = bytes.fromhex(blk["signature"])
+        ok = signing.verify_suite(blk["alg"], bytes.fromhex(blk["public_key"]), msg, sig)
+        if ok is None:
+            own = getattr(signer, "verify", None)
+            if own is None:
+                raise ValueError(f"{capability}: refusing to mint: a {blk['alg']!r} co-signer must provide "
+                                 "verify(msg, sig) so the mint can self-verify it (SPEC 7.16 SIG-37)")
+            ok = own(msg, sig) is True
+        if not ok:
+            raise ValueError(f"{capability}: refusing to mint: the {blk['alg']!r} seal signature by "
+                             f"{blk['public_key'][:16]}... does not verify over the seal (SPEC 7.16 SIG-37)")
+
+
 def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str,
                  reproduce: str | None = None,
                  data_library: tuple[str, str] | None = None,
@@ -473,7 +531,8 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
                  derived_from: list | None = None,
                  solver: dict | None = None,
                  canon_version: int = 1,
-                 profile=None) -> dict:
+                 profile=None,
+                 cosigners: list | None = None) -> dict:
     # `profile` (domain-neutral, ADDITIVE) brands the on-disk dialect -- schema tags, the open-engine
     # sentinel, the default `reproduce` phrasing, the unpinned-data marker, the attestation scope, and
     # whether a `host` block is emitted. None resolves to the neutral profile, whose values ARE the
@@ -491,6 +550,9 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
     if type(canon_version) is not int or canon_version not in _CANON:
         raise ValueError(f"unsupported canon_version {canon_version!r}; supported: {sorted(_CANON)}")
     _c = _CANON[canon_version]
+    # SPEC v4 7.8 / 7.9 / 7.16: the seal signer set is the primary (the active signer: the built-in seed or the
+    # `use_signer` hook) plus `cosigners`, every one known BEFORE minting (SIG-36). Co-signatures exist only in v4.
+    seal_signers = _seal_signer_set(canon_version, cosigners)
     # the sealed sections carry the NORMALIZED spelling (-0.0 -> 0.0), so the digest a strict, plain
     # canonical-JSON verifier recomputes over the stored value equals the one taken here.
     core = normalize_floats(build_result_core(case, result, profile=p))
@@ -581,7 +643,7 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
     if canon_version == 3:
         # SPEC v4 draft 7.9 SIG-18: "In v4, `manifest.provenance.value` MUST contain `seal_signers`". This release
         # seals with the one primary signature, so the declared list is that signer alone (7.10 G2).
-        repro["seal_signers"] = [{"alg": "ed25519", "public_key": signing.public_key_hex()}]
+        repro["seal_signers"] = seal_signers
     repro = normalize_floats(repro)
     withheld_at_mint: list[str] = []
     if canon_version == 3:
@@ -633,6 +695,11 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
     # verifiers' header recompute explicitly (not just coincidentally for ASCII).
     bundle["bundle_sha256"] = sha(canon(sha256sums))
     bundle["signature"] = signing.sign_bundle_digest(bundle["bundle_sha256"])
+    if cosigners:
+        # SPEC 7.8: "No co-signatures" has exactly one encoding, the key absent; so `signatures` is written only
+        # when there is at least one. Every block signs the same 71 bytes (SIG-3).
+        bundle["signatures"] = [signing.sign_block(c, bundle["bundle_sha256"]) for c in cosigners]
+    _self_verify_seal_signatures(case.capability, bundle, seal_signers, cosigners or [])
     if withheld_at_mint:
         # SPEC 10.4 R5: "A record MUST be present whenever W is non-empty ... That includes items withheld at mint."
         bundle["redaction"] = {"schema": p.redaction_schema_v2, "parent_bundle_sha256": bundle["bundle_sha256"],
