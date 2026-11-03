@@ -49,7 +49,7 @@ import math
 from collections.abc import Callable
 
 from .contract import ReproduceRunner
-from .envelope import _CANON, canon, is_integrity_field, stat_tolerance_problem
+from .envelope import _CANON, _json_number, canon, is_integrity_field, stat_tolerance_problem
 from .provenance import DATA_LIBRARY
 
 CERTIFICATION_SCHEMA = "evidence.certification.v1"
@@ -64,37 +64,67 @@ REPRODUCTION_CAPABILITY = "proof:reproduction-record"
 #: (conservative -- an absurd band can never turn a mismatch into a pass).
 _MAX_SIGMAS = 10.0
 
-#: The fresh run's 1-sigma must sit within this factor of the sealed one. The band is
-#: `sigmas * hypot(sealed, fresh)`, so a fresh sigma far wider than sealed (a re-run with far fewer
-#: samples than the sealed run controls) would widen the band the sealed claim is held to; a fresh
-#: sigma far narrower means the re-run did not use the sealed controls either. Same controls -> the
-#: two stochastic sigma estimates agree to well within 2x.
-_SIGMA_RATIO = 2.0
+#: The fresh run's 1-sigma must sit within this factor of the sealed one: a fresh sigma far wider than the
+#: sealed one (a re-run with far fewer samples than the sealed run controls) or far narrower means the re-run
+#: did not use the sealed controls. Same controls -> the two sigma estimates agree to well within 1.5x.
+#: Together with the band rule below (`sigmas * hypot(min(sealed, fresh), fresh)`) an honest stochastic
+#: re-run is reported not reproduced about 2% of the time at 1.5 and 3 sigma (reviewer's Monte Carlo).
+_SIGMA_RATIO = 1.5
 
-#: Result-core keys that are PROSE / METADATA, not computed values or integrity: a stat reproduce compares them
-#: SEPARATELY and reports a difference as `metadata_drift` (informational) instead of failing the
-#: re-derivation. A caveat re-worded, a band tightened, a verdict label or fidelity tier re-declared
-#: since the mint does not change whether the NUMBER falls out of the code. Everything else in the core
-#: (the outputs' engine, counts, generator/model pins, benchmark id, the provenance stub) stays in the
-#: strict byte-for-byte remainder.
+
+def _by_value_numbers(value):
+    """``value`` with every integral finite float made an int (``20.0`` -> ``20``), recursively; everything else
+    unchanged. The --command (outputs-only) comparison runs on this, so a JSON number is compared BY VALUE: a
+    reviewer's tool in another language that writes ``20.0`` for a sealed ``20`` (or the reverse) matches, under
+    every canon (canon 1 is type-sensitive, canon 2 and 3 already encode the two alike). It never makes a
+    non-number equal to a number: a boolean (``type(x) is bool``, not float) and a string such as ``"20"`` are left
+    as they are, so they still mismatch; a non-finite float is left as it is and the canon refuses it. Two ints, or
+    an int and a float, end up equal exactly when their values are equal (Python's int/float equality is exact)."""
+    if type(value) is float:
+        return int(value) if math.isfinite(value) and value.is_integer() else value
+    if isinstance(value, dict):
+        return {k: _by_value_numbers(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_by_value_numbers(v) for v in value]
+    return value
+
+
+def _outputs_by_value(core):
+    """A copy of a result core whose ``result`` (the outputs, the only part an outputs-only reproducer supplies) has
+    its JSON numbers in by-value form (``_by_value_numbers``). The claim fields are left byte for byte."""
+    if not (isinstance(core, dict) and "result" in core):
+        return core
+    return {**core, "result": _by_value_numbers(core["result"])}
+
+#: Result-core keys that are not computed values or integrity: a stat reproduce lifts them out of the strict
+#: byte-for-byte remainder and reports a difference as `metadata_drift`. Of these only `caveats` is cosmetic
+#: (a re-worded caveat does not change the claim); `fidelity`, `verdict` and `reproduce_tolerance` are CLAIM
+#: fields (CLAIM_CORE_KEYS below), and any drift in them fails `reproduced` in every mode via `claim_drift`.
+#: Everything else in the core (the outputs' engine, counts, generator/model pins, benchmark id, the
+#: provenance stub) stays in the strict byte-for-byte remainder.
 METADATA_KEYS = ("caveats", "reproduce_tolerance", "verdict", "fidelity")
 
 #: Of the metadata keys, these two are the MATERIAL claim fields: the result's self-declared `verdict`
 #: and `fidelity` tier. A caveat re-wording or an (only-tightening) tolerance change is cosmetic, but if
 #: the fresh re-run's result declares a DIFFERENT verdict or fidelity than the sealed one, `certified`
 #: must not silently assert the sealed claim -- the drift is surfaced as `metadata_conflict` and blocks
-#: certification. It never fails `reproduced`: the NUMBER still re-derives. Domain-neutral (verdict/fidelity
-#: are kernel contract fields), so this is unconditional hardening, not a profile knob.
+#: certification. Since the claim-drift rule (CLAIM_CORE_KEYS) such a drift also fails `reproduced`;
+#: `metadata_conflict` is kept as the certify-record view of the same two fields. Domain-neutral
+#: (verdict/fidelity are kernel contract fields), so this is unconditional hardening, not a profile knob.
 MATERIAL_METADATA_KEYS = ("verdict", "fidelity")
 
 
 def _material_metadata_conflict(reproduce_detail) -> dict:
-    """The subset of a stat reproduce's `metadata_drift` that is MATERIAL to certification
-    (verdict/fidelity). Empty for an exact reproduce, a missing detail, or cosmetic-only drift."""
+    """The drift that is MATERIAL to certification: a verdict/fidelity difference in a stat reproduce's
+    `metadata_drift`, plus the verdict/fidelity/caveats entries of the claim drift every mode reports (a caveat
+    the fresh run declares and the sealed bundle omits widens the claim). Empty for a clean reproduce, a missing
+    detail, or cosmetic-only drift (extra sealed caveats)."""
     if not isinstance(reproduce_detail, dict):
         return {}
-    drift = reproduce_detail.get("metadata_drift") or {}
-    return {k: v for k, v in drift.items() if k in MATERIAL_METADATA_KEYS}
+    meta = {k: v for k, v in (reproduce_detail.get("metadata_drift") or {}).items() if k in MATERIAL_METADATA_KEYS}
+    claim = {k: v for k, v in (reproduce_detail.get("claim_drift") or {}).items()
+             if k in MATERIAL_METADATA_KEYS + ("caveats",)}
+    return {**meta, **claim}
 
 
 #: Sealed-provenance pins that legitimately differ when a reviewer re-runs at another commit.
@@ -160,9 +190,16 @@ def _ccanon(value):
         return b"v1-fallback:" + canon(value)
 
 
+def _without_caveats(core):
+    """``core`` without its `caveats`: caveats are judged by the claim-drift subset rule (`_claim_drift`), in
+    every mode, never by byte equality, so exact and stat comparisons treat them the same way."""
+    return {k: v for k, v in core.items() if k != "caveats"} if isinstance(core, dict) else core
+
+
 def _exact_match(orig_core, fresh_core) -> tuple[bool, dict]:
     try:
-        return (orig_core is not None and _ccanon(orig_core) == _ccanon(fresh_core)), {"mode": "exact"}
+        return (orig_core is not None
+                and _ccanon(_without_caveats(orig_core)) == _ccanon(_without_caveats(fresh_core))), {"mode": "exact"}
     except ValueError as exc:
         # a NaN/Infinity in either core: not RFC 8259 JSON, so it can neither be sealed (canon refuses at
         # mint) nor compared -- a closed negative, never a crash and never a pass
@@ -181,11 +218,13 @@ def _split_metadata(core: dict) -> tuple[dict, dict]:
     return rest, meta
 
 
-def _stat_match(orig_core: dict, fresh_core: dict, tol: dict) -> tuple[bool, dict]:
+def _stat_match(orig_core: dict, fresh_core: dict, tol: dict, *, fresh_tol: dict | None = None,
+                fresh_sigma_only: bool = False) -> tuple[bool, dict]:
     """Statistical (stochastic) reproduce: the declared quantity must agree within `sigmas`
     times the combined 1-sigma, and EVERY other value/integrity byte of the core must be identical
     (except fields the tolerance declares `derived` from the quantity -- see below). Prose/metadata
-    keys (METADATA_KEYS) are compared separately and reported as `metadata_drift`, never a failure.
+    keys (METADATA_KEYS) are compared separately and reported as `metadata_drift`; the claim fields among them
+    (fidelity / verdict / reproduce_tolerance) then fail `reproduced` via `_claim_drift` in the caller.
 
     Falls back to an EXACT match (conservative -- a malformed band can never turn a mismatch into a
     pass), with a named reason, when: the sealed tolerance is unusable (fields missing/non-numeric,
@@ -196,7 +235,9 @@ def _stat_match(orig_core: dict, fresh_core: dict, tol: dict) -> tuple[bool, dic
     The effective band is the TIGHTER of the sealed tolerance and the fresh (code-declared) one, and
     the effective `derived` set is their intersection: the sealed tolerance is what the reviewer is
     held to, but a re-signed bundle that widened its own band or declared extra `derived` fields can
-    never loosen the comparison beyond what the open engine's card actually declares."""
+    never loosen the comparison beyond what the open engine's card actually declares. (A tolerance that
+    differs at all is a claim drift and fails `reproduced` anyway; a fresh run that declares NO tolerance
+    is deterministic and is handled by `_cores_match`.)"""
     cap = next(iter(orig_core.get("result", {})), None)
     q, sigma_key = tol.get("quantity"), tol.get("sigma_key")
     o_out = orig_core.get("result", {}).get(cap, {})
@@ -204,12 +245,19 @@ def _stat_match(orig_core: dict, fresh_core: dict, tol: dict) -> tuple[bool, dic
     problem = stat_tolerance_problem(tol, o_out)
     if problem:
         return _exact_fallback(orig_core, fresh_core, f"sealed tolerance unusable: {problem}")
-    try:
-        o_val, f_val = float(o_out[q]), float(f_out[q])
-        o_sig, f_sig = float(o_out[sigma_key]), float(f_out[sigma_key])
-        sigmas = float(tol.get("sigmas"))
-    except (KeyError, TypeError, ValueError):
+    if not (isinstance(f_out, dict) and q in f_out and sigma_key in f_out):
         return _exact_fallback(orig_core, fresh_core, "tolerance fields missing or non-numeric")
+    sigmas = _json_number(tol.get("sigmas"))
+    if sigmas is None:
+        return _exact_fallback(orig_core, fresh_core, "tolerance fields missing or non-numeric")
+    nums = [_json_number(o_out[q]), _json_number(f_out[q]), _json_number(o_out[sigma_key]),
+            _json_number(f_out[sigma_key])]
+    if None in nums:
+        # a string ("20.0") or a boolean on either side is a MISMATCH, never coerced into the band
+        return False, {"mode": "stat", "quantity": q, "within_tolerance": False,
+                       "reason": f"{q!r} and {sigma_key!r} must be finite JSON numbers (not strings or booleans) "
+                                 "in both the sealed and the fresh outputs"}
+    o_val, f_val, o_sig, f_sig = nums
     if not math.isfinite(sigmas) or sigmas < 0 or sigmas > _MAX_SIGMAS:
         return _exact_fallback(
             orig_core, fresh_core,
@@ -222,17 +270,19 @@ def _stat_match(orig_core: dict, fresh_core: dict, tol: dict) -> tuple[bool, dic
             "the re-run did not reproduce the sealed run controls")
 
     # the fresh (code-declared) tolerance can only TIGHTEN the sealed one, never loosen it
-    fresh_tol = fresh_core.get("reproduce_tolerance")
+    # (`fresh_tol` overrides the fresh core's own declaration: the --command path passes the REVIEWER's band)
+    if fresh_tol is None:
+        fresh_tol = fresh_core.get("reproduce_tolerance")
     fresh_tol = fresh_tol if isinstance(fresh_tol, dict) and fresh_tol.get("kind") == "stat" else {}
-    sealed_sigmas = sigmas
-    try:
-        fs = float(fresh_tol.get("sigmas"))
-        if math.isfinite(fs) and 0 <= fs < sigmas:
-            sigmas = fs
-    except (TypeError, ValueError):
-        pass
-    # compare two independent estimates: the tolerance band is sigmas * sqrt(sig_a^2 + sig_b^2)
-    combined = math.hypot(o_sig, f_sig)
+    declared_sigmas = sigmas
+    fs = _json_number(fresh_tol.get("sigmas"))
+    if fs is not None and 0 <= fs < sigmas:
+        sigmas = fs
+    # compare two independent estimates: the band is sigmas * hypot(min(sealed, fresh), fresh). The sealed sigma is a
+    # producer claim, so it can only NARROW the band (a smaller sealed sigma counts as is; a larger one is capped at
+    # the fresh sigma), never inflate it; the band is never wider than sigmas * hypot(sealed, fresh).
+    # (`fresh_sigma_only`: the REVIEWER's band of the --command path is built from the fresh 1-sigma alone.)
+    combined = math.hypot(f_sig, f_sig) if fresh_sigma_only else math.hypot(min(o_sig, f_sig), f_sig)
     if not math.isfinite(combined) or combined <= 0:
         return _exact_fallback(orig_core, fresh_core, "non-finite or non-positive combined sigma")
     delta = abs(o_val - f_val)
@@ -268,21 +318,139 @@ def _stat_match(orig_core: dict, fresh_core: dict, tol: dict) -> tuple[bool, dic
         for k in METADATA_KEYS if _ccanon(o_meta.get(k)) != _ccanon(f_meta.get(k))
     }
     return bool(within and rest_identical), {
-        "mode": "stat", "quantity": q, "sigmas": sigmas, "sealed_sigmas": sealed_sigmas,
+        "mode": "stat", "quantity": q, "sigmas": sigmas,
+        # the band width the governing tolerance declared before any tightening: the reviewer's in reviewer mode
+        ("reviewer_sigmas" if fresh_sigma_only else "sealed_sigmas"): declared_sigmas,
         "delta": delta, "sigma": combined, "n_sigma": delta / combined,
+        "sigma_basis": "fresh" if fresh_sigma_only else "min(sealed,fresh)+fresh",
         "within_tolerance": within, "rest_identical": rest_identical,
         # prose/metadata that changed since the mint -- informational, never a failure
         "metadata_drift": metadata_drift,
     }
 
 
-def _cores_match(orig_core, fresh_core) -> tuple[bool, dict]:
+def _declares_stat_tolerance(core) -> bool:
+    tol = core.get("reproduce_tolerance") if isinstance(core, dict) else None
+    return isinstance(tol, dict) and tol.get("kind") == "stat"
+
+
+#: The reason a deterministic re-run that landed inside the producer's sealed band is NOT a reproduction.
+DETERMINISTIC_BAND_REASON = (
+    "matched within the producer's sealed band, not exactly; the fresh run is deterministic (it declares no "
+    "reproduce_tolerance), so it must re-derive the sealed values exactly and a band match is not a reproduction")
+
+
+def _cores_match(orig_core, fresh_core, *, outputs_only: bool = False, reviewer_tol: dict | None = None
+                 ) -> tuple[bool, dict]:
     """Compare the recorded result core against a fresh re-run. Exact by default; a core that
-    declares a statistical `reproduce_tolerance` is compared within that tolerance instead."""
+    declares a statistical `reproduce_tolerance` is compared within that tolerance instead.
+
+    The sealed band is the producer's commitment for a genuinely STOCHASTIC run, so it only applies when the
+    fresh run is stochastic too (its own core declares a `stat` tolerance). A fresh run that declares none is
+    deterministic: the same inputs give the same numbers, so it is held to an exact match of every value. If
+    it lands inside the sealed band but not exactly, the comparison says so (mode `stat-deterministic`,
+    reason DETERMINISTIC_BAND_REASON) and is NOT a reproduction: otherwise a re-signed bundle could seal a
+    wrong number with a wide band over a deterministic capability and "reproduce" it.
+
+    ``outputs_only`` (the --command path: the reviewer's tool returns outputs only, and every claim field of the
+    fresh core was copied from the sealed one) never applies the SEALED band: the outputs must match exactly,
+    unless the REVIEWER supplied ``reviewer_tol`` (a `stat` tolerance), which is then the band (mode
+    `stat-reviewer`, `band: "reviewer"`), built from the fresh 1-sigma alone (`sigma_basis: "fresh"`)."""
+    if outputs_only:
+        # a reviewer's tool may be written in any language: its outputs are compared by JSON number VALUE, so
+        # 20 and 20.0 are equal; a boolean or a numeric string is still a mismatch (strict numbers stay strict)
+        orig_core, fresh_core = _outputs_by_value(orig_core), _outputs_by_value(fresh_core)
+        if reviewer_tol is not None:
+            ok, detail = _stat_match(orig_core, fresh_core, reviewer_tol, fresh_tol=reviewer_tol, fresh_sigma_only=True)
+            if detail.get("mode") == "stat":
+                detail = {**detail, "mode": "stat-reviewer"}
+            return ok, {**detail, "band": "reviewer", "outputs_only": True}
+        ok, detail = _exact_match(orig_core, fresh_core)
+        return ok, {**detail, "outputs_only": True}
     tol = orig_core.get("reproduce_tolerance") if isinstance(orig_core, dict) else None
     if isinstance(tol, dict) and tol.get("kind") == "stat":
-        return _stat_match(orig_core, fresh_core, tol)
+        ok, detail = _stat_match(orig_core, fresh_core, tol)
+        if _declares_stat_tolerance(fresh_core) or detail.get("mode") != "stat":
+            return ok, detail
+        # deterministic fresh run: exact on every value (the tolerance key itself is a claim field, compared
+        # separately by _claim_drift)
+        o_vals = {k: v for k, v in orig_core.items() if k != "reproduce_tolerance"}
+        f_vals = ({k: v for k, v in fresh_core.items() if k != "reproduce_tolerance"}
+                  if isinstance(fresh_core, dict) else fresh_core)
+        exact, _ = _exact_match(o_vals, f_vals)
+        detail = {**detail, "fresh_deterministic": True, "values_exact": exact}
+        if exact:
+            return True, detail
+        if ok:
+            return False, {**detail, "mode": "stat-deterministic", "reason": DETERMINISTIC_BAND_REASON}
+        return False, detail
     return _exact_match(orig_core, fresh_core)
+
+
+#: Sealed CLAIM fields a reproduction must re-declare identically: the result core's `fidelity`, `verdict`
+#: and `reproduce_tolerance`, and the provenance's `produced_by`. A re-run that re-derives the number but
+#: declares a different tier, verdict, band or producer has not reproduced the sealed claim, so any drift
+#: here makes `reproduced` False and is named in `claim_drift`. `caveats` follow a subset rule: a caveat the
+#: fresh run declares that the sealed bundle omits (verbatim) is a drift, since removing a caveat widens the
+#: claim; extra sealed caveats only narrow it and are allowed. (A reworded engine caveat is a removal: the
+#: verbatim text is gone.) `code_version` / `engine_version` stay environment notes, since a reviewer may
+#: legitimately re-run at another commit.
+CLAIM_CORE_KEYS = ("fidelity", "verdict", "reproduce_tolerance")
+CLAIM_PROVENANCE_KEYS = ("produced_by",)
+_ABSENT = object()
+
+
+def _claim_drift(orig_core, fresh_core, sealed_prov, fresh_prov) -> dict:
+    """{field: {sealed, fresh}} for every sealed claim field the fresh run re-declares differently."""
+    def _get(d, k):
+        return d.get(k, _ABSENT) if isinstance(d, dict) else _ABSENT
+
+    def _differs(a, b):
+        if a is _ABSENT or b is _ABSENT:
+            return a is not b
+        try:
+            return _ccanon(a) != _ccanon(b)
+        except ValueError:
+            return True
+
+    drift = {}
+    pairs = [(k, orig_core, fresh_core) for k in CLAIM_CORE_KEYS]
+    if isinstance(sealed_prov, dict):        # a withheld provenance is an environment gap, not a claim drift
+        pairs += [(k, sealed_prov, fresh_prov) for k in CLAIM_PROVENANCE_KEYS]
+    for key, sealed_d, fresh_d in pairs:
+        s_val, f_val = _get(sealed_d, key), _get(fresh_d, key)
+        if _differs(s_val, f_val):
+            drift[key] = {"sealed": None if s_val is _ABSENT else s_val,
+                          "fresh": None if f_val is _ABSENT else f_val}
+    s_cav, f_cav = _get(orig_core, "caveats"), _get(fresh_core, "caveats")
+    s_list = [] if s_cav is _ABSENT else s_cav
+    f_list = [] if f_cav is _ABSENT else f_cav
+    if isinstance(s_list, list) and isinstance(f_list, list):
+        try:
+            have = {_ccanon(c) for c in s_list}
+            missing = [c for c in f_list if _ccanon(c) not in have]
+        except ValueError:
+            missing = list(f_list)
+        if missing:
+            drift["caveats"] = {"sealed": s_list, "fresh": f_list, "missing_from_sealed": missing}
+    elif _differs(s_cav, f_cav):
+        drift["caveats"] = {"sealed": None if s_cav is _ABSENT else s_cav,
+                            "fresh": None if f_cav is _ABSENT else f_cav, "missing_from_sealed": []}
+    return drift
+
+
+def _claim_drift_reason(drift: dict) -> str:
+    parts = [f"caveats (the fresh run declares {v['missing_from_sealed']!r}, which the sealed bundle omits)"
+             if k == "caveats" and v.get("missing_from_sealed")
+             else f"{k} (sealed {v['sealed']!r}, fresh {v['fresh']!r})"
+             for k, v in drift.items()]
+    return ("the fresh run re-declares the sealed claim differently: " + "; ".join(parts)
+            + " -- a reproduction must re-derive the sealed fidelity, verdict, reproduce_tolerance and "
+              "produced_by unchanged, and the sealed bundle must keep every caveat the fresh run declares")
+
+
+#: The claim fields an outputs-only reproducer (--command) copies from the sealed bundle instead of re-deriving.
+CLAIMS_NOT_REDERIVED_OUTPUTS_ONLY = ("fidelity", "verdict", "caveats", "reproduce_tolerance", "produced_by")
 
 
 def _compare_environment(sealed_prov, fresh_prov, *, profile=None) -> dict:
@@ -424,7 +592,9 @@ def reproduce_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> 
     (the default) resolves to the neutral dialect, so every existing call is byte- and behaviour-identical.
 
     Returns a report: {capability, reproduced (result core re-derives), inputs_identical (the re-run
-    used the sealed inputs, not substituted ones), reproduce_detail, environment, environment_mismatch,
+    used the sealed inputs, not substituted ones), reproduce_detail, claim_drift (sealed fidelity / verdict /
+    reproduce_tolerance / produced_by re-declared differently -- any entry fails `reproduced`), environment,
+    environment_mismatch,
     environment_unverifiable, bundle_identical, original_bundle_sha256, reproduced_bundle_sha256,
     fresh_bundle, verified, integrity_ok, origin_ok, signer, verify_problems}.
     A bundle whose INTEGRITY fails (hashes inconsistent, or the signature invalid under the bundle's own
@@ -465,6 +635,9 @@ def reproduce_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> 
             "reproduce_detail": {"mode": "not-attempted",
                                  "reason": "bundle integrity fails (seal/signature/hash problems); "
                                            "an edited or forged record is never re-derived"},
+            "claim_drift": {},
+            "outputs_only": getattr(runner, "outputs_only", False) is True,
+            "claims_not_rederived": [],
             "environment": {"ok": False, "mismatch": {}, "notes": [], "unverifiable": unverifiable,
                             "ignored": list(ENV_IGNORED)},
             "environment_mismatch": {},
@@ -511,7 +684,21 @@ def _reproduce_compare(bundle, runner, spec, capability, orig_core, run_inputs, 
             fresh_core = disclosed_values(fresh_core)
         except ValueError:
             pass                       # a fresh bundle with withheld items cannot match; the comparison says so
-    result_match, reproduce_detail = _cores_match(orig_core, fresh_core)
+    # an outputs-only runner (proof-reproduce --command) copies every claim field from the sealed bundle, so the
+    # sealed band is never applied (only a band the REVIEWER passed) and the claim is not re-derived at all
+    outputs_only = getattr(runner, "outputs_only", False) is True
+    reviewer_tol = getattr(runner, "reviewer_tolerance", None) if outputs_only else None
+    result_match, reproduce_detail = _cores_match(orig_core, fresh_core, outputs_only=outputs_only,
+                                                  reviewer_tol=reviewer_tol)
+    sealed_prov = _sealed_provenance_of(bundle)
+    fresh_prov = fresh["manifest"]["provenance"]["value"]
+    # the sealed CLAIM (fidelity / verdict / reproduce_tolerance / produced_by / caveats) must be re-declared
+    # unchanged; an outputs-only run cannot re-declare it, which the report names instead (claims_not_rederived)
+    claim_drift = {} if outputs_only else _claim_drift(orig_core, fresh_core, sealed_prov, fresh_prov)
+    if claim_drift:
+        result_match = False
+        reproduce_detail = {**reproduce_detail, "claim_drift": claim_drift,
+                            "claim_drift_reason": _claim_drift_reason(claim_drift)}
     # The re-run must have honored the SEALED inputs, not substituted its own. `reproduce_bundle` hands
     # the runner the sealed inputs, but a runner that ignores a field, drops a sealed threshold, or
     # returns a fixed result would re-derive the number off DIFFERENT inputs than the ones the bundle
@@ -523,8 +710,7 @@ def _reproduce_compare(bundle, runner, spec, capability, orig_core, run_inputs, 
         inputs_identical = _ccanon(spec) == _ccanon(fresh_inputs)
     except ValueError:
         inputs_identical = False
-    environment = _compare_environment(_sealed_provenance_of(bundle),
-                                       fresh["manifest"]["provenance"]["value"], profile=profile)
+    environment = _compare_environment(sealed_prov, fresh_prov, profile=profile)
     return {
         "capability": capability,
         "reproduced": result_match,
@@ -532,6 +718,12 @@ def _reproduce_compare(bundle, runner, spec, capability, orig_core, run_inputs, 
         "unverified": False,                    # integrity held, so the re-derivation was attempted
         **verify_fields,
         "reproduce_detail": reproduce_detail,   # how it compared: exact, or a stat-tolerance delta
+        # sealed claim fields the fresh run re-declared differently ({} when none) -- any entry fails `reproduced`
+        "claim_drift": claim_drift,
+        # True for an outputs-only reproducer (--command): only the outputs were compared, and these claim fields
+        # were taken from the bundle, NOT re-derived
+        "outputs_only": outputs_only,
+        "claims_not_rederived": list(CLAIMS_NOT_REDERIVED_OUTPUTS_ONLY) if outputs_only else [],
         # the sealed environment (data library / deck / generator / seed / run controls) vs the re-run's
         "environment": environment,
         "environment_mismatch": environment["mismatch"],          # {pin: {sealed, fresh}} -- blocks certify
@@ -602,6 +794,9 @@ def certify_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> di
         "reproduced": False,
         "inputs_identical": False,
         "reproduce_detail": {},
+        "claim_drift": {},
+        "outputs_only": getattr(runner, "outputs_only", False) is True,
+        "claims_not_rederived": [],
         "environment": {"ok": False, "mismatch": {}, "notes": [], "unverifiable": None,
                         "ignored": list(ENV_IGNORED)},
         "environment_mismatch": {},
@@ -617,6 +812,9 @@ def certify_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> di
             "reproduced": repro["reproduced"],
             "inputs_identical": repro["inputs_identical"],
             "reproduce_detail": repro["reproduce_detail"],
+            "claim_drift": repro["claim_drift"],
+            "outputs_only": repro["outputs_only"],
+            "claims_not_rederived": repro["claims_not_rederived"],
             "environment": repro["environment"],
             "environment_mismatch": repro["environment_mismatch"],
             "environment_unverifiable": repro["environment_unverifiable"],
@@ -635,14 +833,16 @@ def certify_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> di
 
     # A MATERIAL metadata drift (the fresh re-run's result self-declares a different verdict or fidelity
     # tier than the sealed core) must not ride under certified:True -- a downgrade would otherwise sit in a
-    # note next to a green verdict. Surfaced as `metadata_conflict` and blocks certification; it never fails
-    # `reproduced` (the number still re-derives). Cosmetic drift (caveats, a tightened tolerance) stays
-    # informational. Unconditional (verdict/fidelity are kernel contract fields), so it is byte-neutral
-    # hardening of the unsigned report, not a profile knob.
+    # note next to a green verdict. Surfaced as `metadata_conflict` and blocks certification; it also fails
+    # `reproduced` (claim_drift). A caveat the fresh run declares that the sealed bundle omits is material too (it is
+    # in claim_drift and metadata_conflict); only EXTRA sealed caveats stay informational (`metadata_drift`).
+    # Unconditional (verdict/fidelity/caveats are kernel contract fields), so it is byte-neutral hardening of the
+    # unsigned report, not a profile knob.
     metadata_conflict = _material_metadata_conflict(record.get("reproduce_detail"))
     record["metadata_conflict"] = metadata_conflict
+    # an outputs-only reproduction (the claim fields were copied, not re-derived) never certifies
     record["certified"] = bool(
-        record["verified"] and record.get("reproduced")
+        record["verified"] and record.get("reproduced") and not record.get("outputs_only")
         and record.get("inputs_identical") and environment_ok and not metadata_conflict
     )
     return record

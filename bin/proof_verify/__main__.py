@@ -455,6 +455,19 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
             print("    so this proves INTEGRITY, not that the record came from a production signer (ORIGIN).")
             _print_seal_keys(rep, signer_hex)
             print(f"      pinned key: {_pinned_line(rep)}  (public demo key -- not a trust anchor)")
+        elif rep.get("key_matches_pin"):
+            # a verified seal signature IS under a pinned (non-demo) key, but the receiver policy's origin rules
+            # (quorum, required suites, aging; SPEC 7.13) are not met: say so, never "that key is not the pin"
+            print(f"{lead}integrity verified -- origin NOT established: {path}")
+            _print_withheld(bundle, rep)
+            print(f"    every hash recomputes and the {_suite_signature(rep)} is valid under a PINNED key, so the")
+            print("    record is UNEDITED since it was signed -- but origin does not hold under this receiver policy:")
+            for problem in rep.get("origin_problems") or []:
+                print(f"      - {problem}")
+            if any("aged suite or hash" in p for p in rep.get("origin_problems") or []):
+                print("    the signature has AGED under the pinned key: its suite or hash is past its trusted_until at")
+                print(f"    as_of {rep.get('as_of')}, and no valid archive shows that it existed before then (SPEC 7.13).")
+            _print_seal_keys(rep, signer_hex)
         else:
             print(f"{lead}integrity verified -- origin NOT established: {path}")
             _print_withheld(bundle, rep)
@@ -480,6 +493,13 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
     # means a pinned-production-key signature over an intact bundle.
     print(f"{lead}verified (integrity + origin): {path}")
     _print_withheld(bundle, rep)
+    basis = rep.get("origin_basis") or "current"
+    if basis.startswith("archived-before:"):
+        # SPEC 13.6 "Origin through the archive": never let a rescued origin read like a current one
+        t0 = basis.removeprefix("archived-before:")
+        print(f"    ORIGIN THROUGH THE ARCHIVE: a seal signature's suite or hash has aged at as_of {rep.get('as_of')};")
+        print(f"    origin holds only through the archive, which shows the seal signatures existed no later than {t0}")
+        print("    (archive rescue, SPEC 7.13). It is only as good as the archive's TSAs.")
     _print_seal_keys(rep, None)
     print(f"    pinned key: {pinned_key_fingerprint()}")
     print("    cross-check this fingerprint against the published trust root before")

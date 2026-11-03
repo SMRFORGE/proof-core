@@ -6,6 +6,10 @@ proof-core never talks to a TSA: the caller sends the imprint to the time-stampi
 only after every block in E is final, because the seal datum includes every signature." `seal_imprint` is computed
 from the bundle as it stands, and `add_seal_timestamps` refuses a token whose imprint is not the CURRENT seal
 imprint, so a token requested before the last signature was added (or for another bundle) is never attached.
+
+SPEC 10.8.9: "A producer MUST NOT add, remove or reorder seal tokens after creating an archive (AR-7)": the archived
+object lists the seal tokens, so `add_seal_timestamps` refuses a bundle that already has an `archive` (drop it, add the
+tokens, and archive again with `proof_core.archive.add_archive`).
 """
 from __future__ import annotations
 
@@ -52,7 +56,11 @@ def _token_imprint(der: bytes) -> bytes:
 def add_seal_timestamps(bundle: dict, tokens: list[bytes]) -> dict:
     """Return a COPY of the v4 ``bundle`` with ``tokens`` (DER RFC 3161 TimeStampTokens) as its `timestamps` block,
     after any it already holds. Each token must be well formed (SPEC 10.7.5) and carry the bundle's CURRENT seal
-    imprint; anything else raises ValueError. The seal and its signatures are untouched (`timestamps` is unsigned)."""
+    imprint; anything else raises ValueError. The seal and its signatures are untouched (`timestamps` is unsigned).
+    A bundle that already has an `archive` is refused (SPEC 10.8.9: its archived object lists the seal tokens)."""
+    if "archive" in bundle:
+        raise ValueError("the bundle has an archive, whose archived object lists the seal tokens: a producer MUST NOT "
+                         "add seal tokens after creating an archive; drop it and archive again (SPEC 10.8.9, AR-7)")
     want = seal_imprint(bundle)
     entries = list(bundle.get("timestamps", []))
     for i, der in enumerate(tokens):

@@ -7,7 +7,7 @@
 **Give a Claude Code agent three verbs: seal a result, verify a record, re-run it.** Not "trust us". Check us.
 
 Repo: `gitlab.com/proof-core/skill` · MIT · a Claude Code plugin with one Agent Skill · Python 3.11+ standard
-library · vendors [proof-core](https://gitlab.com/proof-core/proof-core) 0.23.0 · no install, no network, no
+library · vendors [proof-core](https://gitlab.com/proof-core/proof-core) 0.24.0 · no install, no network, no
 account
 
 ## What this is
@@ -116,11 +116,11 @@ flowchart LR
 
 | Repo | Use it to |
 |---|---|
-| [proof-core](https://gitlab.com/proof-core/proof-core) | v0.23.0: seal, verify and reproduce any computed result (Python, standard library only), in envelope v3 plus the v4 core |
+| [proof-core](https://gitlab.com/proof-core/proof-core) | v0.24.0: seal, verify and reproduce any computed result (Python, standard library only), in envelope v3 plus the v4 core |
 | [pytest-proof-core](https://gitlab.com/proof-core/pytest-proof-core) | seal each test's outcome and re-check it later in CI |
-| [envelope-spec](https://gitlab.com/proof-core/envelope-spec) | the bundle format's written standard: spec (1.0.0-rc1), JSON Schema, and 546 conformance vectors to test any verifier against |
-| [proof-mcp](https://gitlab.com/proof-core/proof-mcp) | v0.5.0: receipt format v2 with a coverage section, code-mode receipts and loop receipts for ordinary tool-calling loops, MCP over stdio and streamable HTTP, async hosts, and `proof-accept` to accept or reject a sealed run |
-| [proof-core-kernel-js](https://gitlab.com/proof-core/proof-core-kernel-js) | v0.6.0 (`@proof-core/verify`): verify bundles in Node or a browser, with no dependencies |
+| [envelope-spec](https://gitlab.com/proof-core/envelope-spec) | the bundle format's written standard: spec (1.0.0-rc1), JSON Schema, and 593 conformance vectors to test any verifier against |
+| [proof-mcp](https://gitlab.com/proof-core/proof-mcp) | v0.6.0: receipt format v2 with a coverage section, code-mode receipts and loop receipts for ordinary tool-calling loops, MCP over stdio and streamable HTTP, async hosts, `proof-accept` to accept or reject a sealed run, and `proof-mcp serve`, an evidence MCP server |
+| [proof-core-kernel-js](https://gitlab.com/proof-core/proof-core-kernel-js) | v0.7.0 (`@proof-core/verify`): verify bundles in Node or a browser, with no dependencies |
 | [skill](https://gitlab.com/proof-core/skill) | give a Claude Code agent seal, verify and reproduce as a skill |
 | [pytest-proof-core-plugin](https://gitlab.com/proof-core/pytest-proof-core-plugin) | the pytest plugin, packaged for Claude Code |
 
