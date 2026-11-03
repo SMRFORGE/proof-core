@@ -950,17 +950,67 @@ def _classify(entry, index, imprint, pins, allow_ess_v1, aged) -> dict:
             why = f"the token's suite or digest hash {hit} has aged at as_of (K2, 7.13)"
             return report(index, "out_of_window", [why], t, tsa)
     try:
-        _check_b(t, sel, rule, digest, imprint, allow_ess_v1, problems)
+        ident = _check_b(t, sel, rule, digest, imprint, allow_ess_v1, problems)
     except _Invalid as exc:
         return report(index, "invalid", [str(exc)] + problems, t, tsa)
     except Malformed as exc:                    # TT-15: the B6 operation was refused by the work budget
         return report(index, "malformed", [str(exc)] + problems, t, tsa)
-    return report(index, "accepted", problems, t, tsa)
+    out = report(index, "accepted", problems, t, tsa)
+    out["_suite"], out["_digest"] = SUITE_OF[rule[0]], digest      # internal: the archive stamp end (AR-12)
+    out["_key"] = ident                                             # internal: the TSA key identity (10.7.7)
+    return out
+
+
+def _der_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def _der_uint(v: int) -> bytes:
+    """The minimal DER INTEGER of a non-negative ``v`` (X.690 8.3)."""
+    c = v.to_bytes(v.bit_length() // 8 + 1, "big")
+    return b"\x02" + _der_len(len(c)) + c
+
+
+#: P-256 n (SP 800-186 3.2.1.3), for the low-S normalization of `signature_digest`
+_P256_N = int("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+
+
+def signature_digest(t: Token) -> str:
+    """SPEC 10.8.2 "Signature digest": "sha256:" + lowerhex(SHA-256(the canonical signature value)). For an
+    ecdsa-with signatureAlgorithm (TT-28) the canonical value is the minimal DER SEQUENCE { r, s' } with s' = n - s when
+    n/2 < s < n (low-S), else s; otherwise it is the `signature` OCTET STRING contents exactly as stored (an RSA
+    signature is its k octets). A renewal stamp commits to it beside token_id (AR-10), so it binds the previous
+    stamp's signature while the high-S flip of B6 step 2 still changes nothing (AR-6)."""
+    if t.ecdsa_rs is not None:
+        r, s = t.ecdsa_rs
+        if _P256_N // 2 < s < _P256_N:
+            s = _P256_N - s
+        body = _der_uint(r) + _der_uint(s)
+        data = b"\x30" + _der_len(len(body)) + body
+    else:
+        data = t.signature
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def parse_token_text(s: Any) -> Token:
+    """10.7.2 (TT-6 to TT-8) and every rule of 10.7.5 for one base64 token string, under the TT-12 node limit; no pin
+    lookup and no public-key operation. Raises Malformed. The archive (10.8) reads token_id through this."""
+    raw = strict_b64(s, TOKEN_MAX_CHARS, "token", TOKEN_MAX_BYTES)
+    budget = _NODE_BUDGET.set([0])
+    try:
+        return parse_token(raw)
+    except (MemoryError, RecursionError) as exc:
+        raise Malformed(f"resource limit while reading the token ({type(exc).__name__})") from None
+    finally:
+        _NODE_BUDGET.reset(budget)
 
 
 def _check_b(t: Token, sel: Cert, rule, digest: str | None, imprint: bytes, allow_ess_v1: bool,
-             problems: list[str]) -> None:
-    """B1 to B6. Raises _Invalid."""
+             problems: list[str]) -> str:
+    """B1 to B6. Raises _Invalid. Returns the selected key's TSA key identity (`key_identity`)."""
     # B1. Algorithms
     if digest is None:
         raise _Invalid(f"B1: digestAlgorithm {_safe_dotted(t.digest_oid)} is not SHA-256, SHA-384 or SHA-512")
@@ -1008,6 +1058,19 @@ def _check_b(t: Token, sel: Cert, rule, digest: str | None, imprint: bytes, allo
     else:
         if _ecdsa_verify(key, t.ecdsa_rs, h):
             problems.append(HIGH_S_ADVISORY)
+    return key_identity(kind, key)
+
+
+def key_identity(kind: str, key) -> str:
+    """SPEC 10.7.7 "TSA key identity": the normalized public key of an accepted token's selected certificate, as B5
+    decoded it. P-256: "ecdsa:" + lowerhex(the 33-octet SEC 1 compressed point, 02 or 03 by the parity of y, then x
+    as 32 octets), so one key under an uncompressed and a compressed SPKI (two pins) is one TSA. RSA: "rsa:" +
+    lowerhex(n) + ":" + lowerhex(e), both minimal and without leading zeros. Distinct TSAs are counted by this."""
+    if kind == "ecdsa":
+        x, y = key
+        return "ecdsa:" + (bytes([2 + (y & 1)]) + x.to_bytes(32, "big")).hex()
+    n, e = key
+    return f"rsa:{n:x}:{e:x}"
 
 
 def _rsa_verify(key: tuple[int, int], sig: bytes, tail: bytes) -> None:
@@ -1049,12 +1112,18 @@ def _ecdsa_verify(q: tuple[int, int], rs: tuple[int, int], h: bytes) -> bool:
 # --- scopes (10.7.7, 10.7.8) ------------------------------------------------------------------------------------------
 
 def bound_of(reports: list[dict]) -> tuple[tuple[int, str] | None, str | None, int]:
-    """TT-38: (the latest genTime instant in A, its report string, distinct pin ids in A)."""
+    """TT-38: (the latest genTime instant in A, its report string, the number of distinct TSAs in A). Distinct TSAs
+    are distinct TSA key identities (`key_identity`), not pin ids: one key pinned twice is one TSA."""
     acc = [r for r in reports if r["class"] == "accepted"]
     if not acc:
         return None, None, 0
     best = max(acc, key=lambda r: r["_instant"])
-    return best["_instant"], best["gen_time"], len({r["tsa"] for r in acc})
+    return best["_instant"], best["gen_time"], distinct_tsas(acc)
+
+
+def distinct_tsas(accepted: list[dict]) -> int:
+    """SPEC 10.7.7: the number of distinct TSA key identities among accepted token reports."""
+    return len({r["_key"] for r in accepted})
 
 
 def earliest_of(reports: list[dict]) -> tuple[tuple[int, str] | None, str | None]:

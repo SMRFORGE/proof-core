@@ -26,7 +26,13 @@ bundle -- see SECURITY):
         3. the command writes the recomputed OUTPUTS -- a JSON object of the capability's output keys,
            the same shape as the sealed ``result[<capability>]`` -- to the path in ``PROOF_OUTPUT``.
         4. those fresh outputs are spliced onto the sealed bundle's shape (same inputs, fidelity, verdict,
-           tolerance and provenance pins) and fed into the SAME comparison as --runner.
+           caveats, tolerance and provenance pins) and compared OUTPUTS ONLY: --command cannot re-derive
+           fidelity, verdict, caveats, reproduce_tolerance or produced_by (they are taken from the bundle, and
+           the report says so), and it never applies the bundle's own sealed statistical band, which is the
+           producer's claim. Every output must match exactly (JSON numbers by value: 20 equals 20.0, a
+           boolean or a numeric string never equals a number), unless the REVIEWER passes a band with
+           ``--stochastic QUANTITY --sigma-key KEY [--sigmas N]``; the result is then labelled as compared
+           under the reviewer's band. To hold a capability to its sealed claim, use --runner.
 
 SECURITY (hard line): the CLI NEVER imports or executes anything named ONLY inside the bundle. The
 capability string, the inputs, and every other field in the bundle are treated strictly as DATA. The only
@@ -35,9 +41,13 @@ So a hostile bundle cannot cause code execution merely by being pointed at -- se
 ``tests/test_reproduce_cli.py::test_bundle_alone_cannot_cause_code_execution``.
 
 Exit codes:
-  0  reproduced -- the sealed numbers re-derive from the open run (within the sealed band if stochastic).
+  0  reproduced (--runner only) -- the sealed numbers and the sealed claim re-derive from the open run (within
+     the sealed band if the re-run is itself stochastic).
   1  NOT reproduced, or verify failed (the bundle's integrity does not hold, so it is never re-run).
   2  usage error, or the bundle file could not be read / parsed, or the --runner target is unusable.
+  3  outputs reproduced, claims NOT re-derived (--command only): every output matches exactly, or within the
+     reviewer's --stochastic band, but fidelity, verdict, caveats, reproduce_tolerance and produced_by were taken
+     from the bundle. Mirrors proof-verify's exit 3 (integrity only, not origin): a partial result, never a pass.
 """
 from __future__ import annotations
 
@@ -57,6 +67,7 @@ from .envelope import build_bundle
 EXIT_REPRODUCED = 0
 EXIT_NOT_REPRODUCED = 1          # also: verify failed (a bundle whose integrity fails is never re-run)
 EXIT_USAGE = 2                   # usage / unreadable bundle / unusable --runner target
+EXIT_OUTPUTS_ONLY = 3            # --command: outputs reproduced, claims NOT re-derived (mirrors proof-verify's 3)
 
 #: env vars naming the input/output JSON files for the built-in --command runner (the documented contract).
 ENV_INPUTS = "PROOF_INPUTS"
@@ -206,6 +217,8 @@ def _rebuild_with_outputs(bundle: dict, fresh_outputs: dict, profile=None) -> di
     run_prov["rng_seed"] = prov.get("rng_seed")
     run_prov["produced_by"] = prov.get("produced_by")
     run_prov["environment_captured"] = False
+    # the claim fields below are COPIED from the subject (an outputs-only reproducer cannot re-derive them); the
+    # comparison knows this (CommandRunner.outputs_only) and never applies the copied sealed band
     result = Result(
         capability=capability,
         fidelity=Fidelity(core["fidelity"]),
@@ -243,10 +256,15 @@ class CommandRunner:
     recomputed outputs back, and rebuilds the fresh bundle to mirror the subject's shape (see
     ``_rebuild_with_outputs``)."""
 
-    def __init__(self, command: str, bundle: dict, profile=None):
+    #: the comparison is OUTPUTS ONLY: the fresh core's claim fields are copies of the sealed ones (certify.py)
+    outputs_only = True
+
+    def __init__(self, command: str, bundle: dict, profile=None, reviewer_tolerance: dict | None = None):
         self.command = command
         self._bundle = bundle
         self._profile = profile
+        #: a `stat` tolerance the REVIEWER passed (--stochastic); None = exact match of every output
+        self.reviewer_tolerance = reviewer_tolerance
 
     def can_run(self, capability: str) -> bool:
         # the reviewer chose this command for THIS bundle's capability
@@ -299,11 +317,13 @@ def _print_numbers(report: dict, out) -> None:
     mode = detail.get("mode")
     cap = report.get("capability")
     fresh = report.get("fresh_bundle")
-    if mode == "stat":
+    if mode in ("stat", "stat-deterministic", "stat-reviewer"):
         q = detail.get("quantity")
         sealed_val = report.get("_sealed_core", {}).get(q)
         fresh_val = _result_core(fresh, cap).get(q) if fresh else None
-        print(f"  comparison: statistical band on {q!r}", file=out)
+        source = ("the REVIEWER's band (--stochastic), not the bundle's sealed reproduce_tolerance"
+                  if mode == "stat-reviewer" else "the producer's sealed band")
+        print(f"  comparison: statistical band on {q!r} -- {source}", file=out)
         print(f"    sealed {q} = {sealed_val}   fresh {q} = {fresh_val}", file=out)
         print(f"    delta = {detail.get('delta'):.6g}   combined sigma = {detail.get('sigma'):.6g}   "
               f"n_sigma = {detail.get('n_sigma'):.3g}  (band = {detail.get('sigmas')} sigma)", file=out)
@@ -337,11 +357,42 @@ def _print_report(path: str, report: dict, out) -> None:
                   else "origin NOT established (demo pin)" if report.get("pinned_key_is_demo")
                   else "origin NOT established")
         print(f"  verify: integrity OK, {origin}", file=out)
-    if report.get("reproduced"):
-        print("  RESULT: REPRODUCED -- the sealed numbers re-derive from the open run", file=out)
-    else:
+    detail = report.get("reproduce_detail") or {}
+    mode = detail.get("mode")
+    if not report.get("reproduced"):
         print("  RESULT: NOT reproduced", file=out)
+    elif report.get("outputs_only") and mode == "stat-reviewer":
+        print(f"  RESULT: REPRODUCED (outputs only) within the REVIEWER's band ({detail.get('sigmas')} sigma on "
+              f"{detail.get('quantity')!r}) -- the outputs agree within that band; this is not an exact "
+              "re-derivation", file=out)
+    elif report.get("outputs_only"):
+        print("  RESULT: REPRODUCED (outputs only) -- every fresh output equals the sealed output exactly", file=out)
+    elif mode == "stat":
+        print(f"  RESULT: REPRODUCED within the producer's sealed statistical band ({detail.get('sigmas')} sigma) "
+              "-- the fresh STOCHASTIC run agrees within that band; this is not a bit-exact re-derivation",
+              file=out)
+    else:
+        print("  RESULT: REPRODUCED -- the sealed numbers re-derive exactly from the open run", file=out)
     _print_numbers(report, out)
+    if report.get("outputs_only"):
+        print("  NOTE: --command compares OUTPUTS ONLY. fidelity, verdict, caveats, reproduce_tolerance and "
+              "produced_by were taken from the bundle and NOT re-derived.", file=out)
+        sealed_tol = (report.get("_sealed_full_core") or {}).get("reproduce_tolerance")
+        if isinstance(sealed_tol, dict) and sealed_tol.get("kind") == "stat" and mode != "stat-reviewer":
+            print("  NOTE: the bundle seals its own statistical band; --command never applies it (it is the "
+                  "producer's claim). Pass --stochastic QUANTITY --sigma-key KEY [--sigmas N] to compare under "
+                  "a band you choose, or use --runner.", file=out)
+    if mode == "stat-deterministic":
+        print(f"  NOTE: {detail.get('reason')}", file=out)
+    claim_drift = report.get("claim_drift") or {}
+    if claim_drift:
+        print("  sealed claim fields the fresh run re-declares differently (sealed vs fresh):", file=out)
+        for key, diff in claim_drift.items():
+            if key == "caveats" and diff.get("missing_from_sealed"):
+                print(f"    caveats: the fresh run declares {diff['missing_from_sealed']!r}, which the sealed "
+                      "bundle omits (a removed caveat widens the claim)", file=out)
+            else:
+                print(f"    {key}: sealed={diff.get('sealed')!r} fresh={diff.get('fresh')!r}", file=out)
     if not report.get("inputs_identical", True):
         print("  NOTE: the re-run did NOT use the sealed inputs (a substituted or ignored input); "
               "this is not a reproduction of the sealed case", file=out)
@@ -360,7 +411,14 @@ def _epilog() -> str:
         f"  the sealed case {{capability, inputs}} is written as JSON to a temp dir; its path is in\n"
         f"  the env var {ENV_INPUTS}. The command runs there (shell, no network) and writes the\n"
         f"  recomputed outputs -- a JSON object of the capability's output keys -- to {ENV_OUTPUT}.\n"
-        "  Those fresh outputs are compared against the sealed ones (exactly, or within the sealed band).\n\n"
+        "  Those fresh outputs are compared against the sealed ones OUTPUTS ONLY and EXACTLY: --command never\n"
+        "  applies the bundle's sealed statistical band, and it cannot re-derive fidelity, verdict, caveats,\n"
+        "  reproduce_tolerance or produced_by (they are taken from the bundle; the report says so). For a\n"
+        "  stochastic tool, pass YOUR band: --stochastic QUANTITY --sigma-key KEY [--sigmas N]. To hold the\n"
+        "  capability to its sealed claim, use --runner.\n\n"
+        "exit codes: 0 reproduced (--runner: numbers and claim), 1 not reproduced or integrity failed,\n"
+        "  2 usage error, 3 outputs reproduced but claims NOT re-derived (any --command pass, exact or under\n"
+        "  the reviewer's band).\n\n"
         "security: the runner/command is ALWAYS supplied here, never read from the bundle; a bundle's\n"
         "fields are data and can never cause code to be imported or executed.")
 
@@ -382,6 +440,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--pubkey", metavar="HEX",
                    help="pin this 64-hex Ed25519 public key as the origin trust root for the verify step "
                         "(a convenience for a dialect with no Profile; profile.pinned_pubkey wins if both)")
+    p.add_argument("--stochastic", metavar="QUANTITY",
+                   help="--command only: compare the output QUANTITY within YOUR statistical band (needs "
+                        "--sigma-key) instead of exactly; the bundle's sealed band is never used")
+    p.add_argument("--sigma-key", metavar="KEY", help="--command --stochastic: the output key holding the 1-sigma")
+    p.add_argument("--sigmas", metavar="N", type=float, default=None,
+                   help="--command --stochastic: the band width in sigmas (default 3, at most 10)")
     p.add_argument("--json", action="store_true",
                    help="emit the verdict as a JSON object (same exit code) instead of human text")
     return p
@@ -395,7 +459,8 @@ def _emit_json_report(path: str, report: dict, code: int) -> int:
     out["kind"] = REPRODUCE_VERDICT_KIND
     out["path"] = path
     out["exit_code"] = code
-    out["state"] = "reproduced" if report.get("reproduced") else "not-reproduced"
+    out["state"] = ("not-reproduced" if not report.get("reproduced")
+                    else "outputs-reproduced" if report.get("outputs_only") else "reproduced")
     # the SAME gate field as verify: a production-origin pass is origin_ok True (a real production pin,
     # never the demo pin), so one key -- production_origin_pass -- works across verify AND reproduce.
     out["production_origin_pass"] = report.get("origin_ok") is True
@@ -416,6 +481,26 @@ def _emit_json_error(path: str, state: str, code: int, *, integrity_ok=None, **e
            "production_origin_pass": False, "not_a_production_pass": True, **extra}
     print(json.dumps(out, sort_keys=True, default=str))
     return code
+
+
+def _reviewer_tolerance(args) -> tuple[dict | None, str | None]:
+    """The REVIEWER's band from --stochastic / --sigma-key / --sigmas: (tolerance or None, usage error or None)."""
+    import math
+    if args.stochastic is None:
+        if args.sigma_key is not None or args.sigmas is not None:
+            return None, "--sigma-key and --sigmas need --stochastic QUANTITY"
+        return None, None
+    if args.command is None:
+        return None, ("--stochastic is for --command only; --runner re-runs the producer, whose own declared "
+                      "tolerance governs")
+    if not args.sigma_key:
+        return None, "--stochastic needs --sigma-key KEY (the output key holding the 1-sigma)"
+    if args.sigma_key == args.stochastic:
+        return None, "--sigma-key must differ from the --stochastic quantity"
+    sigmas = 3.0 if args.sigmas is None else args.sigmas
+    if not math.isfinite(sigmas) or not 0 < sigmas <= 10:
+        return None, "--sigmas must be a finite number above 0 and at most 10"
+    return {"kind": "stat", "quantity": args.stochastic, "sigma_key": args.sigma_key, "sigmas": sigmas}, None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -456,6 +541,13 @@ def _main(argv: list[str]) -> int:
             print(f"error: --pubkey must be 64 lowercase hex characters: {exc}", file=sys.stderr)
             return EXIT_USAGE
 
+    reviewer_tol, why = _reviewer_tolerance(args)
+    if why:
+        if args.json:
+            return _emit_json_error(args.bundle, "usage", EXIT_USAGE, error=why)
+        print(f"error: {why}", file=sys.stderr)
+        return EXIT_USAGE
+
     try:
         with open(args.bundle, "rb") as fh:
             # bytes + strict UTF-8, exactly as proof-verify reads: no newline translation before the size cap,
@@ -493,7 +585,7 @@ def _main(argv: list[str]) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_USAGE
     else:
-        runner = CommandRunner(args.command, bundle, profile)
+        runner = CommandRunner(args.command, bundle, profile, reviewer_tolerance=reviewer_tol)
 
     try:
         report = reproduce_bundle(bundle, runner, profile=profile)
@@ -515,7 +607,12 @@ def _main(argv: list[str]) -> int:
 
     # stash the sealed result core for the printer (read here, once, from the verified bundle)
     report["_sealed_core"] = _result_core(bundle, report.get("capability"))
-    code = EXIT_REPRODUCED if report.get("reproduced") else EXIT_NOT_REPRODUCED
+    try:
+        report["_sealed_full_core"] = bundle["manifest"]["result"]["value"]
+    except (KeyError, TypeError):
+        report["_sealed_full_core"] = {}
+    code = (EXIT_NOT_REPRODUCED if not report.get("reproduced")
+            else EXIT_OUTPUTS_ONLY if report.get("outputs_only") else EXIT_REPRODUCED)
     if args.json:
         return _emit_json_report(args.bundle, report, code)
     _print_report(args.bundle, report, sys.stdout)

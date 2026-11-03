@@ -301,8 +301,8 @@ class PolicyError(ValueError):
 class PolicyUnsupportedError(PolicyError):
     """A WELL-FORMED receiver policy member this release does not evaluate (any value other than its default).
     Refused rather than ignored, so a caller who sets one never believes it ran; a distinct kind from a malformed
-    policy (``policy``). The members that read the archive (`require_archive`, `min_archive_tsas`) come in a later
-    release."""
+    policy (``policy``). Since the archive members (`require_archive`, `min_archive_tsas`) are evaluated (SPEC 10.8),
+    every member of 13.4.1 is, so this release never raises it; the kind stays for callers that catch it."""
 
     kind = "policy_unsupported"
 
@@ -417,10 +417,8 @@ def resolve_pins(pins: Any, *, where: str = "pins", duplicates: str = "merge",
 #: The members of the receiver policy (SPEC 13.4.1) with their defaults. This release evaluates `schema`, `pins`,
 #: `min_envelope`, the origin members of 7.13 (quorum, required suites, aging) and the sign-off members of 13.4.4
 #: (roster, roles, order, self-verification) and the trusted-time members of 10.7 (TSA pins, `min_seal_tsas`,
-#: `require_signoff_timestamps`, `max_attest_lag_s`, `allow_ess_v1`) and `require_full_copy_review` (13.4.4); every
-#: other member is accepted only AT ITS DEFAULT
-#: (where it changes nothing), and a non-default value is refused rather than ignored, so a caller who sets one never
-#: believes it ran. The archive arrives in a later release.
+#: `require_signoff_timestamps`, `max_attest_lag_s`, `allow_ess_v1`), `require_full_copy_review` (13.4.4) and the
+#: archive members of 10.8 and 13.4.3 row 18 (`require_archive`, `min_archive_tsas`): every member.
 _POLICY_DEFAULTS: dict[str, Any] = {
     "origin_quorum": 1, "require_seal_suites": [], "min_envelope": "v3", "suites": {}, "hashes": {}, "tsas": [],
     "min_seal_tsas": 0, "require_archive": False, "min_archive_tsas": 1, "roster": [], "require_roles": [],
@@ -565,12 +563,13 @@ _POLICY_INT_MEMBERS = frozenset({"origin_quorum", "min_seal_tsas", "min_archive_
 #: (`origin_quorum`, `require_seal_suites`, `suites`, `hashes`) and the sign-off members of 13.4.4 (`roster`,
 #: `require_roles`, `require_order`, `allow_self_verify`, `originator_keys`, `originator_signer_ids`) and the
 #: trusted-time members of 10.7 and 13.4.1 (`tsas`, `min_seal_tsas`, `require_signoff_timestamps`, `max_attest_lag_s`,
-#: `allow_ess_v1`). The archive members are accepted only at their default; a well-formed other value raises
-#: PolicyUnsupportedError (a limitation of this release, see CHANGELOG).
+#: `allow_ess_v1`) and the archive members (`require_archive`, `min_archive_tsas`, 10.8 and 13.4.3 row 18). A member
+#: outside this set would be accepted only at its default (PolicyUnsupportedError); none is.
 _POLICY_EVALUATED = frozenset({"min_envelope", "origin_quorum", "require_seal_suites", "suites", "hashes",
                                "roster", "require_roles", "require_order", "allow_self_verify", "originator_keys",
                                "originator_signer_ids", "tsas", "min_seal_tsas", "require_signoff_timestamps",
-                               "max_attest_lag_s", "allow_ess_v1", "require_full_copy_review"})
+                               "max_attest_lag_s", "allow_ess_v1", "require_full_copy_review", "require_archive",
+                               "min_archive_tsas"})
 
 
 def _derived_signoff_timestamps(policy: dict) -> bool:
@@ -694,9 +693,9 @@ def utc_now() -> str:
 
 def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -> list[str]:
     """SPEC 13.4.3, the reason codes in table order, for the rows this release can evaluate. Rows 3 to 12 read the
-    `signoffs` dimension and its entries (`signoff_reasons`), rows 13 to 15 the `time` dimension. Row 18 reads the
-    archive, which this release does not check: a PRESENT archive block already rejects through row 17 (`_dims`),
-    and `require_archive` is refused (`PolicyUnsupportedError`). Row 19 reads the `signoffs` entries again
+    `signoffs` dimension and its entries (`signoff_reasons`), rows 13 to 15 the `time` dimension, rows 16 to 18 the
+    `archive` dimension (row 18: `require_archive`, and min_tsas against `min_archive_tsas`). Row 19 reads the
+    `signoffs` entries again
     (`partial_copy_reasons`, `require_full_copy_review`).
 
     13.4.2: "`verdict` MUST have been produced under the same effective policy ... If the hashes differ, `evaluate`
@@ -735,6 +734,11 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
         reasons.append("archive_broken")
     if dims.get("archive") == "malformed":
         reasons.append("archive_malformed")
+    if members.get("require_archive"):
+        a = rep.get("archive") if isinstance(rep.get("archive"), dict) else {}
+        fewest = a.get("min_tsas") if a.get("state") == "valid" and isinstance(a.get("min_tsas"), int) else 0
+        if dims.get("archive") != "valid" or fewest < members.get("min_archive_tsas", 1):
+            reasons.append("archive_required")
     reasons += partial_copy_reasons(signoffs, members, v2=rep.get("canon_version") == 3)
     return reasons
 
@@ -2805,11 +2809,8 @@ def _check_v4(bundle: dict, problems: list[str], origin_problems: list[str],
                     and "inputs" in core_src["provenance"]:
                 problems.append("inputs declared withheld but still present in the result core's provenance")
                 break
-    # unsigned v4 blocks this release does not check: never a pass by omission. `attestations` (sign-offs v2) is
-    # checked in `classify_bundle` (`check_signoffs_v2`, 10.3.8), whatever the integrity verdict, and `timestamps`
-    # there too (`_time_dimension`, 10.7.7), once integrity holds.
-    if v4_out is not None:
-        v4_out["unchecked_blocks"] = sorted(k for k in ("archive",) if k in bundle)
+    # the unsigned v4 blocks are checked in `classify_bundle`: `attestations` (sign-offs v2, 10.3.8) whatever the
+    # integrity verdict, `timestamps` (10.7.7) and `archive` (10.8.6) once integrity holds.
     # step 19, the seal signatures E = [signature] + signatures over the RECOMPUTED seal (7.10 G1-G6). Origin
     # (pins, quorum, required suites, aging, 7.13) is decided from the recorded blocks in `classify_bundle`.
     declared_signers = ([(e["alg"], e["public_key"]) for e in prov_val["seal_signers"]]
@@ -3148,6 +3149,9 @@ def _entry_tokens(d: dict, seal: str | None, tok: dict | None) -> list[dict]:
 #: misuse is the likely cause, so the report and the render say so.
 TSA_TIME_AFTER_AS_OF = "advisory: TSA time is later than the check time (as_of)"
 NOTE_TSA_TIME_AFTER_AS_OF = "tsa_time_after_as_of"
+#: SPEC 13.6 / 13.7 item 4: origin holds only through the archive rescue of an aged seal signature (7.13); the
+#: verdict's `origin_basis` is "archived-before:<t0>".
+NOTE_ORIGIN_ARCHIVE_RESCUE = "origin_archive_rescue"
 #: SPEC 13.4.1 "Derived default": the receiver policy pins TSAs but states `require_signoff_timestamps: false`, so a
 #: sign-off without an accepted token (its token may have been deleted) is not rejected by row 12.
 NOTE_SIGNOFF_TIMESTAMPS_NOT_REQUIRED = "signoff_timestamps_not_required"
@@ -3162,12 +3166,20 @@ def _future_advisory(reports: list[dict], tok: dict) -> list[dict]:
 
 
 def check_signoffs_v2(bundle: Any, seal: str | None, pins: dict[str, bool], members: dict, as_of: str,
-                      tok: dict | None = None) -> dict:
+                      tok: dict | None = None, archive: dict | None = None) -> dict:
     """SPEC 10.3.8, the verifier steps for a canon-3 bundle's `attestations`, run whatever the 13.1 state is.
 
     ``seal`` is the seal this verifier recomputed (None when the header cannot be canonicalized, so no entry can
-    match it); ``pins`` the effective pin set (key id -> effective demo flag); ``members`` the effective policy members.
+    match it); ``pins`` the effective pin set (key id -> effective demo flag); ``members`` the effective policy members;
+    ``archive`` the archive dimension (10.8.6) that may rescue an aged entry (step 7), or None.
     Returns the library output of 10.3.8: ``{state, checked, problems, entries}``."""
+    return _signoffs_finish(_signoffs_check(bundle, seal, pins, members, as_of, tok), as_of, archive)
+
+
+def _signoffs_check(bundle: Any, seal: str | None, pins: dict[str, bool], members: dict, as_of: str,
+                    tok: dict | None) -> dict:
+    """10.3.8 steps 1 to 6 and 9: every public-key operation of the sign-offs (charged in the TT-15 order before the
+    seal and archive tokens). `_signoffs_finish` applies step 7, which reads the archive, and steps 8 and 10 to 13."""
     b = bundle if isinstance(bundle, dict) else {}
     if "attestations" not in b:                                                     # step 1
         return signoffs_none()
@@ -3216,13 +3228,9 @@ def check_signoffs_v2(bundle: Any, seal: str | None, pins: dict[str, bool], memb
                 problems.append("a timestamp token of the entry is " + "/".join(sorted({t["class"] for t in bad}))
                                 + " (SPEC 10.3.8 step 6, TT-42): "
                                 + "; ".join(f"token {t['index']}: {t['problems'][0]}" for t in bad if t["problems"]))
-        if shape_ok and (hash_aged or _aged(members.get("suites", {}).get(d["alg"]), as_of)):   # step 7
-            problems.append(f"the entry's suite {d['alg']} or its hash sha256 is aged at as_of {as_of} and no archive "
-                            "rescues it (SPEC 7.13, 10.3.8 step 7)")
-        state = "invalid" if problems else ("valid" if supported else "not_checked")   # step 8
-        if state == "not_checked":
-            problems = [f"not checked (suite {d['alg']} not supported by this verifier)"]
-        entries.append({"index": i, "entry_sha256": digests[i], "state": state,
+        aged_untils = (_aged_untils(members, d["alg"], as_of)
+                       if shape_ok and (hash_aged or _aged(members.get("suites", {}).get(d["alg"]), as_of)) else [])
+        entries.append({"index": i, "entry_sha256": digests[i], "state": None,
                         "role": d.get("role"), "meaning": d.get("meaning"), "key_id": kid,
                         "signer_id": d.get("signer_id"), "printed_name": d.get("printed_name"),
                         "signed_at": d.get("signed_at"), "self_verify": None, "time_ok": None, "roster": None,
@@ -3231,7 +3239,24 @@ def check_signoffs_v2(bundle: Any, seal: str | None, pins: dict[str, bool], memb
                         "reviewed_copy": d.get("reviewed_copy"),
                         "prior": list(d["prior"]) if shape_ok else None,
                         "tokens": _tsp.public(tokens), "time_bound": None, "problems": problems,
-                        "_shape_ok": shape_ok, "_tokens": tokens})
+                        "_shape_ok": shape_ok, "_tokens": tokens, "_supported": supported, "_aged": aged_untils})
+    return {"b": b, "entries": entries, "pins": pins, "members": members, "roster": roster, "holder": holder}
+
+
+def _signoffs_finish(ctx: dict, as_of: str, archive: dict | None) -> dict:
+    """10.3.8 steps 7, 8 and 10 to 13 over the entries of `_signoffs_check` (or its early result, returned as is)."""
+    if "entries" not in ctx or "b" not in ctx:
+        return ctx
+    b, entries, pins, members = ctx["b"], ctx["entries"], ctx["pins"], ctx["members"]
+    roster, holder = ctx["roster"], ctx["holder"]
+    listed = (archive.get("_listed") or []) if isinstance(archive, dict) else []
+    for x in entries:
+        if x["_aged"] and not _rescued(archive, x["_aged"], x["entry_sha256"] in listed, members):   # step 7
+            x["problems"].append(f"the entry's suite {x['alg']} or its hash sha256 is aged at as_of {as_of} and the "
+                                 "archive does not rescue it (SPEC 7.13, 10.3.8 step 7)")
+        x["state"] = "invalid" if x["problems"] else ("valid" if x["_supported"] else "not_checked")   # step 8
+        if x["state"] == "not_checked":
+            x["problems"] = [f"not checked (suite {x['alg']} not supported by this verifier)"]
     # step 10, distinctness: the originator key set and the originator signer ids
     orig_keys = set(_seal_signer_ids(b)) | set(members.get("originator_keys") or [])
     orig_ids = set(members.get("originator_signer_ids") or [])
@@ -3274,7 +3299,7 @@ def check_signoffs_v2(bundle: Any, seal: str | None, pins: dict[str, bool], memb
             x["roster"] = {"status": "pinned_key" if kid in pins else "unpinned_key", "person_id": None,
                            "name_differs": False, "signer_id_differs": False, "role_not_held": False}
     for x in entries:
-        del x["_shape_ok"], x["_tokens"]
+        del x["_shape_ok"], x["_tokens"], x["_supported"], x["_aged"]
     # step 13, the dimension's state from the entries alone (total precedence)
     if any(x["state"] == "invalid" for x in entries):
         state = "invalid"
@@ -3422,23 +3447,275 @@ def _time_dimension(bundle: Any, tok: dict) -> dict:
     return out("insufficient", reports)
 
 
-def _dims(bundle: Any, cv: int | None, integrity: bool, signoffs: dict, items: dict, time_out: dict) -> dict:
+# --- SPEC 10.8: the archive (initial stamp and timestamp-renewal chains) ---------------------------------------------
+
+_ARCHIVE_SCHEMA = "evidence.archive.v1"
+_ARCHIVE_OBJECT_SCHEMA = "evidence.archive.object.v1"
+_ARCHIVE_RENEWAL_SCHEMA = "evidence.archive.renewal.v1"
+_AR_HASH_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}", re.ASCII)
+_AR_MAX_DIGESTS = 256
+_AR_MAX_CHAINS = 4
+_AR_MAX_STAMPS = 64
+_AR_MAX_STAMP_TOKENS = 4
+AR_NOT_CHECKED_RESERVED = "not checked (reserved)"
+AR_NOT_CHECKED_AFTER_UNVERIFIED = "not checked (after an unverified stamp)"
+AR_STAMP0_UNVERIFIED = "chain 0 stamp 0 is unverified: no pinned TSA anchors the archive (AR-14)"
+
+
+def _archive_out(state: str, problems=(), not_covered=(), chains=()) -> dict:
+    return {"state": state, "t0": None, "t0_tsas": None, "min_tsas": None, "valid_until": None,
+            "continuous_at_as_of": None, "not_covered": list(not_covered), "chains": list(chains),
+            "problems": list(problems)}
+
+
+def _archive_structure_problem(ar: Any) -> str | None:
+    """AR-1 to AR-4, every rule but the token strings (checked after TT-13, so an oversized block decodes nothing)."""
+    if not (isinstance(ar, dict) and set(ar) == {"schema", "object", "chains"}):
+        return "archive must be an object with exactly the keys schema, object and chains (AR-1)"
+    if ar["schema"] != _ARCHIVE_SCHEMA:
+        return f"archive schema must be {_ARCHIVE_SCHEMA!r} (AR-1)"
+    obj = ar["object"]
+    if not (isinstance(obj, dict) and set(obj) == {"attestations"}):
+        return "archive object must be an object with exactly the key attestations (AR-2)"
+    att = obj["attestations"]
+    if not (isinstance(att, list) and len(att) <= _AR_MAX_DIGESTS and all(_is_digest(x) for x in att)):
+        return f"archive object.attestations must be an array of 0 to {_AR_MAX_DIGESTS} well-formed digests (AR-2)"
+    if any(not att[i] < att[i + 1] for i in range(len(att) - 1)):
+        return "archive object.attestations must be unique and sorted by code point (AR-2)"
+    chains = ar["chains"]
+    if not (isinstance(chains, list) and 1 <= len(chains) <= _AR_MAX_CHAINS):
+        return f"archive chains must be an array of 1 to {_AR_MAX_CHAINS} chains (AR-3)"
+    for i, ch in enumerate(chains):
+        if not (isinstance(ch, dict) and set(ch) == {"hash", "stamps"}):
+            return f"archive chain {i} must be an object with exactly the keys hash and stamps (AR-3)"
+        h = ch["hash"]
+        if not (isinstance(h, str) and _AR_HASH_RE.fullmatch(h)):
+            return f"archive chain {i} hash must match [a-z0-9][a-z0-9-]{{0,31}} (AR-3)"
+        if i == 0 and h != "sha256":
+            return "archive chain 0 hash must be 'sha256' (AR-3)"
+        if i > 0 and h == "sha256":
+            return f"archive chain {i} is a second sha256 chain; a later chain must use another hash (AR-3)"
+        st = ch["stamps"]
+        if not (isinstance(st, list) and 1 <= len(st) <= _AR_MAX_STAMPS):
+            return f"archive chain {i} stamps must be an array of 1 to {_AR_MAX_STAMPS} stamps (AR-4)"
+        for k, s in enumerate(st):
+            if not (isinstance(s, dict) and set(s) == {"format", "tokens"}):
+                return f"archive chain {i} stamp {k} must be an object with exactly the keys format and tokens (AR-4)"
+            if s["format"] != "rfc3161":
+                return f"archive chain {i} stamp {k} format must be 'rfc3161' (AR-4)"
+            if not (isinstance(s["tokens"], list) and 1 <= len(s["tokens"]) <= _AR_MAX_STAMP_TOKENS):
+                return (f"archive chain {i} stamp {k} tokens must be an array of 1 to {_AR_MAX_STAMP_TOKENS} strings "
+                        "(AR-4)")
+    return None
+
+
+def _archive_token_problem(ar: dict) -> str | None:
+    """AR-4: every token string of every chain meets TT-6 to TT-8 (a reserved chain's tokens are never decoded
+    further, AR-11)."""
+    for i, ch in enumerate(ar["chains"]):
+        for k, s in enumerate(ch["stamps"]):
+            for j, t in enumerate(s["tokens"]):
+                try:
+                    _tsp.strict_b64(t, _tsp.TOKEN_MAX_CHARS, "token", _tsp.TOKEN_MAX_BYTES)
+                except _tsp.Malformed as exc:
+                    return f"archive chain {i} stamp {k} token {j}: {exc} (AR-4)"
+    return None
+
+
+def _present_entry_digests(bundle: dict) -> list[str]:
+    """The entry digests (10.3.7 `entry_sha256`) of every entry present in `attestations`, in order, each once."""
+    atts = bundle.get("attestations")
+    out: list[str] = []
+    for e in atts if isinstance(atts, list) else []:
+        d = _entry_sha256(e) if isinstance(e, dict) else None
+        if d is not None and d not in out:
+            out.append(d)
+    return out
+
+
+def _archive_object(bundle: dict, listed: list[str]) -> tuple[bytes | None, str | None]:
+    """AR-7: (AO, None), or (None, the problem) when a seal token has no token_id."""
+    ids: list[str] = []
+    if "timestamps" in bundle:
+        ts = bundle["timestamps"]
+        if not (isinstance(ts, list) and 1 <= len(ts) <= 16):
+            return None, "timestamps is not an array of 1 to 16 tokens, so the archived object cannot be formed (AR-7)"
+        for i, e in enumerate(ts):
+            if not (isinstance(e, dict) and set(e) == {"format", "token"} and e["format"] == "rfc3161"):
+                return None, f"seal token {i} is not a timestamps entry of TT-2, so it has no token_id (AR-7)"
+            try:
+                ids.append(_tsp.parse_token_text(e["token"]).token_id)
+            except _tsp.Malformed as exc:
+                return None, f"seal token {i} has no token_id ({exc}) (AR-7)"
+    blocks = [bundle.get("signature")] + (bundle.get("signatures") if isinstance(bundle.get("signatures"), list)
+                                           else [])
+    ao = _canon({"schema": _ARCHIVE_OBJECT_SCHEMA, "bundle_sha256": bundle.get("bundle_sha256"),
+                 "signatures": [blk.get("signature") if isinstance(blk, dict) else None for blk in blocks],
+                 "timestamps": ids, "attestations": list(listed)})
+    return ao, None
+
+
+def _stamp_end(acc: list[dict], pins: dict[str, dict], members: dict) -> tuple[str | None, str | None]:
+    """AR-12: the end e_k = (u_k, d_k) of an accepted stamp, from its accepted token reports ``acc``."""
+    us: list[str] = []
+    ds: list[str] = []
+    for r in acc:
+        p = pins[r["tsa"]]
+        if p["trusted_until"] is not None:
+            us.append(p["trusted_until"])
+        if p["distrusted_after"] is not None:
+            ds.append(p["distrusted_after"])
+    names = [("suites", r["_suite"]) for r in acc] + [("hashes", r["_digest"]) for r in acc] + [("hashes", "sha256")]
+    for table, name in names:
+        e = (members.get(table) or {}).get(name)
+        if isinstance(e, dict) and e.get("trusted_until") is not None:
+            us.append(e["trusted_until"])
+    return (min(us) if us else None), (min(ds) if ds else None)
+
+
+def _within(inst: tuple[int, str], end: tuple[str | None, str | None]) -> bool:
+    """AR-12 "within": `trusted_until` inclusive, `distrusted_after` exclusive, as exact instants."""
+    u, d = end
+    return (u is None or inst <= _tsp.utc_instant(u)) and (d is None or inst < _tsp.utc_instant(d))
+
+
+def _archive_dimension(bundle: Any, tok: dict, members: dict, as_of: str) -> dict:
+    """SPEC 10.8 (AR-1 to AR-16) for a canon-3 bundle: {state, t0, t0_tsas, valid_until, continuous_at_as_of,
+    not_covered, chains, problems} (AR-15), evaluated in the steps of AR-16. ``_t0`` (internal) is t0's exact instant,
+    for the rescue of 7.13; the caller removes it from the library output."""
+    b = bundle if isinstance(bundle, dict) else {}
+    if not tok["check"]:
+        return _archive_out("not_checked")                                         # TT-36
+    if "archive" not in b:
+        return _archive_out("none")
+    ar = b["archive"]
+    why = _archive_structure_problem(ar)                                            # AR-16 step 1
+    if why is None and tok["over_cap"]:
+        why = (f"the bundle carries more than {_tsp.MAX_TOKENS} timestamp tokens in total; none is evaluated "
+               "(SPEC 10.7.4 TT-13)")
+    if why is None:
+        why = _archive_token_problem(ar)
+    if why is not None:
+        return _archive_out("malformed", [why])
+    stamps = ar["chains"][0]["stamps"]
+    parsed: list[list] = []
+    for k, st in enumerate(stamps):                                                 # step 2
+        row = []
+        for j, s in enumerate(st["tokens"]):
+            try:
+                row.append(_tsp.parse_token_text(s))
+            except _tsp.Malformed as exc:
+                return _archive_out("malformed", [f"chain 0 stamp {k} token {j} is malformed: {exc} (AR-5)"])
+        parsed.append(row)
+    listed = ar["object"]["attestations"]                                           # step 3
+    present = _present_entry_digests(b)
+    not_covered = [d for d in present if d not in listed]
+    ao, why = _archive_object(b, listed)
+    problems = [why] if why else []
+    excised = [d for d in listed if d not in present]
+    if excised:
+        problems.append(f"the archive lists {len(excised)} sign-off(s) not present in attestations, the first "
+                        f"{excised[0]}: a listed sign-off was excised (AR-8)")
+    if problems:
+        return _archive_out("broken", problems, not_covered)
+    pins = {p["id"]: p for p in tok["tsas"]}                                        # step 4
+    imprint = hashlib.sha256(ao).digest()
+    reports: list[list[dict]] = []
+    for k, st in enumerate(stamps):
+        if k > 0:
+            imprint = hashlib.sha256(_canon({"schema": _ARCHIVE_RENEWAL_SCHEMA,
+                                             "previous": [{"token_id": t.token_id, "sig": _tsp.signature_digest(t)}
+                                                          for t in parsed[k - 1]]})).digest()
+        reports.append([_tsp.classify_token({"format": "rfc3161", "token": s}, j, imprint, tok["tsas"],
+                                            allow_ess_v1=tok["allow_ess_v1"], aged=None)
+                        for j, s in enumerate(st["tokens"])])
+    rows = []                                                                       # step 5: AR-12
+    for reps in reports:
+        classes = {r["class"] for r in reps}
+        cls = ("malformed" if "malformed" in classes else "invalid" if "invalid" in classes
+               else "accepted" if "accepted" in classes else "unverified")
+        row = {"class": cls, "time": None, "tsas": [], "tokens": _tsp.public(reps), "problems": [],
+               "_t": None, "_end": None}
+        if cls == "accepted":
+            acc = [r for r in reps if r["class"] == "accepted"]
+            best = max(acc, key=lambda r: r["_instant"])
+            # `tsas` lists the accepted pin ids; the stamp's TSA COUNT is its distinct key identities (10.8.6)
+            row.update(time=best["gen_time"], tsas=sorted({r["tsa"] for r in acc}), _t=best["_instant"],
+                       _end=_stamp_end(acc, pins, members), _ntsas=_tsp.distinct_tsas(acc))
+        rows.append(row)
+    m1 = next((k for k, r in enumerate(rows) if r["class"] == "unverified"), len(rows))   # AR-13: m + 1
+    for r in rows[m1 + 1:]:
+        r["problems"].append(AR_NOT_CHECKED_AFTER_UNVERIFIED)
+    gaps: list[str] = []
+    for k in range(1, m1):
+        prev, cur = rows[k - 1], rows[k]
+        if prev["class"] != "accepted" or cur["class"] != "accepted":
+            continue                                       # a malformed or invalid stamp decides the state below
+        if cur["_t"] < prev["_t"]:
+            cur["problems"].append(f"stamp time {cur['time']} is earlier than stamp {k - 1}'s {prev['time']} (AR-13)")
+        elif not _within(cur["_t"], prev["_end"]):
+            u, d = (x if x is not None else "null" for x in prev["_end"])
+            cur["problems"].append(f"stamp time {cur['time']} is not within stamp {k - 1}'s end (trusted_until {u}, "
+                                   f"distrusted_after {d}): the chain has a gap (AR-13)")
+        gaps += [f"chain 0 stamp {k}: {p}" for p in cur["problems"]]
+    chains = [{"hash": "sha256", "checked": True, "problems": [],
+               "stamps": [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]}]
+    chains += [{"hash": ch["hash"], "checked": False, "problems": [AR_NOT_CHECKED_RESERVED], "stamps": []}
+               for ch in ar["chains"][1:]]                                          # AR-11
+    classes_k = [r["class"] for r in rows]
+    if "malformed" in classes_k:                                                    # AR-14
+        k = classes_k.index("malformed")
+        return _archive_out("malformed", [f"chain 0 stamp {k} has a malformed token (AR-5)"], not_covered, chains)
+    if "invalid" in classes_k:
+        k = classes_k.index("invalid")
+        return _archive_out("broken", [f"chain 0 stamp {k} is invalid (AR-14)"], not_covered, chains)
+    if gaps:
+        return _archive_out("broken", gaps, not_covered, chains)
+    if m1 == 0:
+        return _archive_out("not_checked", [AR_STAMP0_UNVERIFIED], not_covered, chains)
+    first, last = rows[0], rows[m1 - 1]
+    u, d = last["_end"]
+    out = _archive_out("valid", [], not_covered, chains)
+    out.update(t0=first["time"], t0_tsas=first["_ntsas"], min_tsas=min(r["_ntsas"] for r in rows[:m1]),
+               valid_until={"trusted_until": u, "distrusted_after": d},
+               continuous_at_as_of=(u is None or as_of <= u) and (d is None or as_of < d), _t0=first["_t"],
+               _listed=list(listed))
+    return out
+
+
+def _rescued(archive: dict | None, untils: list[str], covered: bool, members: dict) -> bool:
+    """SPEC 7.13 "Archive rescue" of a signature whose aged suite and hash have the `trusted_until` values ``untils``:
+    the archive is `valid` and continuous at as_of, EVERY stamp of its verified prefix has at least `min_archive_tsas`
+    TSAs (`min_tsas`), t0 <= T_aged (the earliest of ``untils``, as exact instants) and the signature is covered by the
+    archived object."""
+    return (covered and archive is not None and archive["state"] == "valid" and archive["continuous_at_as_of"] is True
+            and archive["min_tsas"] >= members.get("min_archive_tsas", 1) and bool(untils)
+            and archive["_t0"] <= _tsp.utc_instant(min(untils)))
+
+
+def _aged_untils(members: dict, alg: Any, as_of: str) -> list[str]:
+    """The `trusted_until` of the signature suite ``alg`` and of `sha256`, each only if it has aged (7.13)."""
+    out = []
+    for table, name in (("suites", alg), ("hashes", "sha256")):
+        e = (members.get(table) or {}).get(name) if isinstance(name, str) else None
+        if _aged(e, as_of):
+            out.append(e["trusted_until"])
+    return out
+
+
+def _dims(cv: int | None, signoffs: dict, items: dict, time_out: dict, archive_out: dict) -> dict:
     """The v4 dimensions (SPEC 13.7 item 4) as runner protocol v2 reports them (`dims`), plus `items` (6.6.8).
 
     - canon 1/2 (13.4.6): `signoffs` is `invalid` exactly when the v1 attestation check fails, `ok` when a valid block
       has an entry, else `none`; `time` and `archive` are `none`.
-    - canon 3: `signoffs` is the state of 10.3.8 (`check_signoffs_v2`) and `time` that of 10.7.7
-      (`_time_dimension`). This release checks no archive: an absent block reads `none`; a PRESENT one cannot be
-      checked here and reads fail-closed (`malformed` once integrity holds, else `not_checked`, 13.7 table), so the
-      default policy rejects it (13.4.3 row 17; 13.4.5 "a timestamp or archive that is present but invalid or
-      malformed").
+    - canon 3: `signoffs` is the state of 10.3.8 (`check_signoffs_v2`), `time` that of 10.7.7 (`_time_dimension`) and
+      `archive` that of 10.8.6 (`_archive_dimension`).
     - canon >= 4, or an unreadable header: `signoffs: none`, `time: not_checked`, `archive: not_checked` (11.6)."""
-    b = bundle if isinstance(bundle, dict) else {}
     if cv in (1, 2):
         return {"signoffs": signoffs["state"], "time": "none", "archive": "none", "items": items}
     if cv == 3:
-        archive = "not_checked" if not integrity else ("malformed" if "archive" in b else "none")
-        return {"signoffs": signoffs["state"], "time": time_out["state"], "archive": archive, "items": items}
+        return {"signoffs": signoffs["state"], "time": time_out["state"], "archive": archive_out["state"],
+                "items": items}
     return {"signoffs": "none", "time": "not_checked", "archive": "not_checked", "items": items}
 
 
@@ -3592,6 +3869,50 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
     # the pin set this verdict was made under (13.4.1): the caller's, or the single-pin path's pin plus the built-in
     # demo pins (`_default_pin_set`)
     eff_pins = pin_set if pin_set is not None else _default_pin_set(effective_pin, bool(demo_pin))
+    # SPEC 10.3 / 13.4.6 / 11.6: the `signoffs` dimension. Canon 3: the 10.3.8 procedure over the recomputed seal,
+    # whatever the integrity verdict. Canon 1/2: the v3 result mapped (13.4.6). Canon >= 4 or no readable header:
+    # `{state: none, checked: false}`.
+    cv = canon_info.get("version")
+    tok = _token_context(bundle, members, as_of, integrity_ok) if cv == 3 else None
+    if cv == 3:
+        try:
+            seal = _sha(_canon(bundle["sha256sums"])) if isinstance(bundle.get("sha256sums"), dict) else None
+        except (TypeError, ValueError, RecursionError):
+            seal = None
+        try:
+            signoffs = _signoffs_check(bundle, seal, eff_pins, members, as_of, tok)    # 10.3.8 steps 1-6 (charged)
+        except (MemoryError, RecursionError) as exc:
+            signoffs = {"state": "invalid", "checked": True, "entries": [],
+                        "problems": [_RESOURCE_PROBLEM.format(type(exc).__name__)]}
+    elif cv in (1, 2):
+        signoffs = {"state": "invalid" if attestation_problems else ("ok" if attestations else "none"),
+                    "checked": True, "problems": list(attestation_problems), "entries": []}
+    else:
+        signoffs = signoffs_none(checked=False)
+    # SPEC 10.7.7: the `time` dimension over the seal tokens (canon 3); `none` for v3 input, `not_checked` for a
+    # newer canon (TT-36, 11.6)
+    if cv == 3:
+        time_out = _time_dimension(bundle, tok)
+    else:
+        time_out = {"state": "none" if cv in (1, 2) else "not_checked", "bound": None, "distinct_tsas": None,
+                    "tokens": [], "problems": [], "notes": []}
+    # SPEC 10.8: the `archive` dimension (canon 3), its tokens charged after the seal tokens (TT-15, AR-16); `none` for
+    # v3 input, `not_checked` for a newer canon (TT-36, 11.6)
+    if cv == 3:
+        try:
+            archive_out = _archive_dimension(bundle, tok, members, as_of)
+        except (MemoryError, RecursionError) as exc:
+            archive_out = _archive_out("malformed", [_RESOURCE_PROBLEM.format(type(exc).__name__)])
+        try:
+            signoffs = _signoffs_finish(signoffs, as_of, archive_out)       # 10.3.8 steps 7-13 (7: archive rescue)
+        except (MemoryError, RecursionError) as exc:
+            signoffs = {"state": "invalid", "checked": True, "entries": [],
+                        "problems": [_RESOURCE_PROBLEM.format(type(exc).__name__)]}
+        attestation_problems = list(signoffs["problems"]) + [
+            f"attestation[{x['index']}]: {pr}" for x in signoffs["entries"] if x["state"] == "invalid"
+            for pr in x["problems"]]
+    else:
+        archive_out = _archive_out("none" if cv in (1, 2) else "not_checked")
     v4_blocks = sig_info.get("v4_blocks")
     if v4_blocks is not None:
         # SPEC 7.12-7.14 for v4 input: E evaluated per 7.10 (G1-G6 in `_check_seal_signatures`), origin per 7.13
@@ -3600,9 +3921,10 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
         if pin_set is None and _malformed:
             origin_problems.append(_MALFORMED_PIN_PROBLEM)
             pins_v4 = {}
-        signers, origin_ok, key_matches_pin, demo_pin = _v4_origin(
-            v4_blocks, pins_v4, members, as_of, integrity_ok, profile_declares_demo, origin_problems)
+        signers, origin_ok, key_matches_pin, demo_pin, origin_basis = _v4_origin(
+            v4_blocks, pins_v4, members, as_of, integrity_ok, profile_declares_demo, origin_problems, archive_out)
     else:
+        origin_basis = "current"
         if demo_pin and key_matches_pin:
             origin_problems.append("pinned key is the public demo identity; origin cannot be established")
         origin_ok = integrity_ok and not origin_problems
@@ -3623,36 +3945,6 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
         state = STATE_INTEGRITY_ONLY_DEMO
     else:
         state = STATE_INTEGRITY_ONLY
-    # SPEC 10.3 / 13.4.6 / 11.6: the `signoffs` dimension. Canon 3: the 10.3.8 procedure over the recomputed seal,
-    # whatever the integrity verdict. Canon 1/2: the v3 result mapped (13.4.6). Canon >= 4 or no readable header:
-    # `{state: none, checked: false}`.
-    cv = canon_info.get("version")
-    tok = _token_context(bundle, members, as_of, integrity_ok) if cv == 3 else None
-    if cv == 3:
-        try:
-            seal = _sha(_canon(bundle["sha256sums"])) if isinstance(bundle.get("sha256sums"), dict) else None
-        except (TypeError, ValueError, RecursionError):
-            seal = None
-        try:
-            signoffs = check_signoffs_v2(bundle, seal, eff_pins, members, as_of, tok)
-        except (MemoryError, RecursionError) as exc:
-            signoffs = {"state": "invalid", "checked": True, "entries": [],
-                        "problems": [_RESOURCE_PROBLEM.format(type(exc).__name__)]}
-        attestation_problems = list(signoffs["problems"]) + [
-            f"attestation[{x['index']}]: {pr}" for x in signoffs["entries"] if x["state"] == "invalid"
-            for pr in x["problems"]]
-    elif cv in (1, 2):
-        signoffs = {"state": "invalid" if attestation_problems else ("ok" if attestations else "none"),
-                    "checked": True, "problems": list(attestation_problems), "entries": []}
-    else:
-        signoffs = signoffs_none(checked=False)
-    # SPEC 10.7.7: the `time` dimension over the seal tokens (canon 3); `none` for v3 input, `not_checked` for a
-    # newer canon (TT-36, 11.6)
-    if cv == 3:
-        time_out = _time_dimension(bundle, tok)
-    else:
-        time_out = {"state": "none" if cv in (1, 2) else "not_checked", "bound": None, "distinct_tsas": None,
-                    "tokens": [], "problems": [], "notes": []}
     # SPEC 13.7 item 4 `notes` (advisory codes, never a state): a TSA time later than as_of, on a seal token or a
     # sign-off token
     if time_out["notes"] or any(TSA_TIME_AFTER_AS_OF in (t.get("problems") or []) for x in signoffs["entries"]
@@ -3661,6 +3953,8 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
     # 13.4.1 "Derived default": the policy pins TSAs and states require_signoff_timestamps false
     if cv == 3 and members.get("tsas") and members.get("require_signoff_timestamps") is False:
         notes = notes + [NOTE_SIGNOFF_TIMESTAMPS_NOT_REQUIRED]
+    if origin_basis != "current":
+        notes = notes + [NOTE_ORIGIN_ARCHIVE_RESCUE]
     signer_alg = (sig_info.get("primary") or {}).get("alg") or "ed25519"
     try:
         signer_kid = key_id(signer_alg, signer) if isinstance(signer, str) else None
@@ -3689,7 +3983,7 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
         # SPEC 7.15 (v4 output; for v3 input added beside the v3 fields): one entry per block of E, the basis of the
         # origin answer, and the evaluation instant
         "signers": signers,
-        "origin_basis": "current",
+        "origin_basis": origin_basis,
         "as_of": as_of,
         # SPEC 7.10 G6 / SIG-23: each S_nc block, "not checked (suite <alg> not supported by this verifier)"
         "signatures_not_checked": sig_info.get("not_checked", []),
@@ -3703,16 +3997,16 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
         "canon_version": canon_info.get("version"),
         "supported_canon_max": canon_info.get("supported_max", _CANON_SUPPORTED_MAX),
         "items": _items_report(v4_info.get("walk")),
-        "dims": _dims(bundle, cv, integrity_ok, signoffs, _items_report(v4_info.get("walk")), time_out),
+        "dims": _dims(cv, signoffs, _items_report(v4_info.get("walk")), time_out, archive_out),
         # SPEC 10.3.8 library output (v4 entries; for v3 input the 13.4.6 mapping, with the v1 entries in
         # `attestations`)
         "signoffs": signoffs,
         # SPEC 10.7.7 TT-39: {state, bound, distinct_tsas, tokens}
         "time": time_out,
+        # SPEC 10.8.6 AR-15: {state, t0, t0_tsas, valid_until, continuous_at_as_of, not_covered, chains}
+        "archive": {k: v for k, v in archive_out.items() if not k.startswith("_")},
         "notes": notes,
         "note_details": {NOTE_COMMITTED_KEY_PLAIN_DATA: plain} if plain else {},
-        # v4 unsigned blocks this release reports but does not check (the archive)
-        "unchecked_blocks": v4_info.get("unchecked_blocks", []),
     }
     # SPEC 7.15 / 13.3: the `signers` output is asserted through runner protocol v2 `expect_dims` (vector:
     # valid/v4_ed25519_plus_p256.json), so the dims carry it beside `items`
@@ -3743,13 +4037,15 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
 
 
 def _v4_origin(blocks: list[dict], pins: dict[str, bool], members: dict, as_of: str, integrity_ok: bool,
-               all_demo: bool, origin_problems: list[str]) -> tuple[list[dict], bool, bool, bool]:
-    """SPEC 7.12 to 7.14 for v4 input. Returns (signers, origin_ok, key_matches_pin, demo_match).
+               all_demo: bool, origin_problems: list[str],
+               archive: dict | None = None) -> tuple[list[dict], bool, bool, bool, str]:
+    """SPEC 7.12 to 7.14 for v4 input. Returns (signers, origin_ok, key_matches_pin, demo_match, origin_basis).
 
     - 7.12 "Key matches pin": "at least one verified S_sup block has a key id in the pin set (demo or not)".
     - 7.13 "Counted entry": a verified S_sup block whose key id is pinned by a non-demo pin and, SIG-30, whose suite and
-      `sha256` (the seal hash, and e for P-256) are not aged at `as_of`, or are rescued. Rescue needs a `valid`
-      archive dimension (10.8.6), which this release does not compute, so an aged entry is never rescued here.
+      `sha256` (the seal hash, and e for P-256) are not aged at `as_of`, or are rescued by the ``archive`` dimension
+      (`_rescued`: valid, continuous at as_of, t0 <= T_aged, `min_archive_tsas`; every seal signature is covered).
+    - 7.15 `origin_basis`: "archived-before:<t0>" when a counted entry relied on rescue, else "current".
     - SIG-31: origin iff integrity, (a) at least `origin_quorum` distinct counted entries, (b) every suite in
       `require_seal_suites` is the suite of a counted entry (a reserved or unknown suite never is), (c) aging.
     - SIG-32: aging never relaxes G4 (an aged block that does not verify already failed integrity).
@@ -3762,9 +4058,11 @@ def _v4_origin(blocks: list[dict], pins: dict[str, bool], members: dict, as_of: 
         pinned = b["key_id"] in pins
         demo = pinned and (pins[b["key_id"]] or all_demo)
         aged = hash_aged or _aged(members["suites"].get(b["alg"]), as_of)
-        counted = integrity_ok and verified and pinned and not demo and not aged
+        rescued = aged and _rescued(archive, _aged_untils(members, b["alg"], as_of), True, members)
+        counted = integrity_ok and verified and pinned and not demo and (not aged or rescued)
         signers.append({"key_id": b["key_id"], "alg": b["alg"], "checked": b["checked"], "valid": b["valid"],
-                        "pinned": pinned, "demo": demo, "counted": counted, "_aged": aged})
+                        "pinned": pinned, "demo": demo, "counted": counted, "_aged": aged and not rescued,
+                        "_rescued": counted and rescued})
     matched = [e for e in signers if e["checked"] and e["valid"] and e["pinned"]]
     counted_ids = {e["key_id"] for e in signers if e["counted"]}
     counted_suites = {e["alg"] for e in signers if e["counted"]}
@@ -3788,9 +4086,11 @@ def _v4_origin(blocks: list[dict], pins: dict[str, bool], members: dict, as_of: 
                                    "; a reserved or unknown suite can never be satisfied by this verifier)")
         if demo_match and not counted_ids:
             origin_problems.append("pinned key is the public demo identity; origin cannot be established")
+    origin_ok = integrity_ok and not origin_problems
+    basis = f"archived-before:{archive['t0']}" if any(e["_rescued"] for e in signers) else "current"
     for e in signers:
-        del e["_aged"]
-    return signers, integrity_ok and not origin_problems, key_matches_pin, demo_match
+        del e["_aged"], e["_rescued"]
+    return signers, origin_ok, key_matches_pin, demo_match, basis
 
 
 def _v3_signers(primary: dict | None, pins: dict[str, bool], integrity_ok: bool, origin_ok: bool,

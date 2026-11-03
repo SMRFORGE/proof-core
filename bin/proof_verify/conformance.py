@@ -91,9 +91,11 @@ def _safe_vector_path(d: pathlib.Path, name) -> pathlib.Path:
     return resolved
 
 
-def _policy_entry(d: pathlib.Path, entry: dict, text: str, policy_fn, states: dict) -> tuple[bool, str]:
+def _policy_entry(d: pathlib.Path, entry: dict, text: str, policy_fn, states: dict,
+                  corpus_as_of: str | None = None) -> tuple[bool, str]:
     """Run one vector under its own policy file (an `expect: "policy"` vector, or a `valid` one that names a policy;
-    SPEC v4 13.3). Returns (ok, got)."""
+    SPEC v4 13.3), at the vector's `as_of`, else the manifest's `corpus_as_of` (13.3), so a vector whose answer
+    depends on time (aging, an archive's end) never reads the wall clock. Returns (ok, got)."""
     if policy_fn is None:
         return False, "not run (the vector has its own policy and no policy_fn was given)"
     try:
@@ -103,7 +105,9 @@ def _policy_entry(d: pathlib.Path, entry: dict, text: str, policy_fn, states: di
     except (OSError, KeyError, ValueError) as exc:
         return False, f"error: {exc}"
     try:
-        result = policy_fn(bundle, policy, entry.get("caller_pins"))
+        as_of = entry.get("as_of", corpus_as_of)
+        result = (policy_fn(bundle, policy, entry.get("caller_pins"), as_of=as_of) if as_of is not None
+                  else policy_fn(bundle, policy, entry.get("caller_pins")))
     except Exception as exc:  # noqa: BLE001 -- the verifier REFUSED the policy: right only when the vector expects that error
         kind = getattr(exc, "kind", None)
         if "expect_error" in entry:
@@ -134,11 +138,12 @@ def _policy_entry(d: pathlib.Path, entry: dict, text: str, policy_fn, states: di
     return True, "policy"
 
 
-def classify_with_policy(bundle, policy, caller_pins=None) -> dict:
+def classify_with_policy(bundle, policy, caller_pins=None, as_of=None) -> dict:
     """The reference verifier as a ``policy_fn`` for `run_conformance`: ``classify_bundle`` under the vector's
-    receiver policy and its out-of-policy caller pins (SPEC v4 draft 13.4.1 step 3)."""
+    receiver policy and its out-of-policy caller pins (SPEC v4 draft 13.4.1 step 3), at ``as_of`` (the vector's, or
+    the corpus's; None: the current time)."""
     from .verify import classify_bundle
-    return classify_bundle(bundle, policy=policy, pins=caller_pins)
+    return classify_bundle(bundle, policy=policy, pins=caller_pins, as_of=as_of)
 
 
 def _load_states(d: pathlib.Path) -> dict:
@@ -165,7 +170,7 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
     runner that gives the verifier the raw text. A battery with no applicable vector never certifies.
 
     'policy' vectors (runner protocol v2) carry their own receiver policy file. They run through ``policy_fn(bundle,
-    policy, caller_pins)``, which returns a classify_bundle-style dict or raises an exception whose ``kind`` names
+    policy, caller_pins, as_of=...)`` (the vector's `as_of`, else the manifest's `corpus_as_of`), which returns a classify_bundle-style dict or raises an exception whose ``kind`` names
     the refusal (``"policy"`` for a malformed policy, SPEC 13.4.1). Each must give exactly the state listed in
     ``expected_states.json`` beside the vectors directory, or be refused when it carries ``expect_error``. Without
     a ``policy_fn`` they are NOT RUN, which is a failure (13.3: "the others count as not run, which is a failure of
@@ -200,7 +205,7 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
                 failures.append({"file": entry["file"], "expected": "policy", "got": f"error: {exc}",
                                  "note": entry.get("note", "")})
                 continue
-            ok, got = _policy_entry(d, entry, text, policy_fn, states)
+            ok, got = _policy_entry(d, entry, text, policy_fn, states, manifest.get("corpus_as_of"))
             if ok:
                 passed += 1
             else:

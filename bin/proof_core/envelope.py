@@ -336,12 +336,13 @@ def _assert_sealed_provenance_honest(capability: str, core: dict, repro: dict, *
             f"({p.produced_by_open!r}) nor an explicit '{p.produced_by_external_prefix}<code>'; set one so the "
             "sealed origin cannot read as open-engine-derived when it is not")
     # STAT-TOLERANCE honesty: a sealed statistical band is only as honest as the sigma it is built on.
-    # `reproduce` bounds the re-run by `sigmas * hypot(sealed_sigma, fresh_sigma)`, so a sealed sigma that
+    # `reproduce` bounds the re-run by `sigmas * hypot(min(sealed_sigma, fresh_sigma), fresh_sigma)`, so a sealed sigma that
     # is absurd (sigma == the value; sigma_key pointing at the quantity or at an unrelated count) would
     # make ANY fresh value "reproduce". The consumer side falls back to an exact match on such a band
-    # (certify._stat_match); this belt refuses to MINT one in the first place. Same bounds both sides.
+    # (certify._stat_match); this belt refuses to MINT one in the first place. Same bounds both sides, and the same
+    # strict number rule (stat_number_problem): a string or boolean band, quantity or sigma is refused, not coerced.
     if tol.get("kind") == "stat":
-        problem = stat_tolerance_problem(tol, outputs)
+        problem = stat_number_problem(tol, outputs) or stat_tolerance_problem(tol, outputs)
         if problem:
             raise ValueError(f"{capability}: refusing to seal a stat reproduce_tolerance: {problem}")
     # PROVENANCE-SHAPE belt: the verifier's own required/optional provenance rules (not a second copy), so the
@@ -432,6 +433,35 @@ MAX_RELATIVE_SIGMA = 0.05
 
 def is_integrity_field(name: str) -> bool:
     return name in INTEGRITY_FIELDS or name.endswith("_sha256")
+
+
+def _json_number(value):
+    """``value`` as a float when it is a finite JSON number (an int or a float, never a bool), else None. A
+    statistical comparison never coerces a string such as "20.0" or a boolean with float(): either is a mismatch.
+    One definition for the mint belt (``stat_number_problem``) and reproduce (``certify._stat_match``)."""
+    if type(value) not in (int, float):
+        return None
+    try:
+        out = float(value)
+    except OverflowError:
+        return None
+    return out if math.isfinite(out) else None
+
+
+def stat_number_problem(tol: dict, outputs: dict) -> str | None:
+    """Why a stat tolerance's numbers would not survive reproduce's strict number rule (None = they do): the band
+    width ``sigmas``, the quantity and its 1-sigma must each be a finite JSON number, never a string or a boolean.
+    Reproduce treats a string or a boolean there as a mismatch (``certify._stat_match``), so the mint refuses to seal
+    one: the record would carry a band no honest re-run can ever be compared under. Names absent from ``outputs``
+    (and a malformed ``quantity`` / ``sigma_key``) are left to ``stat_tolerance_problem``."""
+    if _json_number(tol.get("sigmas")) is None:
+        return f"sigmas {tol.get('sigmas')!r} must be a finite JSON number (not a string or a boolean)"
+    if isinstance(outputs, dict):
+        for key in (tol.get("quantity"), tol.get("sigma_key")):
+            if isinstance(key, str) and key in outputs and _json_number(outputs[key]) is None:
+                return (f"{key!r} = {outputs[key]!r} must be a finite JSON number (not a string or a boolean); "
+                        "reproduce compares it as one")
+    return None
 
 
 def stat_tolerance_problem(tol: dict, outputs: dict) -> str | None:
