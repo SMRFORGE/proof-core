@@ -22,11 +22,11 @@ PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core <seal|verify|reprodu
 
 ## When to use it
 
-- **seal** — right after producing a result the agent will hand off, or that a
+- **seal**: right after producing a result the agent will hand off, or that a
   reviewer, a teammate, or a future reader must be able to trust and re-check.
-- **verify** — to confirm a bundle you were handed is unaltered (and, under a real
+- **verify**: to confirm a bundle you were handed is unaltered (and, under a real
   pinned key, that it came from the expected signer).
-- **reproduce** — to re-run the work on the bundle's own sealed inputs and confirm the
+- **reproduce**: to re-run the work on the bundle's own sealed inputs and confirm the
   result comes out the same.
 
 ## seal
@@ -64,17 +64,22 @@ Exit codes:
 
 | code | meaning |
 |---|---|
-| 0 | integrity + origin — a production origin pass (`production_origin_pass: true`) |
-| 1 | FAIL — edited, forged, malformed, or an invalid human sign-off |
+| 0 | integrity + origin: a production origin pass (`production_origin_pass: true`) |
+| 1 | FAIL: edited, forged, malformed, an invalid human sign-off, a receiver policy that rejects the bundle for another reason, or a failed chain walk |
 | 2 | the bundle could not be read, or a usage error |
-| 3 | integrity-only — unaltered and re-derivable, but origin NOT established |
-| 4 | unsupported canon — sealed under an encoding this verifier does not know; NOT a pass, use a newer verifier |
-| 6 | unsupported signature suite (`unsupported-alg`) — NOT a pass, use a newer verifier |
+| 3 | integrity-only: unaltered since signing, but origin NOT established (verify does not re-run anything) |
+| 4 | unsupported canon: sealed under an encoding this verifier does not know; NOT a pass, use a newer verifier |
+| 5 | chain incomplete or unknown, only with `--upstream`: an earlier bundle this one cites is missing or could not be checked; NOT a pass |
+| 6 | unsupported signature suite (`unsupported-alg`): NOT a pass, use a newer verifier |
 
 **Exit 3 is the normal result for the public build**, which pins a demo key anyone can
-sign under. It proves integrity, not origin — `production_origin_pass` is `false`. An
+sign under. It proves integrity, not origin; `production_origin_pass` is `false`. An
 automated origin gate MUST reject exit 3; it is not a production pass. Exit 0 is reachable
 only when a real production trust root is pinned (`--pubkey HEX` / a dialect profile).
+
+A bundle that cites earlier bundles (`derived_from`) is reported as `chain: not_checked`
+unless you pass them: `--upstream PATH` (a file or a folder of `*.json`, repeatable) walks the
+chain offline, and exit 5 means a link is missing or could not be checked.
 
 ## reproduce
 
@@ -103,8 +108,10 @@ tool by an ABSOLUTE path (or have it on PATH); a bare relative script name will 
 found. The runner/command is ALWAYS supplied here on the command line, never read from
 the bundle.
 
-Exit codes: `0` reproduced, `1` not reproduced (or integrity failed, so it was never
-re-run), `2` usage / unreadable bundle. `--json` emits a parseable verdict with the same
+Exit codes: `0` reproduced (`--runner`: the numbers and the sealed claim re-derive), `1` not
+reproduced (or integrity failed, so it was never re-run), `2` usage / unreadable bundle, `3`
+outputs reproduced but the sealed claims NOT re-derived (`--command` only; a partial result,
+never a pass). `--json` emits a parseable verdict with the same
 `kind`/`exit_code`/`state` fields.
 
 ## The honest boundary (state this plainly)

@@ -2,7 +2,7 @@
 
 `bin/proof_core/` and `bin/proof_verify/` are a **verbatim copy** of the two
 packages from the open proof-core repository. They are NEVER edited in this
-plugin — fixes go upstream, then re-vendor.
+plugin; fixes go upstream, then re-vendor.
 
 - **Upstream:** https://gitlab.com/proof-core/proof-core (MIT)
 - **Version:** 0.25.1
