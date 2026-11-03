@@ -24,6 +24,8 @@ import hashlib
 import re
 from typing import Any
 
+from . import _work
+
 # --- constants (SPEC v4 10.7.5; DER contents of each OBJECT IDENTIFIER, without the 06 tag and length) ----------
 OID_SIGNED_DATA = bytes.fromhex("2a864886f70d010702")          # 1.2.840.113549.1.7.2
 OID_TSTINFO = bytes.fromhex("2a864886f70d0109100104")          # 1.2.840.113549.1.9.16.1.4
@@ -951,6 +953,8 @@ def _classify(entry, index, imprint, pins, allow_ess_v1, aged) -> dict:
         _check_b(t, sel, rule, digest, imprint, allow_ess_v1, problems)
     except _Invalid as exc:
         return report(index, "invalid", [str(exc)] + problems, t, tsa)
+    except Malformed as exc:                    # TT-15: the B6 operation was refused by the work budget
+        return report(index, "malformed", [str(exc)] + problems, t, tsa)
     return report(index, "accepted", problems, t, tsa)
 
 
@@ -989,11 +993,15 @@ def _check_b(t: Token, sel: Cert, rule, digest: str | None, imprint: bytes, allo
         raise _Invalid("B4: only the ESS v1 signing-certificate attribute is present and allow_ess_v1 is false")
     elif t.ess_v1.cert_hash != hashlib.sha1(sel.der).digest():
         raise _Invalid("B4: ESSCertID (v1) certHash is not SHA-1 of the selected certificate")
+    # TT-15: the public-key operation of this token (B5 key decoding and B6) is one unit of the work budget, charged
+    # before any key arithmetic. A refused operation is not performed and the token is `malformed`.
+    if not _work.charge():
+        raise Malformed(f"B6: the signature check was {_work.REFUSED}")
     # B5. Key
     kind, key = _spki_key(sel.spki)
     if kind != family:
         raise _Invalid("B5: the key does not fit the signature algorithm")
-    # B6. Signature over the SA bytes (one unit of the work budget, TT-15)
+    # B6. Signature over the SA bytes
     h = _HASH_FN[digest](t.sa_bytes).digest()
     if family == "rsa":
         _rsa_verify(key, t.signature, DIGEST_INFO[digest] + h)

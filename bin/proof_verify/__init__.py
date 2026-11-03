@@ -3,12 +3,16 @@ nothing from the producer or any domain engine -- so a reviewer verifies a bundl
 none of the code that produced it, enforced by packaging, not promised."""
 from .verify import (
     DEMO_KEY_ID,
+    DEMO_KEY_IDS,
     P256_DEMO_KEY_ID,
     STATE_FAIL,
     STATE_INTEGRITY_ONLY,
     STATE_INTEGRITY_ONLY_DEMO,
     STATE_VERIFIED,
+    WORK_BUDGET_LIMIT,
     PolicyError,
+    WorkBudget,
+    WorkBudgetExceeded,
     classify_bundle,
     derived_from_problems,
     index_upstreams,
@@ -28,12 +32,16 @@ from .verify import (
 
 __all__ = [
     "DEMO_KEY_ID",
+    "DEMO_KEY_IDS",
     "P256_DEMO_KEY_ID",
     "STATE_FAIL",
     "STATE_INTEGRITY_ONLY",
     "STATE_INTEGRITY_ONLY_DEMO",
     "STATE_VERIFIED",
+    "WORK_BUDGET_LIMIT",
     "PolicyError",
+    "WorkBudget",
+    "WorkBudgetExceeded",
     "classify_bundle",
     "derived_from_problems",
     "index_upstreams",

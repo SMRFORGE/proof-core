@@ -40,7 +40,9 @@ import sys
 from decimal import Decimal
 from typing import Any
 
+from . import _work
 from . import tsp as _tsp
+from ._work import WORK_BUDGET_LIMIT, WorkBudget, WorkBudgetExceeded  # noqa: F401 -- the TT-15 API
 
 
 def safe_text(text: Any) -> str:
@@ -324,6 +326,9 @@ def key_id(alg: str, public_key_hex: str) -> str:
 DEMO_KEY_ID = key_id("ed25519", _DEMO_PUBKEY)
 P256_DEMO_KEY_ID = key_id("ecdsa-p256", _P256_DEMO_PUBKEY)
 _DEMO_KEY_IDS = frozenset({DEMO_KEY_ID, P256_DEMO_KEY_ID})
+#: Public: the key ids of every published demo key (SPEC section 2), for product layers applying SIG-28 to their own
+#: pins (proof-mcp server pins).
+DEMO_KEY_IDS = _DEMO_KEY_IDS
 #: The built-in demo pins (SPEC 7.12 / 13.4.1 step 3: "the CLI's built-in demo pin"): every demo key, as a demo pin.
 #: Pinning a demo key can never grant origin (SIG-28), so the built-in set only names demo-signed bundles as such.
 BUILTIN_DEMO_PINS = ({"key_id": DEMO_KEY_ID, "demo": True}, {"key_id": P256_DEMO_KEY_ID, "demo": True})
@@ -1709,12 +1714,21 @@ def _p256_verify(signature: bytes, msg: bytes, pubkey: bytes) -> bool:
 _ALG_SUPPORTED_V4 = frozenset({"ed25519", "ecdsa-p256"})
 
 
-def _suite_verify(alg: str, public_key_hex: str, msg: bytes, sig_hex: str) -> bool:
-    """7.3 or 7.6 on hex fields that already passed their suite row. Never raises."""
+def _suite_verify(alg: str, public_key_hex: str, msg: bytes, sig_hex: str) -> bool | None:
+    """7.3 or 7.6 on hex fields that already passed their suite row, as one unit of the work budget (TT-15). Returns
+    None when the budget refuses the operation, which is then not performed. Never raises."""
     try:
         pk, sig = bytes.fromhex(public_key_hex), bytes.fromhex(sig_hex)
     except (ValueError, TypeError):
         return False
+    if alg not in _ALG_SUPPORTED_V4:
+        return False
+    if not _work.charge():
+        return None
+    return _suite_math(alg, pk, msg, sig)
+
+
+def _suite_math(alg: str, pk: bytes, msg: bytes, sig: bytes) -> bool:
     if alg == "ed25519":
         return _ed25519_verify(sig, msg, pk)
     if alg == "ecdsa-p256":
@@ -1722,7 +1736,8 @@ def _suite_verify(alg: str, public_key_hex: str, msg: bytes, sig_hex: str) -> bo
     return False
 
 
-def verify_signature(alg: str, public_key_hex: str, msg_bytes: bytes, sig_hex: str) -> bool | None:
+def verify_signature(alg: str, public_key_hex: str, msg_bytes: bytes, sig_hex: str, *,
+                     work_budget: WorkBudget | None = None) -> bool | None:
     """SPEC 7.15: the domain-neutral signature check both reference verifiers export, so a product layer that signs
     with these suites applies the same encoding gates as the seal check.
 
@@ -1733,7 +1748,11 @@ def verify_signature(alg: str, public_key_hex: str, msg_bytes: bytes, sig_hex: s
       **None**, "not checked" (SIG-2: the hex of any other suite is never verified and never treated as checked).
       None is falsy on purpose, so a caller that tests the result for truth fails closed.
     - anything malformed (a non-token ``alg``, a hex field off its row, a non-bytes message): False.
-    Never raises."""
+
+    ``work_budget`` (TT-15): the `WorkBudget` of the verification this check belongs to, the one passed to
+    `classify_bundle`. A check that reaches the arithmetic is charged to it first; when that would make the count
+    exceed 2,048 the check is not performed and `WorkBudgetExceeded` is raised. With no budget the check is not
+    counted. Otherwise never raises."""
     if not (isinstance(alg, str) and _ALG_TOKEN_RE.fullmatch(alg) and isinstance(public_key_hex, str)
             and isinstance(sig_hex, str) and isinstance(msg_bytes, (bytes, bytearray))):
         return False
@@ -1743,7 +1762,16 @@ def verify_signature(alg: str, public_key_hex: str, msg_bytes: bytes, sig_hex: s
         return False
     if alg not in _ALG_SUPPORTED_V4:
         return None
-    return _suite_verify(alg, public_key_hex, bytes(msg_bytes), sig_hex)
+    if work_budget is not None and not isinstance(work_budget, WorkBudget):
+        raise TypeError("verify_signature: work_budget must be a WorkBudget")
+    if work_budget is not None:
+        if not work_budget.charge():
+            raise WorkBudgetExceeded(_work.REFUSED)
+        return _suite_math(alg, bytes.fromhex(public_key_hex), bytes(msg_bytes), bytes.fromhex(sig_hex))
+    ok = _suite_verify(alg, public_key_hex, bytes(msg_bytes), sig_hex)
+    if ok is None:
+        raise WorkBudgetExceeded(_work.REFUSED)
+    return ok
 
 
 def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
@@ -1845,9 +1873,11 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
         ok = False
     else:
         ok = _suite_verify(alg, signer, bundle_sha256.encode(), sig_hex)
+        if ok is None:
+            problems.append(f"{_SUITE_NAME[alg]} signature {_work.REFUSED}")
     if sig_out is not None:
         sig_out["primary"] = {"alg": alg, "public_key": signer, "checked": True, "valid": bool(ok)}
-    if not ok:
+    if ok is False:
         problems.append(f"{_SUITE_NAME[alg]} signature does not verify under the bundle's own embedded public key")
     # ORIGIN pin: a dialect may pin its OWN trust root (profile.pinned_pubkey, 64 hex). None keeps the
     # verifier's module-global pin unchanged -- the neutral default -- so the deliberate single-pin design
@@ -1867,6 +1897,16 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
     profile_pin, malformed_pin = _profile_pin(profile)
     if malformed_pin:
         origin_problems.append(_MALFORMED_PIN_PROBLEM)
+    elif alg != "ed25519":
+        # Only the newer-canon branch (`v4_suites`) reaches here with a non-Ed25519 primary. The single-pin path's pin
+        # set is the module or profile Ed25519 pin plus the built-in demo pins (`_default_pin_set`), so the only
+        # non-Ed25519 keys it pins are the demo keys (SIG-28), always as demo pins.
+        if key_id(alg, signer) in _DEMO_KEY_IDS:
+            if sig_out is not None:
+                sig_out["pin_demo"] = True
+                sig_out["pin_key_id"] = key_id(alg, signer)
+        else:
+            origin_problems.append("signature is not under the pinned public key")
     elif signer != (profile_pin or _PINNED_PUBKEY):
         origin_problems.append("signature is not under the pinned public key")
     return signer
@@ -1942,12 +1982,17 @@ def _check_attestations(bundle: dict, bundle_sha256: str, problems: list[str], o
             msg = _canon({"attests": bundle_sha256, "schema": schema, "message": label,
                           "role": role, "name": name, "timestamp": ts})
             sig_hex = a.get("signature")
+            ok = False
             try:
-                valid = (isinstance(sig_hex, str) and _SIGNATURE_HEX_RE.fullmatch(sig_hex) is not None
-                         and _ed25519_verify(bytes.fromhex(sig_hex), msg, pk))
+                if isinstance(sig_hex, str) and _SIGNATURE_HEX_RE.fullmatch(sig_hex) is not None:
+                    ok = _suite_verify("ed25519", pkhex, msg, sig_hex)
             except (ValueError, TypeError):
-                valid = False
-            if not valid:
+                ok = False
+            valid = ok is True
+            if ok is None:                               # TT-15: refused by the work budget, not performed
+                problems.append(f"attestation[{i}] sign-off by {name!r} ({role!r}): the signature check was "
+                                f"{_work.REFUSED}")
+            elif not valid:
                 problems.append(f"attestation[{i}] sign-off by {name!r} ({role!r}) does not verify")
         out.append({"role": role, "name": name, "timestamp": ts,
                     "signer": ("ed25519:" + pkhex) if (isinstance(pkhex, str) and len(pk) == 32) else None,
@@ -2857,7 +2902,10 @@ def _check_seal_signatures(bundle: dict, recomputed: str, problems: list[str],
         row = {"key_id": key_id(alg, pk), "alg": alg, "public_key": pk}
         if alg in _ALG_SUPPORTED_V4:
             ok = _suite_verify(alg, pk, msg, blk["signature"])
-            if not ok:
+            if ok is None:
+                problems.append(f"{where}: {_SUITE_NAME[alg]} signature {_work.REFUSED}")
+                ok = False
+            elif not ok:
                 problems.append(
                     f"{_SUITE_NAME[alg]} signature does not verify under the bundle's own embedded public key"
                     if where == "signature" else
@@ -3152,7 +3200,9 @@ def check_signoffs_v2(bundle: Any, seal: str | None, pins: dict[str, bool], memb
                 ok = _suite_verify(d["alg"], d["public_key"], attestation_signed_bytes(d, seal), d["signature"])
             except (KeyError, TypeError, ValueError, RecursionError):
                 ok = False
-            if not ok:
+            if ok is None:
+                problems.append(f"the {_SUITE_NAME[d['alg']]} signature {_work.REFUSED}")
+            elif not ok:
                 problems.append(f"the {_SUITE_NAME[d['alg']]} signature does not verify over the signed object under "
                                 "the entry's own key (SPEC 10.3.7)")
         tokens = []
@@ -3421,7 +3471,23 @@ _RESOURCE_PROBLEM = ("bundle could not be checked: verification ran out of resou
 _MAX_REPORTED_PROBLEMS = 200
 
 
-def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_of: str | None = None) -> dict:
+def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_of: str | None = None,
+                    work_budget: WorkBudget | None = None) -> dict:
+    """The verdict of one verification; see `_classify_bundle`.
+
+    ``work_budget`` (SPEC 10.7.4 TT-15): the `WorkBudget` this verification charges its public-key operations to.
+    None starts a fresh one. A product layer that adds its own operations (`verify_signature(...,
+    work_budget=...)`) passes one budget here and to each of them, so the 2,048 limit covers the whole verification.
+    A refused operation is not performed: a seal signature it refuses fails integrity, a sign-off signature makes its
+    entry invalid, and a token signature makes the token `malformed`."""
+    token = _work.CURRENT.set(work_budget if work_budget is not None else WorkBudget())
+    try:
+        return _classify_bundle(bundle, profile=profile, policy=policy, pins=pins, as_of=as_of)
+    finally:
+        _work.CURRENT.reset(token)
+
+
+def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_of: str | None = None) -> dict:
     """The THREE-state verdict. Recompute every hash, check the embedded result.v1 core, validate the
     signature under the bundle's own key (integrity) and check that key against the pin (origin).
 
@@ -3595,6 +3661,11 @@ def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_of
     # 13.4.1 "Derived default": the policy pins TSAs and states require_signoff_timestamps false
     if cv == 3 and members.get("tsas") and members.get("require_signoff_timestamps") is False:
         notes = notes + [NOTE_SIGNOFF_TIMESTAMPS_NOT_REQUIRED]
+    signer_alg = (sig_info.get("primary") or {}).get("alg") or "ed25519"
+    try:
+        signer_kid = key_id(signer_alg, signer) if isinstance(signer, str) else None
+    except ValueError:
+        signer_kid = None
     out = {
         "state": state,
         "integrity_ok": integrity_ok,
@@ -3611,8 +3682,10 @@ def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_of
         # optional frontier assertion slots, as sealed in provenance -- PRODUCER claims the spine carries
         # and shape-checks but never evaluates (applicability is the adapter's judgement, not the seal's):
         "frontier": _frontier_report(bundle),
-        "signer": ("ed25519:" + signer) if isinstance(signer, str) else None,
-        "signer_is_demo": signer == _DEMO_PUBKEY,
+        # the legacy `<alg>:<raw hex>` display label (7.15), under the primary's own suite: only the newer-canon
+        # branch (11.6) can carry a non-Ed25519 primary here
+        "signer": f"{signer_alg}:{signer}" if isinstance(signer, str) else None,
+        "signer_is_demo": signer_kid in _DEMO_KEY_IDS,
         # SPEC 7.15 (v4 output; for v3 input added beside the v3 fields): one entry per block of E, the basis of the
         # origin answer, and the evaluation instant
         "signers": signers,
@@ -3623,7 +3696,7 @@ def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_of
         "pinned_key_is_demo": demo_pin,
         "pinned_key": ("ed25519:" + effective_pin) if effective_pin is not None else sig_info.get("pin_key_id"),
         # SPEC 7.11: the signer's key id, and (when a pin set is in force) the pin set as {key_id: effective demo}
-        "signer_key_id": key_id("ed25519", signer) if isinstance(signer, str) else None,
+        "signer_key_id": signer_kid,
         "pin_set": None if pin_set is None else [{"key_id": k, "demo": pin_set[k]} for k in sorted(pin_set)],
         # ADR-050: the sealed canon version this bundle claims, and the highest version this verifier can
         # apply. `canon_version` is None when the header was malformed/missing (an integrity FAIL).
@@ -4067,13 +4140,15 @@ def _check(bundle: dict, problems: list[str], origin_problems: list[str],
                 problems.append("inputs declared withheld but still present in the result core's provenance")
                 break
 
+    # SPEC 10.7.4 TT-15: the seal signature is checked first, then the sign-offs, in entry order (the one charge order
+    # both reference verifiers implement)
+    signer = _check_signature(bundle, recomputed_bundle, problems, origin_problems, profile, sig_out=sig_out,
+                              pin_set=pin_set)
     # human sign-offs are validated against the RECOMPUTED seal (a tampered decision breaks both the
     # producer signature above AND every sign-off over the old digest), into their own dimension.
     if attestation_problems is not None and attestations_out is not None:
         _check_attestations(bundle, recomputed_bundle, attestation_problems, attestations_out)
-
-    return _check_signature(bundle, recomputed_bundle, problems, origin_problems, profile, sig_out=sig_out,
-                            pin_set=pin_set)
+    return signer
 
 
 # ====================================================================================================
