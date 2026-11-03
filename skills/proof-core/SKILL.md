@@ -3,7 +3,7 @@ name: proof-core
 description: Seal a computed result into a tamper-evident, independently re-runnable evidence bundle, and verify or reproduce one. Use when an agent produces a result (a number, a decision, a test or evaluation outcome, a file digest) that someone downstream has to trust and may need to re-run or audit later. Seals the result with its inputs so a neutral party can re-derive it offline, with no account and no network. Not a correctness check and not a logger; it makes a result re-runnable and tamper-evident, nothing more.
 license: MIT
 metadata:
-  wraps: proof-core 0.22.0 (vendored, MIT)
+  wraps: proof-core 0.23.0 (vendored, MIT)
   offline: true
 ---
 

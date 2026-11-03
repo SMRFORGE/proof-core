@@ -16,6 +16,7 @@ import sys
 from .render import RenderError, headline, seal_signer_lines, signoff_lines, time_lines
 from .verify import (  # noqa: F401 -- re-exported for backward-compatible access
     _MAX_JSON_DEPTH,
+    _SUITE_NAME,
     BUILTIN_DEMO_PINS,
     CHAIN_FAIL,
     CHAIN_INCOMPLETE,
@@ -32,6 +33,7 @@ from .verify import (  # noqa: F401 -- re-exported for backward-compatible acces
     _utc_or_null,
     classify_bundle,
     index_upstreams,
+    key_id,
     key_label,
     loads,
     pin_key,
@@ -137,6 +139,42 @@ def _print_attestations(rep: dict) -> None:
         print("    NOTE: a sign-off did not verify. Until approver keys are pinned, even a valid sign-off")
         print("          establishes only that the key-holder signed; binding a key to a named person is an")
         print("          identity step (an approver registry).")
+
+
+def _primary_signer(rep: dict) -> dict | None:
+    """The `signers` entry of the reported `signer` (7.15): the first verified block, or on the newer-canon branch
+    (11.6) the primary. None when no block verified."""
+    return next((e for e in rep.get("signers") or [] if e.get("checked") and e.get("valid")), None)
+
+
+def _suite_signature(rep: dict) -> str:
+    """"the <suite> signature", named from the suite of the reported signer, never assumed to be Ed25519."""
+    first = _primary_signer(rep)
+    return f"{_SUITE_NAME.get(first['alg'], first['alg']) if first else 'Ed25519'} signature"
+
+
+def _pinned_line(rep: dict) -> str:
+    """The pin a verified block matched, as the matched pin-set entry's key id. Only on the single-pin path (no policy
+    or caller pins) does a match on the module pin keep its legacy fingerprint."""
+    matched = next((e for e in rep.get("signers") or []
+                    if e.get("checked") and e.get("valid") and e.get("pinned")), None)
+    if matched is None:
+        return _pins_text(rep)
+    if rep.get("pin_set") is None and matched.get("alg") == "ed25519"             and matched.get("key_id") == DEMO_KEY_ID_OF(pinned_key_fingerprint()):
+        return pinned_key_fingerprint()
+    return matched["key_id"]
+
+
+def DEMO_KEY_ID_OF(fingerprint: str) -> str:
+    return key_id("ed25519", fingerprint.removeprefix("ed25519:"))
+
+
+def _pins_text(rep: dict) -> str:
+    """What the verdict was pinned to: the module pin's fingerprint on the single-pin path, else the pin set."""
+    ps = rep.get("pin_set")
+    if ps is None:
+        return pinned_key_fingerprint()
+    return "the pin set: " + (", ".join(e["key_id"] for e in ps) if ps else "empty")
 
 
 def _print_seal_keys(rep: dict, signer_hex: str | None) -> None:
@@ -344,25 +382,32 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
         # header seals and its signature verifies, so the sha256sums header is unedited since signing -- but
         # this verifier LACKS that canon and cannot recompute the sections, so it does NOT (and cannot) say
         # the record is untampered. Per Decision 4, report whether the version claim is signed under the PIN.
-        signer_hex = (rep.get("signer") or "").removeprefix("ed25519:")
-        pinned_hex = (rep.get("pinned_key") or "").removeprefix("ed25519:")
-        signed_under_pin = bool(signer_hex) and signer_hex == pinned_hex
+        # The primary's own suite and key id (11.6 checks it under the 7.5 suite table), and the pin it matched in the
+        # effective pin set, demo or not (the `signers` entry, 7.15)
+        primary = _primary_signer(rep) or {}
+        signed_under_pin = bool(primary.get("pinned"))
         print(f"UNSUPPORTED  {path}", file=sys.stderr)
         print(f"    this bundle declares canon_version {rep.get('canon_version')}; this verifier supports up to "
               f"{rep.get('supported_canon_max')}.", file=sys.stderr)
-        print("    its sha256sums header seals and the Ed25519 signature over it verifies, so the header is", file=sys.stderr)
+        print(f"    its sha256sums header seals and the {_suite_signature(rep)} over it verifies, so the header is",
+              file=sys.stderr)
         print("    UNEDITED since signing -- but this verifier lacks that canon, so it CANNOT recompute or", file=sys.stderr)
         print("    vouch for the inputs / result / provenance sections. This is not a claim that the record", file=sys.stderr)
         print("    is untampered; it is this verifier saying it cannot check it.", file=sys.stderr)
-        if signed_under_pin and not rep.get("pinned_key_is_demo"):
-            print(f"    the version claim IS signed under the pinned production key ({pinned_key_fingerprint()}),", file=sys.stderr)
+        if signed_under_pin and not primary.get("demo"):
+            what = "the pinned production key" if rep.get("pin_set") is None else "a non-demo pin of the receiver policy"
+            print(f"    the version claim IS signed under {what} ({_pinned_line(rep)}),", file=sys.stderr)
             print("    so it comes from a trusted origin: get a newer verifier and re-check.", file=sys.stderr)
-        elif signed_under_pin:
+        elif signed_under_pin and primary.get("alg") == "ed25519":
             print("    the version claim is signed under the pinned key, but that pin is the public DEMO identity", file=sys.stderr)
             print("    (anyone can sign under it), so this proves integrity of the header, not a trusted origin.", file=sys.stderr)
+        elif signed_under_pin:
+            print(f"    the version claim is signed under {key_label(primary.get('key_id'))}, a demo pin", file=sys.stderr)
+            print("    (anyone can sign under it), so this proves integrity of the header, not a trusted origin.", file=sys.stderr)
         else:
-            print(f"    WARNING: the signature is NOT under the pinned key ({pinned_key_fingerprint()}); it is", file=sys.stderr)
-            print(f"    {key_label(signer_hex)}. This canon_version claim is not from a trusted origin and could be", file=sys.stderr)
+            print(f"    WARNING: the signature is NOT under {'the pinned key' if rep.get('pin_set') is None else 'a pinned key'} "
+                  f"({_pins_text(rep)}); it is", file=sys.stderr)
+            print(f"    {key_label(primary.get('key_id'))}. This canon_version claim is not from a trusted origin and could be", file=sys.stderr)
             print('    attacker-planted -- do not read "use a newer verifier" as trust in this record.', file=sys.stderr)
         # any unsigned top-level keys riding outside the seal (ADR-050 trust-surface check on fail-forward)
         for problem in rep.get("problems", []):
@@ -404,16 +449,16 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
         if rep.get("pinned_key_is_demo") and rep.get("key_matches_pin"):
             print(f"{lead}integrity verified -- origin NOT established (demo pin): {path}")
             _print_withheld(bundle, rep)
-            print("    every hash recomputes and the Ed25519 signature is valid under the pinned key, so")
+            print(f"    every hash recomputes and the {_suite_signature(rep)} is valid under the pinned key, so")
             print("    the record is UNEDITED since it was signed. But that pinned key is the public DEMO")
             print("    identity (its seed ships in signing.py); anyone can reproduce a signature under it,")
             print("    so this proves INTEGRITY, not that the record came from a production signer (ORIGIN).")
             _print_seal_keys(rep, signer_hex)
-            print(f"      pinned key: {pinned_key_fingerprint()}  (public demo key -- not a trust anchor)")
+            print(f"      pinned key: {_pinned_line(rep)}  (public demo key -- not a trust anchor)")
         else:
             print(f"{lead}integrity verified -- origin NOT established: {path}")
             _print_withheld(bundle, rep)
-            print("    every hash recomputes and the Ed25519 signature is valid under the key this bundle")
+            print(f"    every hash recomputes and the {_suite_signature(rep)} is valid under the key this bundle")
             print("    carries, so the record is UNEDITED since it was signed -- but that key is not the pin:")
             _print_seal_keys(rep, signer_hex)
             print(f"      pinned key: {pinned_key_fingerprint()}")
