@@ -13,7 +13,7 @@ import sys
 # The parse-time guards (duplicate-key / NaN / depth / size) live in ONE place, `verify.loads`, so every
 # bundle reader shares them. Re-exported here (``cli._text_depth_ok``, ``cli.loads``) for callers/tests
 # that reach for them on the CLI module.
-from .render import RenderError, headline, seal_signer_lines, signoff_lines, time_lines
+from .render import RenderError, claims_lines, headline, seal_signer_lines, signoff_lines, time_lines
 from .verify import (  # noqa: F401 -- re-exported for backward-compatible access
     _MAX_JSON_DEPTH,
     _SUITE_NAME,
@@ -27,19 +27,20 @@ from .verify import (  # noqa: F401 -- re-exported for backward-compatible acces
     STATE_UNSUPPORTED_ALG,
     STATE_UNSUPPORTED_CANON,
     PolicyError,
+    _classify_parsed,
+    _index_upstreams_parsed,
+    _int_digits,
     _reject_duplicate_keys,
     _reject_non_finite,
     _text_depth_ok,
     _utc_or_null,
-    classify_bundle,
-    index_upstreams,
+    _verify_chain_parsed,
     key_id,
     key_label,
     loads,
     pin_key,
     pinned_key_fingerprint,
     safe_terminal_output,
-    verify_chain,
 )
 
 _USAGE = ("usage: proof-verify <bundle.json> [--profile pkg.module:attr] [--pubkey HEX] [--json]\n"
@@ -69,6 +70,10 @@ EXIT_INTEGRITY_ONLY = 3
 #: from 1 (a genuine integrity failure) and 3 (integrity-only), so a CI gate or an air-gapped script tells
 #: "out of date" from "broken" without parsing text. It is a FAIL for every gate until the verifier is updated.
 EXIT_UNSUPPORTED_CANON = 4
+#: SPEC v4 13.5: the bundle's header seals, but its only problem is a seal signature suite this verifier does not
+#: implement (reserved or unknown). Its OWN code, distinct from 4 (a newer canon) so a gate tells "newer format"
+#: from "newer signature suite" without parsing text. A FAIL for every gate, like 4.
+EXIT_UNSUPPORTED_ALG = 6
 #: CHAIN INCOMPLETE (only with --upstream): the bundle itself verifies, but its derived_from chain could not be
 #: fully walked -- a cited earlier record was not supplied, was sealed under a newer canon, or the bundle's
 #: provenance is withheld. NOT a pass: nothing about the unwalked links was checked. Its OWN code, distinct
@@ -237,8 +242,10 @@ def _json_exit_code(rep: dict) -> int:
     """The SAME exit code the prose path returns, computed purely (no printing). Integrity failure -> 1;
     else integrity+origin -> 0 or integrity-only -> 3; then the attestation gate overrides a present-but-
     INVALID human sign-off to 1 (exactly as ``_attestation_gate`` does for the prose branches)."""
-    if rep.get("state") in (STATE_UNSUPPORTED_CANON, STATE_UNSUPPORTED_ALG):
+    if rep.get("state") == STATE_UNSUPPORTED_CANON:
         return EXIT_UNSUPPORTED_CANON        # unsupported / use a newer verifier -- not an integrity failure
+    if rep.get("state") == STATE_UNSUPPORTED_ALG:
+        return EXIT_UNSUPPORTED_ALG          # an unimplemented signature suite -- not an integrity failure
     if not rep["integrity_ok"]:
         return EXIT_FAIL
     code = EXIT_VERIFIED if rep["origin_ok"] else EXIT_INTEGRITY_ONLY
@@ -327,6 +334,9 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
          this until the verifier is updated (it is not a pass).
       5  CHAIN INCOMPLETE (only with ``upstreams``): the bundle verifies, but a cited earlier record was not
          supplied (or could not be checked), so part of its derived_from chain was NOT walked. Not a pass.
+      6  UNSUPPORTED ALG (SPEC v4 13.5): the header seals, but the only problem is a seal signature suite this
+         verifier does not implement (reserved or unknown). Integrity and origin are undetermined; use a newer
+         verifier. Not a pass.
 
     With ``upstreams`` (paths to earlier bundles, or folders of them), the bundle's derived_from chain is also
     walked offline (``verify_chain``): a link that does not hold fails the run (1), an unwalked link leaves it
@@ -369,10 +379,12 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_UNREADABLE
     try:
-        rep = classify_bundle(bundle, profile=profile, policy=policy, pins=pins, as_of=as_of)
+        # the subject was read with the hardened loader above (`loads`: SPEC 4), so the private parsed-object path
+        # is the public one's verdict on these bytes
+        rep = _classify_parsed(bundle, profile=profile, policy=policy, pins=pins, as_of=as_of)
     except PolicyError as exc:
         return _policy_error(exc, as_json)
-    chain = None if ups is None else verify_chain(bundle, index_upstreams(ups, profile=profile).get,
+    chain = None if ups is None else _verify_chain_parsed(bundle, _index_upstreams_parsed(ups, profile=profile).get,
                                                   profile=profile)
     if as_json:
         # machine-readable verdict: the SAME exit code as the prose path, no prose printed.
@@ -424,8 +436,8 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
               file=sys.stderr)
         for problem in rep["problems"]:
             print(f"    - {problem}", file=sys.stderr)
-        print(f"    exit {EXIT_UNSUPPORTED_CANON}: NOT a pass -- use a newer verifier.", file=sys.stderr)
-        return EXIT_UNSUPPORTED_CANON
+        print(f"    exit {EXIT_UNSUPPORTED_ALG}: NOT a pass -- use a newer verifier.", file=sys.stderr)
+        return EXIT_UNSUPPORTED_ALG
     if not rep["integrity_ok"]:
         print(f"FAIL  {path}", file=sys.stderr)
         for problem in rep["problems"]:
@@ -487,6 +499,8 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
         _print_canon_note(bundle)
         _print_signoffs(rep, policy)
         _print_frontier(rep, walked=chain is not None)
+        for line in claims_lines(rep, bundle):
+            print(f"    {line}")
         _print_chain(chain, len(ups or []))
         return _chain_gate(chain, _attestation_gate(rep, EXIT_INTEGRITY_ONLY), announce=True)
     # origin_ok is True only under a real production pin (never under the demo pin), so reaching here
@@ -507,6 +521,8 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
     _print_canon_note(bundle)
     _print_signoffs(rep, policy)
     _print_frontier(rep, walked=chain is not None)
+    for line in claims_lines(rep, bundle):
+        print(f"    {line}")
     _print_chain(chain, len(ups or []))
     return _chain_gate(chain, _attestation_gate(rep, EXIT_VERIFIED), announce=True)
 
@@ -674,7 +690,8 @@ def _resolve_profile(spec: str):
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    with safe_terminal_output(enabled="--json" not in args):
+    # SPEC 4.2 item 8: reading, canonicalizing and printing never depend on PYTHONINTMAXSTRDIGITS
+    with safe_terminal_output(enabled="--json" not in args), _int_digits():
         return _main(args)
 
 

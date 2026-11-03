@@ -44,18 +44,23 @@ def assert_integration(produce: Callable[[], dict], runner, *, profile=NEUTRAL) 
     for an integration check."""
     from proof_verify.verify import classify_bundle  # the INDEPENDENT checker (never the producer)
 
+    from .envelope import bundle_bytes, received_bundle
     bundle = produce()
+    if isinstance(bundle, dict):
+        data = bundle_bytes(bundle)        # a bundle the consumer's producer just minted: serialized losslessly
+    else:
+        data, bundle = received_bundle(bundle, "assert_integration")   # its bytes or text (SPEC 4)
     if not isinstance(bundle, dict) or not bundle.get("bundle_sha256"):
         raise IntegrationError(
-            "produce() must return a sealed bundle dict carrying a 'bundle_sha256'; "
+            "produce() must return a sealed bundle (a dict, or its bytes) carrying a 'bundle_sha256'; "
             f"got {type(bundle).__name__}")
-    ver = classify_bundle(bundle, profile=profile)
+    ver = classify_bundle(data, profile=profile)     # the verifier reads bytes (SPEC 4)
     if not ver["integrity_ok"]:
         raise IntegrationError(
             "the sealed bundle does not verify under this profile (integrity_ok is False): the dialect the "
             "verifier was given does not match the one the bundle was minted under. "
             f"Problems: {ver['problems']}")
-    rep = reproduce_bundle(bundle, runner, profile=profile)
+    rep = reproduce_bundle(data, runner, profile=profile)
     if rep.get("reproduced") is not True:
         raise IntegrationError(
             f"the bundle did not reproduce under this profile (reproduced is {rep.get('reproduced')!r}): "

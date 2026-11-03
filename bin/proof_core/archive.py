@@ -105,13 +105,19 @@ def add_archive(bundle: dict, tokens: list[bytes], attestations=()) -> dict:
     return b
 
 
-def renew_archive(bundle: dict, tokens: list[bytes], *, policy: dict, as_of: str) -> dict:
+def renew_archive(data: bytes | str, tokens: list[bytes], *, policy: dict, as_of: str) -> dict:
     """Return a COPY of ``bundle`` with ``tokens`` appended to chain 0 as a timestamp renewal (AR-10). SPEC 10.8.9:
     the new stamp must be "at a time within the previous stamp's end (AR-13) as the receiver's policy will see it", so
     the renewed bundle is verified under the receiver ``policy`` at ``as_of``; unless its archive is `valid` and the
     new stamp is accepted inside the verified prefix with no continuity problem, ValueError is raised (renew earlier,
-    or under a TSA the policy still trusts)."""
+    or under a TSA the policy still trusts). ``data`` is the bundle's bytes or text (SPEC 4); a parsed object raises
+    TypeError, and unreadable bytes raise ValueError."""
     from proof_verify import classify_bundle
+
+    from .envelope import bundle_bytes, received_bundle
+    _, bundle = received_bundle(data, "renew_archive")
+    if not isinstance(bundle, dict):
+        raise ValueError("renew_archive: the bundle is unreadable (SPEC 4)")  # noqa: TRY004 -- unreadable bytes, not a type
     stamps = bundle.get("archive", {}).get("chains", [{}])[0].get("stamps")
     if not isinstance(stamps, list) or not stamps:
         raise ValueError("the bundle has no archive to renew: create one with add_archive")
@@ -120,7 +126,7 @@ def renew_archive(bundle: dict, tokens: list[bytes], *, policy: dict, as_of: str
     stamp = _stamp(list(tokens), renewal_imprint(bundle), "timestamp-renewal (AR-10)")
     b = copy.deepcopy(bundle)
     b["archive"]["chains"][0]["stamps"].append(stamp)
-    rep = classify_bundle(b, policy=policy, as_of=as_of)
+    rep = classify_bundle(bundle_bytes(b), policy=policy, as_of=as_of)   # the renewed bundle this producer made
     a = rep["archive"]
     last = a["chains"][0]["stamps"][-1] if a["chains"] else None
     if a["state"] != "valid" or last is None or last["class"] != "accepted" or last["problems"]:

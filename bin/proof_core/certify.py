@@ -190,6 +190,34 @@ def _ccanon(value):
         return b"v1-fallback:" + canon(value)
 
 
+def differing_output_keys(bundle, sealed_outputs, fresh_outputs, *, outputs_only: bool = False) -> list[str]:
+    """The output keys whose sealed and fresh values differ, judged by the SAME rule the reproduce verdict used:
+    under the subject's sealed canon (``subject_canon``: canon 1 is type-sensitive, canon 2 and 3 encode 20 and
+    20.0 alike; a boolean never equals a number under any canon), and for an outputs-only reproducer (--command)
+    with JSON numbers by value (``_by_value_numbers``). A key present on one side only differs. For explaining a
+    verdict (the CLI's diff lines); the verdict itself is ``_cores_match``. Sorted."""
+    try:
+        fn = subject_canon(bundle)[1]
+    except ReproduceError:
+        fn = canon
+    sealed = sealed_outputs if isinstance(sealed_outputs, dict) else {}
+    fresh = fresh_outputs if isinstance(fresh_outputs, dict) else {}
+    if outputs_only:
+        sealed, fresh = _by_value_numbers(sealed), _by_value_numbers(fresh)
+
+    def _form(value):
+        try:
+            return fn(value)
+        except (ValueError, TypeError, AttributeError):
+            try:
+                return b"v1-fallback:" + canon(value)
+            except (ValueError, TypeError):
+                return object()          # not JSON (NaN, Infinity): the verdict refuses it, so it never matches
+
+    return [k for k in sorted(set(sealed) | set(fresh))
+            if (k in sealed) != (k in fresh) or _form(sealed[k]) != _form(fresh[k])]
+
+
 def _without_caveats(core):
     """``core`` without its `caveats`: caveats are judged by the claim-drift subset rule (`_claim_drift`), in
     every mode, never by byte equality, so exact and stat comparisons treat them the same way."""
@@ -238,11 +266,13 @@ def _stat_match(orig_core: dict, fresh_core: dict, tol: dict, *, fresh_tol: dict
     never loosen the comparison beyond what the open engine's card actually declares. (A tolerance that
     differs at all is a claim drift and fails `reproduced` anyway; a fresh run that declares NO tolerance
     is deterministic and is handled by `_cores_match`.)"""
+    from proof_verify.verify import stat_band_outputs
     cap = next(iter(orig_core.get("result", {})), None)
     q, sigma_key = tol.get("quantity"), tol.get("sigma_key")
-    o_out = orig_core.get("result", {}).get(cap, {})
+    o_out = stat_band_outputs(orig_core)      # the ONE output lookup the verifier and the mint use (SPEC 14 item 7)
     f_out = fresh_core.get("result", {}).get(cap, {})
-    problem = stat_tolerance_problem(tol, o_out)
+    problem = (stat_tolerance_problem(tol, o_out) if o_out is not None
+               else "the sealed result must hold one capability")
     if problem:
         return _exact_fallback(orig_core, fresh_core, f"sealed tolerance unusable: {problem}")
     if not (isinstance(f_out, dict) and q in f_out and sigma_key in f_out):
@@ -576,7 +606,7 @@ def _sealed_provenance_of(bundle: dict):
     return block.get("value") if isinstance(block, dict) else None
 
 
-def reproduce_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> dict:
+def reproduce_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None) -> dict:
     """Check INTEGRITY, then re-derive `bundle` by running its capability on its recorded inputs; compare.
 
     `runner` is the consumer-injected reproduce harness (contract.ReproduceRunner): the domain-agnostic
@@ -604,18 +634,29 @@ def reproduce_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> 
     what the signer sealed -- and reports `origin_ok: False`, `verified: False` alongside the real
     re-derivation result. Raises ReproduceError if the inputs OR the result are withheld, or the
     capability is not registered.
-    """
-    from proof_verify.verify import classify_bundle  # the independent verifier (no kernel import)
 
-    ver = classify_bundle(bundle, profile=profile)
+    ``data`` is the bundle's BYTES or text (SPEC 4: the verifier parses them itself; for a bundle you just minted,
+    ``bundle_bytes(b)``). A parsed object raises TypeError, so no re-serialization path hides the duplicate keys of
+    the bytes a reviewer received.
+    """
+    from proof_verify.verify import (  # the independent verifier (no kernel import)
+        classify_bundle,
+        pinned_key_is_demo,
+    )
+
+    from .envelope import received_bundle
+    data, bundle = received_bundle(data, "reproduce_bundle")
+    ver = classify_bundle(data, profile=profile)     # the verifier reads the bytes (SPEC 4)
     verify_fields = {
         "verified": ver["integrity_ok"] and ver["origin_ok"],   # integrity + origin, as verify_bundle
         "integrity_ok": ver["integrity_ok"],
         "origin_ok": ver["origin_ok"],
         # surfaced so a consumer sees WHY origin is unproven: while the pin is the public demo identity
         # origin_ok is False even for a pin-signed bundle, so `verified`/`certified` are never origin.
-        "pinned_key_is_demo": ver["pinned_key_is_demo"],
-        "signer": ver["signer"],
+        # an `unreadable` verdict (SPEC 13.1) carries no signer and no pin facts: read them with .get so
+        # unreadable bytes give the not-attempted report below, never a KeyError
+        "pinned_key_is_demo": ver.get("pinned_key_is_demo", pinned_key_is_demo()),
+        "signer": ver.get("signer"),
         "verify_problems": ver["problems"],
     }
     if not ver["integrity_ok"]:
@@ -738,7 +779,7 @@ def _reproduce_compare(bundle, runner, spec, capability, orig_core, run_inputs, 
     }
 
 
-def certify_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> dict:
+def certify_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None) -> dict:
     """VERIFY + REPRODUCE, returning an attestation record (evidence.certification.v1).
 
     `runner` is the consumer-injected reproduce harness (see `reproduce_bundle`).
@@ -763,7 +804,9 @@ def certify_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> di
         pinned_key_is_demo,
     )
 
-    ver = classify_bundle(bundle, profile=profile)
+    from .envelope import received_bundle
+    data, bundle = received_bundle(data, "certify_bundle")   # bytes or text (SPEC 4); a parsed object: TypeError
+    ver = classify_bundle(data, profile=profile)     # the verifier reads the bytes (SPEC 4)
     record = {
         # a dialect brands its own certification-record schema; None/default -> the neutral tag.
         "schema": getattr(profile, "certification_schema", None) or CERTIFICATION_SCHEMA,
@@ -774,7 +817,7 @@ def certify_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> di
         # integrity_ok / not origin_ok -- re-derivable, but never certified (origin is unproven)
         "integrity_ok": ver["integrity_ok"],
         "origin_ok": ver["origin_ok"],
-        "signer": ver["signer"],
+        "signer": ver.get("signer"),   # absent on an `unreadable` verdict (SPEC 13.1)
         # Carry the origin caveat INTO the machine-readable record, not just the CLI print layer: a
         # consumer that renders `verified: true` must be able to see whether that is integrity-only
         # (demo key) or integrity+origin (production key), so "Verified" is never mistaken for origin.
@@ -783,8 +826,9 @@ def certify_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> di
         # pin -- otherwise a branded certify record is self-inconsistent (the record is an unsigned
         # report, so this is a correctness fix, not a sealed-byte change). profile=None keeps the
         # module-global pin, byte/behaviour-unchanged.
-        "pinned_key_is_demo": ver["pinned_key_is_demo"] if profile is not None else pinned_key_is_demo(),
-        "pinned_key_fingerprint": (ver["pinned_key"] if profile is not None
+        "pinned_key_is_demo": (ver.get("pinned_key_is_demo", pinned_key_is_demo()) if profile is not None
+                               else pinned_key_is_demo()),
+        "pinned_key_fingerprint": (ver.get("pinned_key", pinned_key_fingerprint()) if profile is not None
                                    else pinned_key_fingerprint()),
         # Seed the FULL documented reproduce key set with safe defaults BEFORE the try, so every return
         # path (happy path, ReproduceError, or a re-run that started but could not finish) hands back a
@@ -806,7 +850,7 @@ def certify_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> di
     }
     environment_ok = False
     try:
-        repro = reproduce_bundle(bundle, runner, profile=profile)
+        repro = reproduce_bundle(data, runner, profile=profile)
         record.update({
             "capability": repro["capability"],
             "reproduced": repro["reproduced"],
@@ -848,7 +892,7 @@ def certify_bundle(bundle: dict, runner: ReproduceRunner, *, profile=None) -> di
     return record
 
 
-def seal_certification(bundle: dict, runner: ReproduceRunner, *, role: str = "reproduced",
+def seal_certification(data: bytes | str, runner: ReproduceRunner, *, role: str = "reproduced",
                        profile=None, canon_version: int | None = None) -> dict:
     """Run certify over `bundle` and SEAL the reproduction verdict into its OWN signed evidence bundle,
     cryptographically CHAINED to the subject via the existing `derived_from` mechanism.
@@ -873,8 +917,9 @@ def seal_certification(bundle: dict, runner: ReproduceRunner, *, role: str = "re
     subject carries no `bundle_sha256` to chain to.
     """
     from .contract import Case, Fidelity, Result, Verdict
-    from .envelope import build_bundle, sha
+    from .envelope import build_bundle, received_bundle, sha
 
+    data, bundle = received_bundle(data, "seal_certification")   # the subject's bytes or text (SPEC 4)
     subject_seal = bundle.get("bundle_sha256") if isinstance(bundle, dict) else None
     subject_sums = bundle.get("sha256sums") if isinstance(bundle, dict) else None
     subject_core = bundle.get("result") if isinstance(bundle, dict) else None
@@ -890,7 +935,7 @@ def seal_certification(bundle: dict, runner: ReproduceRunner, *, role: str = "re
         raise ValueError(  # noqa: TRY004 -- a redacted/malformed subject is a value precondition, not a caller type bug
             "cannot seal a reproduction record: the subject must carry its sealed result core "
             "and sha256sums to bind to (a subject with its result redacted cannot be sealed)")
-    record = certify_bundle(bundle, runner, profile=profile)
+    record = certify_bundle(data, runner, profile=profile)
     reproduced = record.get("reproduced")
     # the subject's capability scopes the binding pointer /result/<cap>; the walker cross-checks it against
     # the upstream's sealed kind, so take it from the reproduce record and confirm it keys the result map.

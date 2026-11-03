@@ -82,12 +82,17 @@ class Adapter:
         """Independent offline check. Returns a verdict dict, never raises on bad input: malformed JSON yields
         ``{"integrity_ok": False, "state": "fail", ...}`` rather than a traceback. Imports no producer code."""
         from proof_verify.verify import classify_bundle
+        if not isinstance(bundle_or_bytes, (bytes, bytearray, str)):
+            # SPEC 4 / 17.3.2: a verdict is given on bytes or text only; a parsed object cannot show the duplicate
+            # keys of the bytes it came from. Still a verdict, never an exception.
+            return {"integrity_ok": False, "state": "fail",
+                    "error": "verify takes the bundle's bytes or text (SPEC 4), not a parsed "
+                             f"{type(bundle_or_bytes).__name__}"}
         try:
-            bundle = _load(bundle_or_bytes)
-        except (ValueError, TypeError, RecursionError, MemoryError) as exc:
+            return classify_bundle(bundle_or_bytes)   # the verifier parses the bytes itself (SPEC 4)
+        except (TypeError, RecursionError, MemoryError) as exc:
             return {"integrity_ok": False, "state": "fail",
                     "error": f"not a valid bundle ({exc.__class__.__name__})"}
-        return classify_bundle(bundle)
 
     def sealed_inputs(self, bundle):
         """The sealed re-run recipe (the ``inputs`` passed to ``seal``), as the VALUES the engine computes on: every
@@ -127,13 +132,15 @@ class Adapter:
         that was verified) or a dict. A dict must come from ``proof_verify.verify.loads``: a plain ``json.loads``
         silently keeps the LAST of two duplicate keys, and that cannot be detected after parsing.
         """
+        raw = bundle
         if not isinstance(bundle, dict):
             try:
                 bundle = _load(bundle)
             except (ValueError, TypeError, RecursionError, MemoryError) as exc:
                 return {"reproduced": False, "expected_sha": None, "got_sha": None,
                         "error": f"not a valid bundle ({exc.__class__.__name__})"}
-        if verify_first and not self.verify(bundle).get("integrity_ok", False):
+        # the verdict is on the bytes as received (SPEC 4); a dict cannot be verified, so it is refused here
+        if verify_first and not self.verify(raw).get("integrity_ok", False):
             return {"reproduced": False, "expected_sha": None, "got_sha": None,
                     "error": "bundle failed integrity verification; not re-deriving"}
         expected = self.sealed_outcome_sha(bundle)

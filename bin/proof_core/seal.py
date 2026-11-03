@@ -18,7 +18,7 @@ The decorated object is BOTH the sealer (call it with the inputs dict to get a b
     proof-reproduce bundle.json --runner your.module:add
 
 needs no hand-written adapter -- the reviewer still NAMES the runner on the command line (the security
-line is unchanged; the decorator only removes the boilerplate). ``reproduce_bundle(bundle, add)`` works
+line is unchanged; the decorator only removes the boilerplate). ``reproduce_bundle(bundle_bytes(bundle), add)`` works
 the same way in code.
 
 SCOPE: ``@sealed`` is for a DETERMINISTIC pure function -- a single ``inputs`` dict in, a dict of outputs

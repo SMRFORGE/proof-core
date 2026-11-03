@@ -66,6 +66,30 @@ def canon(obj: Any) -> bytes:
                       allow_nan=False).encode()
 
 
+def bundle_bytes(bundle: Any) -> bytes:
+    """A bundle THIS PRODUCER just minted, as JSON bytes for the verifier's entry points (which take bytes or text,
+    SPEC 4). ASCII-escaped (``ensure_ascii=True``), so it is lossless for every string the parsed model holds, a lone
+    surrogate included (it is written as its \\uXXXX escape, which UTF-8 could not encode). A value JSON cannot hold
+    (NaN) is written as is, so the verifier reads the result as unreadable rather than this function mending it.
+    Never use it to "verify" a bundle someone else sent: verify the bytes you received."""
+    return json.dumps(bundle, ensure_ascii=True).encode("ascii")
+
+
+def received_bundle(data: Any, where: str) -> tuple[bytes | str, Any]:
+    """The bundle's bytes or text as received, and its parse by the verifier's hardened loader (None when it is
+    unreadable). A parsed object is refused with TypeError: verification reads bytes (SPEC 4, 17.3.2), so a
+    reproduce or certify run never re-serializes a dict whose original bytes (and their duplicate keys) are gone."""
+    from proof_verify.verify import parse_bundle
+    if not isinstance(data, (bytes, bytearray, str)):
+        raise TypeError(f"{where} takes the bundle's bytes or text (SPEC 4: the parse rules are rules about bytes), "
+                        f"not a parsed {type(data).__name__}; pass the file's bytes, or bundle_bytes(b) for a bundle "
+                        "you just minted")
+    try:
+        return data, parse_bundle(data)
+    except (ValueError, RecursionError):
+        return data, None
+
+
 def sha(b: bytes) -> str:
     return "sha256:" + hashlib.sha256(b).hexdigest()
 
@@ -342,7 +366,9 @@ def _assert_sealed_provenance_honest(capability: str, core: dict, repro: dict, *
     # (certify._stat_match); this belt refuses to MINT one in the first place. Same bounds both sides, and the same
     # strict number rule (stat_number_problem): a string or boolean band, quantity or sigma is refused, not coerced.
     if tol.get("kind") == "stat":
-        problem = stat_number_problem(tol, outputs) or stat_tolerance_problem(tol, outputs)
+        from proof_verify.verify import stat_band_outputs
+        problem = (stat_number_problem(tol, outputs) or stat_tolerance_problem(tol, outputs)
+                   or (None if stat_band_outputs(core) is not None else "the result must hold one capability"))
         if problem:
             raise ValueError(f"{capability}: refusing to seal a stat reproduce_tolerance: {problem}")
     # PROVENANCE-SHAPE belt: the verifier's own required/optional provenance rules (not a second copy), so the
@@ -465,33 +491,11 @@ def stat_number_problem(tol: dict, outputs: dict) -> str | None:
 
 
 def stat_tolerance_problem(tol: dict, outputs: dict) -> str | None:
-    """Why a sealed stat tolerance is unusable against `outputs` (None = it is sound). Shared by the
-    mint-time belt (refuse to seal) and the reproduce side (fall back to an exact match), so the two
-    can never disagree about what a plausible band is."""
-    q, sigma_key = tol.get("quantity"), tol.get("sigma_key")
-    if not isinstance(q, str) or not isinstance(sigma_key, str):
-        return "quantity/sigma_key must be output-key strings"
-    if sigma_key == q:
-        return f"sigma_key {sigma_key!r} names the quantity itself (a self-referential band)"
-    derived = tol.get("derived", [])
-    if not isinstance(derived, (list, tuple)):
-        return "derived must be a list of output keys"
-    bad = sorted(d for d in derived if not isinstance(d, str) or is_integrity_field(d))
-    if bad:
-        return f"derived names integrity fields {bad} (never excluded from the remainder check)"
-    if not isinstance(outputs, dict) or q not in outputs or sigma_key not in outputs:
-        return f"outputs lack {q!r} and/or {sigma_key!r}"
-    try:
-        val, sig = float(outputs[q]), float(outputs[sigma_key])
-    except (TypeError, ValueError):
-        return f"{q!r}/{sigma_key!r} are not numeric"
-    if not (math.isfinite(val) and math.isfinite(sig)) or sig <= 0 or val == 0:
-        return f"sigma {sig!r} must be finite and > 0 over a finite, non-zero value {val!r}"
-    rel = sig / abs(val)
-    if rel >= MAX_RELATIVE_SIGMA:
-        return (f"relative sigma {rel:.3g} >= {MAX_RELATIVE_SIGMA:g} ({sigma_key}={sig!r} over {q}={val!r}) "
-                "is not a statistical band")
-    return None
+    """Why a sealed stat tolerance is unusable against `outputs` (None = it is sound): proof_verify's ONE definition
+    (``stat_band_problem``, SPEC 14 item 7), so the mint, reproduce and the verifier (13.4.3 row 22) can never
+    disagree about what a usable band is."""
+    from proof_verify.verify import stat_band_problem
+    return stat_band_problem(tol, outputs)
 
 
 #: SPEC 7.8 SIG-16 / 7.9 SIG-19: at most 7 co-signatures, so at most 8 declared seal signers.

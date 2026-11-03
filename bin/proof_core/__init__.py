@@ -12,7 +12,7 @@ The five verbs:
                                                       default; a consumer injects its own real key with
                                                       ``use_signer`` -- the kernel stays keyless).
   * REDACT    -- ``redact_bundle``                    withhold a section's value while keeping its seal valid.
-  * REPRODUCE -- ``reproduce_bundle(bundle, runner)`` re-derive the numbers via a consumer-injected runner.
+  * REPRODUCE -- ``reproduce_bundle(bundle_bytes, runner)`` re-derive the numbers via a consumer-injected runner.
   * PROVENANCE-- ``provenance.*``                     git/toolchain/data-library pins folded into the seal.
 
 The independent *checker* (integrity + origin, importing nothing from this package) lives in the
@@ -47,7 +47,7 @@ from .testing import assert_integration
 
 #: Single source of truth for the version. pyproject derives the dist version from this
 #: (see [tool.setuptools.dynamic]). Independent of any consumer's version line.
-__version__ = "0.24.0"
+__version__ = "0.25.0"
 
 __all__ = [
     "ATTESTATION_SCHEMA",

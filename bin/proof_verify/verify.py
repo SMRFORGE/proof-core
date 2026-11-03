@@ -30,6 +30,7 @@ real production trust root is pinned. Callers that only need integrity use `inte
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import hmac
@@ -37,6 +38,7 @@ import json
 import math
 import re
 import sys
+import threading
 from decimal import Decimal
 from typing import Any
 
@@ -181,6 +183,8 @@ STATE_FAIL = "fail"                      # a hash/seal/schema problem, or the si
 #: "this is corrupt". `integrity_ok` is still False and `verify_bundle` still returns False (integrity
 #: cannot be established, so a boolean consumer stays fail-closed); only the state + message distinguish it.
 STATE_UNSUPPORTED_CANON = "unsupported-canon"
+#: SPEC 13.1: not a readable bundle (section 4). Only `classify_bundle` (bytes or text) can return it.
+STATE_UNREADABLE = "unreadable"
 STATE_UNSUPPORTED_ALG = "unsupported-alg"
 _ALG_SUPPORTED = frozenset({"ed25519"})
 _SUITE_NAME = {"ed25519": "Ed25519", "ecdsa-p256": "ECDSA P-256"}
@@ -691,19 +695,70 @@ def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _verdict_int(v: Any) -> bool:
+    """An integer-valued number read from a verdict, as @proof-core/verify's Number.isInteger reads it: an int or a
+    whole finite float, never a boolean (`True` is an int in Python, so a bare isinstance check would accept it)."""
+    return type(v) is int or (type(v) is float and math.isfinite(v) and v.is_integer())
+
+
+#: Member names of @proof-core/verify's library verdict. Their presence means a verdict in that implementation's
+#: shape, which this `evaluate` refuses (E2 re-review I1: fail closed, no dual-name reading).
+_FOREIGN_VERDICT_KEYS = frozenset({"canonVersion", "reproduceTolerance", "policySha256", "pinSet", "keyMatchesPin",
+                                   "originBasis", "attestationsOk", "signerIsDemo"})
+
+
+def _check_verdict_shape(rep: Any) -> None:
+    """SPEC 13.4.2: `evaluate` reads a verdict this verifier produced. PolicyError for anything else: not an object, a
+    foreign-shape member, or a missing member a decision row reads (`state`, `canon_version`, `dims` with
+    `signoffs`, `time`, `archive`; the `signoffs`, `time` and `archive` objects; and `reproduce_tolerance` for v4)."""
+    if not isinstance(rep, dict):
+        raise PolicyError("evaluate: the verdict must be an object returned by classify_bundle")
+    foreign = sorted(k for k in rep if k in _FOREIGN_VERDICT_KEYS)
+    if foreign:
+        raise PolicyError(f"evaluate: the verdict has another implementation's member names {foreign}; evaluate reads "
+                          "only a verdict in classify_bundle's own shape (re-verify the bundle here instead)")
+    dims = rep.get("dims")
+    missing = [k for k in ("state", "canon_version", "dims", "signoffs", "time", "archive") if k not in rep]
+    if isinstance(dims, dict):
+        missing += [f"dims.{k}" for k in ("signoffs", "time", "archive") if k not in dims]
+    if rep.get("canon_version") == 3 and "reproduce_tolerance" not in rep:
+        missing.append("reproduce_tolerance")
+    bad = [k for k in ("dims", "signoffs", "time", "archive") if k in rep and not isinstance(rep[k], dict)]
+    if missing or bad or not isinstance(rep.get("state"), str):
+        raise PolicyError(f"evaluate: the verdict lacks or mistypes members a decision row reads "
+                          f"(missing {missing}, not objects {bad}); evaluate reads only classify_bundle's own verdict")
+
+
 def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -> list[str]:
     """SPEC 13.4.3, the reason codes in table order, for the rows this release can evaluate. Rows 3 to 12 read the
     `signoffs` dimension and its entries (`signoff_reasons`), rows 13 to 15 the `time` dimension, rows 16 to 18 the
     `archive` dimension (row 18: `require_archive`, and min_tsas against `min_archive_tsas`). Row 19 reads the
     `signoffs` entries again
-    (`partial_copy_reasons`, `require_full_copy_review`).
+    (`partial_copy_reasons`, `require_full_copy_review`). Rows 20 and 21 read the `archive` dimension with the
+    `signoffs` entries (`archive_reliance_reasons`: under `require_archive`, a valid archive must be continuous at
+    as_of and cover every sign-off counting toward `require_roles`).
 
     13.4.2: "`verdict` MUST have been produced under the same effective policy ... If the hashes differ, `evaluate`
     MUST refuse (an error, not a decision)". A verdict records its `policy_sha256`; ``members`` (with ``pin_set``,
-    or the verdict's own pins when it is None) must hash to it, else PolicyError is raised."""
+    or the verdict's own pins when it is None) must hash to it, else PolicyError is raised.
+
+    The verdict must be in THIS verifier's own shape (`classify_bundle`'s member names): one in another
+    implementation's shape (for example @proof-core/verify's camelCase `canonVersion`, `reproduceTolerance`), or one
+    missing a member the decision reads, is refused with PolicyError, never read with rows silently skipped."""
+    _check_verdict_shape(rep)
+    if not isinstance(members, dict):
+        raise TypeError("evaluate: the members form is a dict of every policy member, defaults filled in")
+    unknown = sorted(k for k in members if k != "_labels" and k not in _POLICY_DEFAULTS)
+    if unknown:          # as @proof-core/verify refuses (TypeError)
+        raise TypeError(f"evaluate: unknown policy member(s) {unknown}")
     missing = sorted(k for k in _POLICY_DEFAULTS if k not in members)
     if missing:          # the members form needs every member, defaults filled in (as @proof-core/verify refuses)
         raise TypeError(f"evaluate: the members form needs every policy member, defaults filled in; missing {missing}")
+    # 13.4.1: a member of a wrong type or out of range is refused (PolicyError), never read by truthiness (as
+    # @proof-core/verify's members form refuses): `require_archive: 1` is not `true`
+    for k in _POLICY_DEFAULTS:
+        if not _POLICY_SHAPES[k](members[k]):
+            raise PolicyError(f'evaluate: policy member "{k}" has a wrong type or a value out of range')
     recorded = rep.get("policy_sha256")
     if recorded is None and isinstance(rep.get("decision"), dict):
         recorded = rep["decision"].get("policy_sha256")
@@ -727,7 +782,7 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
     if dims.get("time") == "malformed":
         reasons.append("time_malformed")
     t = rep.get("time") if isinstance(rep.get("time"), dict) else {}
-    distinct = t.get("distinct_tsas") if t.get("state") == "valid" and isinstance(t.get("distinct_tsas"), int) else 0
+    distinct = t.get("distinct_tsas") if t.get("state") == "valid" and _verdict_int(t.get("distinct_tsas")) else 0
     if distinct < members.get("min_seal_tsas", 0):
         reasons.append("seal_tsas_insufficient")
     if dims.get("archive") == "broken":
@@ -736,11 +791,39 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
         reasons.append("archive_malformed")
     if members.get("require_archive"):
         a = rep.get("archive") if isinstance(rep.get("archive"), dict) else {}
-        fewest = a.get("min_tsas") if a.get("state") == "valid" and isinstance(a.get("min_tsas"), int) else 0
+        fewest = a.get("min_tsas") if a.get("state") == "valid" and _verdict_int(a.get("min_tsas")) else 0
         if dims.get("archive") != "valid" or fewest < members.get("min_archive_tsas", 1):
             reasons.append("archive_required")
     reasons += partial_copy_reasons(signoffs, members, v2=rep.get("canon_version") == 3)
+    reasons += archive_reliance_reasons(rep, members)
+    t = rep.get("reproduce_tolerance")
+    # row 22, under every policy, for v4 input only: a v3 bundle keeps its v3 decision (13.4.6, SIG-31a); its verdict
+    # still REPORTS the band as unusable
+    if rep.get("canon_version") == 3 and isinstance(t, dict) and t.get("state") == "unusable":
+        reasons.append("reproduce_tolerance_unusable")
     return reasons
+
+
+def archive_reliance_reasons(rep: dict, members: dict) -> list[str]:
+    """SPEC 13.4.3 rows 20 and 21: what `require_archive` also needs of a `valid` archive (10.8.6). Row 20,
+    `archive_not_continuous`: `continuous_at_as_of` is not true. Row 21, `archive_not_covering_signoffs`: some sign-off
+    the policy relies on, an entry eligible (13.4.4) for a role in `require_roles`, is not covered by the archive (its
+    entry digest is in `not_covered`, or the verdict reports none for it). A non-`valid` archive is row 18's alone."""
+    dims = rep.get("dims", {})
+    a = rep.get("archive") if isinstance(rep.get("archive"), dict) else {}
+    if not members.get("require_archive") or dims.get("archive") != "valid" or a.get("state") != "valid":
+        return []
+    out = []
+    if a.get("continuous_at_as_of") is not True:
+        out.append("archive_not_continuous")
+    signoffs = rep.get("signoffs") if isinstance(rep.get("signoffs"), dict) else {}
+    entries = ([x for x in (signoffs.get("entries") or []) if isinstance(x, dict)]
+               if rep.get("canon_version") == 3 else [])
+    nc = a.get("not_covered") if isinstance(a.get("not_covered"), list) else None
+    relied = [x for x in entries if any(_eligible(x, r, members) for r in set(members.get("require_roles") or []))]
+    if any(nc is None or not isinstance(x.get("entry_sha256"), str) or x["entry_sha256"] in nc for x in relied):
+        out.append("archive_not_covering_signoffs")
+    return out
 
 
 def _normalize_floats(obj: Any) -> Any:
@@ -1331,6 +1414,34 @@ def _text_depth_ok(text: str) -> bool:
     return True
 
 
+_INT_DIGITS_LOCK = threading.Lock()
+_INT_DIGITS_STATE = {"users": 0, "restore": None}     # verifications running under the raised limit; what to restore
+
+
+@contextlib.contextmanager
+def _int_digits():
+    """SPEC 4.2 item 8 (17.3.2): run with this interpreter's int-string limit (PYTHONINTMAXSTRDIGITS,
+    sys.set_int_max_str_digits) at least _MAX_INT_DIGITS, so reading, canonicalizing and reporting an integer of up to
+    4,300 digits never depends on the environment. The limit is process-wide, so a reference count decides: the first
+    entry raises it, the last exit restores the caller's value. The lock is held only around that bookkeeping, never
+    across a verification, so concurrent verifications (and a chain walk whose `resolve` verifies on another thread)
+    run in parallel. The loader still refuses more than _MAX_INT_DIGITS digits itself."""
+    with _INT_DIGITS_LOCK:
+        if _INT_DIGITS_STATE["users"] == 0:
+            old = sys.get_int_max_str_digits()
+            _INT_DIGITS_STATE["restore"] = old
+            if old and old < _MAX_INT_DIGITS:
+                sys.set_int_max_str_digits(_MAX_INT_DIGITS)
+        _INT_DIGITS_STATE["users"] += 1
+    try:
+        yield
+    finally:
+        with _INT_DIGITS_LOCK:
+            _INT_DIGITS_STATE["users"] -= 1
+            if _INT_DIGITS_STATE["users"] == 0 and sys.get_int_max_str_digits() != _INT_DIGITS_STATE["restore"]:
+                sys.set_int_max_str_digits(_INT_DIGITS_STATE["restore"])
+
+
 def loads(text: str) -> dict:
     """The ONE guarded JSON loader every bundle reader shares. Rejects, at parse time: a bundle larger
     than ``_MAX_BUNDLE_BYTES`` (a pathological input that would exhaust memory), pathological bracket
@@ -1344,8 +1455,9 @@ def loads(text: str) -> dict:
         raise ValueError(f"bundle text is {nbytes} UTF-8 bytes (> {_MAX_BUNDLE_BYTES} cap; rejected)")
     if not _text_depth_ok(text):
         raise ValueError(f"JSON nesting exceeds {_MAX_JSON_DEPTH} levels (rejected fail-closed)")
-    return json.loads(text, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_non_finite,
-                      parse_int=_parse_bounded_int, parse_float=_parse_finite_float)
+    with _int_digits():
+        return json.loads(text, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_non_finite,
+                          parse_int=_parse_bounded_int, parse_float=_parse_finite_float)
 
 
 #: Integer literals longer than this many digits are refused, independent of PYTHONINTMAXSTRDIGITS (CPython's
@@ -1357,15 +1469,10 @@ def _parse_bounded_int(literal: str) -> int:
     digits = literal.lstrip("-")
     if len(digits) > _MAX_INT_DIGITS:
         raise ValueError(f"integer literal has more than {_MAX_INT_DIGITS} digits (rejected fail-closed)")
-    # An interpreter configured with a LOWER int-string limit (PYTHONINTMAXSTRDIGITS) cannot print such an
-    # integer later (every str/repr/json.dumps would raise), so refuse it HERE, while reading, with the limit
-    # named: an unreadable verdict, never a traceback further on.
-    env_limit = sys.get_int_max_str_digits()
-    if env_limit and len(digits) > env_limit:
-        raise ValueError(f"integer literal has {len(digits)} digits, beyond this Python's PYTHONINTMAXSTRDIGITS "
-                         f"limit ({env_limit}); the reference reads up to {_MAX_INT_DIGITS} digits at the default "
-                         "limit -- re-run without lowering it")
-    return int(literal)
+    # SPEC 4.2 item 8: the verdict never depends on PYTHONINTMAXSTRDIGITS. Every entry point runs under
+    # `_int_digits()`, which lifts this interpreter's int-string limit to at least _MAX_INT_DIGITS for the duration.
+    with _int_digits():
+        return int(literal)
 
 
 def _sha(b: bytes) -> str:
@@ -2187,11 +2294,37 @@ _PROV_REQUIRED_PRESENT = ("data_library", "data_library_sha256")
 
 
 def _is_json_integer(v) -> bool:
-    # JSON Schema `integer` (a whole number, written 1 or 1.0); never a bool. A whole float is accepted so the
-    # verdict cannot depend on spelling under canon v2, where 1 and 1.0 seal identically.
+    # JSON Schema `integer` (a whole number, written 1 or 1.0); never a bool. A whole float is accepted here, as v3
+    # does; a v4 bundle is ALSO held to integer literals by _v4_integer_literal_problems (SPEC 8.4).
     if isinstance(v, bool):
         return False
     return isinstance(v, int) or (isinstance(v, float) and v.is_integer())
+
+
+#: SPEC v4 8.4: the integer-typed fields of a v4 bundle, as (where, key path). Each is read in the sealed section
+#: value AND in its readable copy, because the copies are compared under canon 2, which writes `1` and `1.0` alike.
+_V4_INTEGER_FIELDS = (("result", ("schema_version",)), ("provenance", ("rng_seed",)),
+                      ("provenance", ("lineage", "count")))
+
+
+def _v4_integer_literal_problems(bundle: dict) -> list[str]:
+    """SPEC v4 8.4: in a v4 bundle, `schema_version`, `rng_seed` and `lineage.count` MUST be integer literals (an
+    int in the parsed value model of 4.3); a whole-number double such as `1.0` or `1e0` fails the bundle. Read on the
+    parsed value, before any canonicalization. Booleans and other types are the type rules' business (8.1, 8.2)."""
+    out = []
+    manifest = bundle.get("manifest") if isinstance(bundle.get("manifest"), dict) else {}
+    copies = {"result": bundle.get("result"), "provenance": bundle.get("reproducibility")}
+    for sec, path in _V4_INTEGER_FIELDS:
+        blk = manifest.get(sec)
+        for label, root in ((f"manifest.{sec}.value", blk.get("value") if isinstance(blk, dict) else None),
+                            ("result" if sec == "result" else "reproducibility", copies[sec])):
+            v = root
+            for k in path:
+                v = v.get(k) if isinstance(v, dict) else None
+            if isinstance(v, float):
+                out.append(f"{label}.{'.'.join(path)} must be an integer literal in a v4 bundle, not the "
+                           f"whole-number double {v!r} (SPEC 8.4)")
+    return out
 
 
 def _check_required_provenance(prov_val: dict, problems: list[str]) -> None:
@@ -2324,6 +2457,145 @@ def _check_frontier_slots(prov_val: dict, problems: list[str], profile=None, own
             for i, link in enumerate(dfrom):
                 for p in _derived_from_binding_problems(link, own_seal, derived_from_keys):
                     problems.append(f"provenance.derived_from[{i}] {p}")
+
+
+# --- SPEC 13.4.3 row 22 / 14 item 7: a statistical reproduce_tolerance a verifier can check -------------------------
+
+#: 14 item 7: `derived` never names an integrity field (the same set as the producer's, independently stated).
+_TOL_INTEGRITY_FIELDS = frozenset({"engine", "benchmark_id", "generator_sha256", "model_sha256"})
+#: 14 item 7: the sealed relative 1-sigma must be below this.
+_TOL_MAX_RELATIVE_SIGMA = 0.05
+#: 14 item 6 / 7: the placeholder seed (the default `rng_seed`), which a stochastic result never seals.
+_TOL_PLACEHOLDER_SEED = 0
+#: SPEC 13.5 `claims_not_checked`: sealed producer claims only a re-run (reproduce) can check, never verify.
+_CLAIMS_PROVENANCE = ("code_version", "data_library", "deterministic", "engine", "engine_version", "produced_by",
+                      "reproduce")
+_CLAIMS_CORE = ("fidelity", "verdict")
+
+
+def _tol_number(v: Any) -> float | None:
+    """A finite JSON number as a float (an int or a float, never a bool or a string), else None."""
+    if type(v) not in (int, float):
+        return None
+    try:
+        f = float(v)
+    except OverflowError:
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _sealed_section(bundle: Any, sec: str) -> Any:
+    m = bundle.get("manifest") if isinstance(bundle, dict) else None
+    blk = m.get(sec) if isinstance(m, dict) else None
+    return blk.get("value", _END) if isinstance(blk, dict) else _END
+
+
+#: SPEC 14 item 7: the widest band (in sigmas) a statistical tolerance may declare; one definition for the verifier
+#: (row 22), the reproducer (proof_core.certify, which falls back to an exact match) and the mint (which refuses it).
+TOL_MAX_SIGMAS = 10.0
+
+
+def stat_band_outputs(core: Any) -> Any:
+    """SPEC 14 item 7: the outputs a statistical band reads, the result map of the core's ONE capability
+    (`core.result` must hold exactly one key; else None). One definition for verify, reproduce and the mint."""
+    res = core.get("result") if isinstance(core, dict) else None
+    if not (isinstance(res, dict) and len(res) == 1):
+        return None
+    return next(iter(res.values()))
+
+
+def stat_band_problem(tol: Any, outputs: Any) -> str | None:
+    """SPEC 14 item 7, the ONE definition of a usable statistical band, shared by the verifier (13.4.3 row 22), the
+    reproducer (proof_core.certify falls back to an exact match) and the producer (the mint refuses to seal one):
+    None when ``tol`` (a `kind: "stat"` reproduce_tolerance) is usable against ``outputs``, else why not. The
+    placeholder seed is the caller's check (it reads provenance)."""
+    if not isinstance(tol, dict):
+        return "the tolerance is not an object"
+    q, sk = tol.get("quantity"), tol.get("sigma_key")
+    if not (isinstance(q, str) and isinstance(sk, str)):
+        return "quantity and sigma_key must be strings (output keys)"
+    if sk == q:
+        return f"sigma_key {_shown(sk)} names the quantity itself (a self-referential band)"
+    derived = tol.get("derived", [])
+    if not isinstance(derived, list) or not all(isinstance(d, str) for d in derived):
+        return "derived must be a list of output-key strings"
+    if any(d in _TOL_INTEGRITY_FIELDS or d.endswith("_sha256") for d in derived):
+        return "derived names an integrity field (engine, benchmark_id, generator_sha256, model_sha256, *_sha256)"
+    sigmas = _tol_number(tol.get("sigmas"))
+    if sigmas is None:
+        return "sigmas must be a finite JSON number (not a string or a boolean)"
+    if not 0 < sigmas <= TOL_MAX_SIGMAS:
+        return f"sigmas must be greater than 0 and at most {TOL_MAX_SIGMAS:g}"
+    if not (isinstance(outputs, dict) and q in outputs and sk in outputs):
+        return "the outputs of the result's one capability lack the quantity or the sigma_key"
+    val, sig = _tol_number(outputs[q]), _tol_number(outputs[sk])
+    if val is None or sig is None:
+        return "the quantity and the sigma must be finite JSON numbers (not strings or booleans)"
+    if sig <= 0 or val == 0:
+        return "the sigma must be > 0 and the value non-zero"
+    if sig / abs(val) >= _TOL_MAX_RELATIVE_SIGMA:
+        return f"the relative sigma is {sig / abs(val):.3g}, not below {_TOL_MAX_RELATIVE_SIGMA:g}"
+    return None
+
+
+def tolerance_report(bundle: Any, profile=None) -> dict:
+    """SPEC 14 item 7 / 13.5 `reproduce_tolerance`: {state, problems} for the sealed result core's tolerance. `none`:
+    no statistical band (`kind` is not "stat"); `not_checked`: the result (or the band's quantity or sigma, as an
+    item) is withheld, or the provenance is; `sound`; `unusable`: `stat_band_problem` names a problem, or the seal
+    holds the profile's placeholder seed. The reproducer reads the band the same way and falls back to an exact match
+    on an unusable one; for a v4 bundle the decision rejects (13.4.3 row 22)."""
+    core, prov = _sealed_section(bundle, "result"), _sealed_section(bundle, "provenance")
+    if core is _END:
+        return {"state": "not_checked", "problems": ["the result section is withheld"]}
+    tol = core.get("reproduce_tolerance") if isinstance(core, dict) else None
+    if not (isinstance(tol, dict) and tol.get("kind") == "stat"):
+        return {"state": "none", "problems": []}
+    outputs = stat_band_outputs(core)
+    if isinstance(outputs, dict) and any(isinstance(outputs.get(k), dict) and "$committed" in outputs[k]
+                                         for k in (tol.get("quantity"), tol.get("sigma_key")) if isinstance(k, str)):
+        return {"state": "not_checked", "problems": ["the quantity or the sigma is a committed item"]}
+    why = stat_band_problem(tol, outputs)
+    if why is not None:
+        return {"state": "unusable", "problems": [why]}
+    if prov is _END:
+        return {"state": "not_checked", "problems": ["the provenance section is withheld (rng_seed)"]}
+    seed = prov.get("rng_seed") if isinstance(prov, dict) else None
+    placeholder = _profile_value(profile, "rng_seed_placeholder", _TOL_PLACEHOLDER_SEED)
+    if type(seed) in (int, float) and seed == placeholder:
+        return {"state": "unusable",
+                "problems": [f"rng_seed is the placeholder {placeholder!r} (a stochastic result records its seed)"]}
+    return {"state": "sound", "problems": []}
+
+
+def claims_not_checked(bundle: Any) -> list[str]:
+    """SPEC 13.5 `claims_not_checked`: the sealed producer claims present in the bundle that verification never
+    checks (only reproduce can), as `provenance.<key>` and `result.<key>`, sorted."""
+    out = []
+    for sec, keys in (("provenance", _CLAIMS_PROVENANCE), ("result", _CLAIMS_CORE)):
+        v = _sealed_section(bundle, sec)
+        if isinstance(v, dict):
+            out += [f"{sec}.{k}" for k in keys if k in v]
+    return sorted(out)
+
+
+#: SPEC 13.5: the single-bundle chain state when no walk ran: the bundle cites earlier records that were not checked.
+CHAIN_NOT_CHECKED = "not_checked"
+
+
+def single_bundle_chain(bundle: Any) -> dict:
+    """SPEC 13.5 / 9.3: what a single-bundle verification says about `derived_from` (it never walks it): `none` (no
+    links), `not_checked` (links, none of them checked; walk them with verify_chain), or `unknown` (the provenance is
+    withheld, so the links are invisible). Each link is listed with its upstream seal and role, state not_checked."""
+    prov = _sealed_section(bundle, "provenance")
+    if prov is _END:
+        return {"chain": CHAIN_UNKNOWN, "links": []}
+    df = prov.get("derived_from") if isinstance(prov, dict) else None
+    if not (isinstance(df, list) and df):
+        return {"chain": CHAIN_NONE, "links": []}
+    return {"chain": CHAIN_NOT_CHECKED,
+            "links": [{"bundle_sha256": ln.get("bundle_sha256") if isinstance(ln, dict) else None,
+                       "role": ln.get("role") if isinstance(ln, dict) else None, "state": CHAIN_NOT_CHECKED}
+                      for ln in df]}
 
 
 def _frontier_report(bundle: dict) -> dict:
@@ -2771,6 +3043,8 @@ def _check_v4(bundle: dict, problems: list[str], origin_problems: list[str],
         own_seal = _sha(_canon(sha256sums))
     except (TypeError, ValueError):
         own_seal = None
+    # SPEC v4 8.4: the integer-typed fields of a v4 bundle are integer literals, never a whole-number double
+    problems += _v4_integer_literal_problems(bundle)
     # step 15, provenance rules (8.2), seal_signers (7.9), the frontier slots (8.3) and derived_from (9.1)
     if not isinstance(prov_val, dict):
         if "value" in blocks["provenance"]:
@@ -3016,7 +3290,10 @@ def _reviewed_copy_problems(rc: Any) -> list[str]:
         out.append("reviewed_copy.withheld_sections must be a sorted, unique array drawn from inputs and result "
                    "(provenance is never withheld in v4)")
     n = rc["withheld_items_count"]
-    if not _json_int(n, 0, _MAX_WITHHELD_ITEMS_RC):
+    if isinstance(n, float):                 # SPEC v4 8.4 / 10.3.6: an integer literal, never `0.0`
+        out.append("reviewed_copy.withheld_items_count must be an integer literal, not a whole-number double "
+                   "(SPEC 8.4)")
+    elif not _json_int(n, 0, _MAX_WITHHELD_ITEMS_RC):
         out.append("reviewed_copy.withheld_items_count must be a JSON integer from 0 to 16,384")
     d = rc["withheld_items_sha256"]
     if not _is_digest(d):
@@ -3748,18 +4025,73 @@ _RESOURCE_PROBLEM = ("bundle could not be checked: verification ran out of resou
 _MAX_REPORTED_PROBLEMS = 200
 
 
-def classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_of: str | None = None,
+def parse_bundle(data: bytes | str) -> Any:
+    """SPEC 4: the bundle's bytes (strict UTF-8) or text, parsed by the hardened loader (`loads`: size, nesting,
+    duplicate keys, NaN and overflowing literals, the 4,300-digit cap). Raises ValueError (`unreadable`); a parsed
+    object is refused with TypeError, because every rule of section 4 is a rule about bytes."""
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        try:
+            data = bytes(data).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"the bundle is not UTF-8: {exc}") from None
+    if not isinstance(data, str):
+        raise TypeError("a verification takes the bundle's bytes or text (SPEC 4: duplicate keys, size and digit "
+                        f"limits are checked on bytes), not a parsed {type(data).__name__}")
+    return loads(data)
+
+
+def unreadable_report(problem: str, *, policy=None, pins=None, as_of: str | None = None) -> dict:
+    """SPEC 13.1 / 13.5: the verdict on input that is not a readable bundle: state `unreadable`, no integrity, every
+    dimension `none`, and the decision under the effective policy (it always rejects: row 1)."""
+    pin_set, members = effective_policy(policy, pins)
+    members.pop("_labels", None)
+    members = {**_POLICY_DEFAULTS, **members}
+    eff = pin_set if pin_set is not None else {}
+    out = {"state": STATE_UNREADABLE, "integrity_ok": False, "key_matches_pin": False, "origin_ok": False,
+           "problems": [problem], "integrity_problems": [problem], "origin_problems": [], "canon_version": None,
+           "dims": {"signoffs": "none", "time": "none", "archive": "none", "chain": "none", "tolerance": "none"},
+           "signoffs": {"state": "none", "checked": False, "entries": [], "problems": []},
+           "time": {"state": "none"}, "archive": {"state": "none"},
+           "reproduce_tolerance": {"state": "not_checked", "problems": ["the input is unreadable"]},
+           "as_of": as_of if as_of is not None else utc_now(), "notes": [], "claims_not_checked": []}
+    out["policy_sha256"] = policy_sha256(members, eff)
+    out["decision"] = {"accept": False, "policy_sha256": out["policy_sha256"], "reasons": ["state_not_accepted"]}
+    return out
+
+
+def classify_bundle(data: bytes | str, *, profile=None, policy=None, pins=None, as_of: str | None = None,
                     work_budget: WorkBudget | None = None) -> dict:
-    """The verdict of one verification; see `_classify_bundle`.
+    """The verdict of one verification of the bundle's BYTES (or text): parsed here with the hardened loader (SPEC
+    4), so no verdict is ever given on an object that skipped the byte-level checks (17.3.2). Input the loader
+    refuses gets the `unreadable` verdict (13.1); a parsed object is refused with TypeError. A policy that is
+    malformed raises PolicyError (13.4.1), before the bundle is read. See `_classify_parsed` for the rest.
 
     ``work_budget`` (SPEC 10.7.4 TT-15): the `WorkBudget` this verification charges its public-key operations to.
     None starts a fresh one. A product layer that adds its own operations (`verify_signature(...,
     work_budget=...)`) passes one budget here and to each of them, so the 2,048 limit covers the whole verification.
     A refused operation is not performed: a seal signature it refuses fails integrity, a sign-off signature makes its
     entry invalid, and a token signature makes the token `malformed`."""
+    with _int_digits():
+        if policy is not None or pins is not None:
+            effective_policy(policy, pins)                  # 13.4.1: a malformed policy is refused, never a verdict
+        try:
+            bundle = parse_bundle(data)
+        except (ValueError, RecursionError) as exc:
+            return unreadable_report(f"unreadable: {exc}", policy=policy, pins=pins, as_of=as_of)
+        return _classify_parsed(bundle, profile=profile, policy=policy, pins=pins, as_of=as_of,
+                                work_budget=work_budget)
+
+
+def _classify_parsed(bundle: Any, *, profile=None, policy=None, pins=None, as_of: str | None = None,
+                     work_budget: WorkBudget | None = None) -> dict:
+    """PRIVATE: the verdict on an object the CALLER parsed. It does not, and cannot, check what section 4 checks on
+    bytes (duplicate keys above all; also the size and digit caps), so it is not part of the public API: only this
+    package's CLI and chain walk (which parse with `loads` first) and the reference tests call it. Use
+    `classify_bundle(bytes or text)`."""
     token = _work.CURRENT.set(work_budget if work_budget is not None else WorkBudget())
     try:
-        return _classify_bundle(bundle, profile=profile, policy=policy, pins=pins, as_of=as_of)
+        with _int_digits():
+            return _classify_bundle(bundle, profile=profile, policy=policy, pins=pins, as_of=as_of)
     finally:
         _work.CURRENT.reset(token)
 
@@ -4007,10 +4339,22 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
         "archive": {k: v for k, v in archive_out.items() if not k.startswith("_")},
         "notes": notes,
         "note_details": {NOTE_COMMITTED_KEY_PLAIN_DATA: plain} if plain else {},
+        # SPEC 13.5 / 14 item 7: the sealed statistical band, as a verifier can check it (row 22)
+        "reproduce_tolerance": (tolerance_report(bundle, profile) if integrity_ok else
+                                {"state": "not_checked", "problems": ["integrity does not hold"]}),
+        # SPEC 13.5: sealed producer claims that verification never checks (only reproduce can)
+        "claims_not_checked": claims_not_checked(bundle),
     }
     # SPEC 7.15 / 13.3: the `signers` output is asserted through runner protocol v2 `expect_dims` (vector:
     # valid/v4_ed25519_plus_p256.json), so the dims carry it beside `items`
     out["dims"]["signers"] = signers
+    # SPEC 13.5: a single-bundle verdict never walks `derived_from`; it says so (`chain` not_checked) whenever the
+    # bundle cites earlier records, and `dims` carries that and the reproduce_tolerance state (row 22)
+    links = single_bundle_chain(bundle)
+    out["dims"]["chain"] = links["chain"]
+    out["dims"]["tolerance"] = out["reproduce_tolerance"]["state"]
+    if links["chain"] != CHAIN_NONE:
+        out["chain"] = links
     if v4_blocks is not None:
         # SPEC 7.15: for v4 input `signer` is "the key id of the first **verified** S_sup block in E order ... or
         # `null` when integrity does not hold"
@@ -4108,7 +4452,7 @@ def _v3_signers(primary: dict | None, pins: dict[str, bool], integrity_ok: bool,
              "pinned": pinned, "demo": pinned and (pins[kid] or demo_pin), "counted": bool(origin_ok)}]
 
 
-def verify_bundle(bundle: dict, *, profile=None) -> tuple[bool, list[str]]:
+def verify_bundle(data: bytes | str, *, profile=None) -> tuple[bool, list[str]]:
     """Recompute every hash, check the embedded result.v1 core, and verify the signature
     under the pinned key; return (ok, problems). `ok` means INTEGRITY AND ORIGIN: a bundle
     that is untampered but signed under a key other than the pinned one is NOT ok here, and
@@ -4116,17 +4460,28 @@ def verify_bundle(bundle: dict, *, profile=None) -> tuple[bool, list[str]]:
     established under the demo pin). See `classify_bundle` for the full verdict, and
     `integrity_ok` for callers that only need the untampered check. `profile` (optional) selects a
     dialect; see `classify_bundle`."""
-    rep = classify_bundle(bundle, profile=profile)
+    rep = classify_bundle(data, profile=profile)
     return rep["origin_ok"], rep["problems"]
 
 
-def integrity_ok(bundle: dict, *, profile=None) -> bool:
+def _verify_bundle_parsed(bundle: Any, *, profile=None) -> tuple[bool, list[str]]:
+    """PRIVATE: `verify_bundle` on an object the caller parsed (see `_classify_parsed`)."""
+    rep = _classify_parsed(bundle, profile=profile)
+    return rep["origin_ok"], rep["problems"]
+
+
+def _integrity_ok_parsed(bundle: Any, *, profile=None) -> bool:
+    """PRIVATE: `integrity_ok` on an object the caller parsed (see `_classify_parsed`)."""
+    return _classify_parsed(bundle, profile=profile)["integrity_ok"]
+
+
+def integrity_ok(data: bytes | str, *, profile=None) -> bool:
     """INTEGRITY only: every hash recomputes and the Ed25519 signature is valid under the bundle's OWN
     embedded key, so the sealed inputs/result are exactly as signed. Says NOTHING about origin -- the
     signing key need not be the pin, and under the demo pin origin can never be established. Callers that
     only need 'is this record untampered' use this; `verify_bundle` additionally requires origin.
     `profile` (optional) selects a dialect; see `classify_bundle`."""
-    return classify_bundle(bundle, profile=profile)["integrity_ok"]
+    return classify_bundle(data, profile=profile)["integrity_ok"]
 
 
 def _check(bundle: dict, problems: list[str], origin_problems: list[str],
@@ -4541,7 +4896,7 @@ def _chain_state(bundle: Any, problems: list[str]) -> str:
 
 def _classify_chain(bundle: Any, profile) -> dict:
     """`classify_bundle` under `profile`, augmented with the sealed-chain state the walker folds over."""
-    rep = dict(classify_bundle(bundle, profile=profile))
+    rep = dict(_classify_parsed(bundle, profile=profile))
     rep["chain"] = _chain_state(bundle, rep["integrity_problems"])
     return rep
 
@@ -4596,15 +4951,30 @@ def _result_block(bundle: Any) -> Any:
 
 
 def _candidate_rank(bundle: dict, profile) -> tuple[int, int, int]:
-    rep = classify_bundle(bundle, profile=profile)
+    rep = _classify_parsed(bundle, profile=profile)
     res = _result_block(bundle)
     return (int(rep["integrity_ok"]), int(isinstance(res, dict) and "value" in res), int(rep["origin_ok"]))
 
 
-def index_upstreams(bundles, *, profile=None) -> dict[str, dict]:
-    """Index candidate upstream bundles by their RECOMPUTED seal (a convenience to build a `resolve` from:
-    `index_upstreams(...).get`). When two copies share a seal, the intact copy with its `result` present
-    (then: signed under the pin) wins; among equals the FIRST seen wins."""
+def index_upstreams(datas, *, profile=None) -> dict[str, str]:
+    """Index candidate upstream bundles, each given as its BYTES or text, by their RECOMPUTED seal (a convenience to
+    build a `resolve` from: `index_upstreams(...).get`, which returns the upstream's text). An unreadable candidate is
+    skipped. When two copies share a seal, the intact copy with its `result` present (then: signed under the pin)
+    wins; among equals the FIRST seen wins."""
+    texts = {}
+    parsed = []
+    for d in datas:
+        try:
+            b = parse_bundle(d)
+        except (ValueError, RecursionError):
+            continue
+        texts[id(b)] = d if isinstance(d, str) else bytes(d).decode("utf-8")
+        parsed.append(b)
+    return {seal: texts[id(b)] for seal, b in _index_upstreams_parsed(parsed, profile=profile).items()}
+
+
+def _index_upstreams_parsed(bundles, *, profile=None) -> dict[str, dict]:
+    """PRIVATE: `index_upstreams` over objects the caller parsed (see `_classify_parsed`)."""
     index: dict[str, dict] = {}
     ranks: dict[str, tuple[int, int, int]] = {}
     for b in bundles:
@@ -4816,9 +5186,31 @@ def _consumes_verdict(citing_cap, up: dict, allowed) -> tuple[str, str] | None:
     return None
 
 
-def verify_chain(bundle: dict, resolve, *, profile=None, consumes_of=None,
+def verify_chain(data: bytes | str, resolve, *, profile=None, consumes_of=None,
                  max_depth: int = _MAX_CHAIN_DEPTH, max_visited: int = _MAX_CHAIN_VISITED) -> dict:
-    """Walk `bundle`'s sealed `derived_from` links through the supplied upstreams; return the chain report.
+    """The chain walk of the bundle given as its BYTES or text (SPEC 4), through `resolve(seal) -> bytes | str |
+    None` (build one with `index_upstreams(texts).get`). Each upstream is parsed with the hardened loader too; an
+    unreadable one is read as an empty object, so its link fails. A parsed root is refused with TypeError. See
+    `_verify_chain_parsed`."""
+    with _int_digits():
+        root = parse_bundle(data)
+
+        def resolve_parsed(seal):
+            up = resolve(seal)
+            if up is None:
+                return None
+            try:
+                return parse_bundle(up)
+            except (ValueError, RecursionError, TypeError):
+                return {}
+        return _verify_chain_parsed(root, resolve_parsed, profile=profile, consumes_of=consumes_of,
+                                    max_depth=max_depth, max_visited=max_visited)
+
+
+def _verify_chain_parsed(bundle: Any, resolve, *, profile=None, consumes_of=None,
+                         max_depth: int = _MAX_CHAIN_DEPTH, max_visited: int = _MAX_CHAIN_VISITED) -> dict:
+    """PRIVATE: walk `bundle`'s sealed `derived_from` links through the supplied upstreams; return the chain report.
+    The root and the upstreams `resolve` returns are objects the caller parsed (see `_classify_parsed`).
 
     DOMAIN-NEUTRAL + OFF-PATH: a Stage-2 addition nothing on the neutral verify path calls. `resolve(seal)
     -> bundle | None` is the air-gapped upstream seam (build one with `index_upstreams(...).get`); nothing

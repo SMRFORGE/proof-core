@@ -1,9 +1,11 @@
 """Conformance: certify a verifier against the canonical evidence-envelope vectors.
 
-Anyone who writes (or uses) an independent verifier can prove it CONFORMS by running it against
-these vectors: every VALID bundle must verify, every INVALID bundle must be rejected. A tool
-that passes here behaves like the reference on the whole battery of accept/reject cases -- it is
-how "verify without the tool that produced it" is made checkable rather than promised.
+This is a coarse, library-mode CLASS check: every 'valid' vector must verify, every 'invalid' one must be
+rejected with a plain rejection, every 'unsupported' / 'unsupported-alg' one must get that named fail-forward
+verdict, every 'policy' vector must get its exact state under its own policy (or be refused when it carries
+expect_error), and 'unreadable' vectors are reported not applicable (see run_conformance). Conformance to SPEC v4
+13.3 means the EXACT state of expected_states.json and every expect_* field for every vector, which only
+envelope-spec's conformance/run.py checks; use that to call a verifier conformant.
 
 stdlib only; imports nothing from the producer. `run_conformance(verify_fn, vectors_dir)` takes
 any callable returning either `bool` or `(ok, problems)`.
@@ -25,7 +27,6 @@ from .verify import loads as _loads  # the ONE guarded loader (dup-key / NaN / d
 CONFORMANCE_SCHEMA = "evidence.conformance.v2"
 
 #: The state of an input the guarded loader refuses (SPEC v4 draft 13.1: "Not a parseable bundle (section 4)").
-#: It is never a `classify_bundle` state (that entry point receives a parsed value, 4.2 item 10).
 STATE_UNREADABLE = "unreadable"
 
 
@@ -101,7 +102,7 @@ def _policy_entry(d: pathlib.Path, entry: dict, text: str, policy_fn, states: di
     try:
         # SPEC 13.3: "the vector's policy, or `policy/default.json` when the vector names none"
         policy = _loads(_safe_vector_path(d, entry.get("policy", "policy/default.json")).read_text(encoding="utf-8"))
-        bundle = _loads(text)
+        bundle = text                   # the vector's BYTES: the verifier parses them itself (SPEC 4)
     except (OSError, KeyError, ValueError) as exc:
         return False, f"error: {exc}"
     try:
@@ -139,7 +140,7 @@ def _policy_entry(d: pathlib.Path, entry: dict, text: str, policy_fn, states: di
 
 
 def classify_with_policy(bundle, policy, caller_pins=None, as_of=None) -> dict:
-    """The reference verifier as a ``policy_fn`` for `run_conformance`: ``classify_bundle`` under the vector's
+    """The reference verifier as a ``policy_fn`` for `run_conformance`: ``classify_bundle`` of the vector's bytes under the vector's
     receiver policy and its out-of-policy caller pins (SPEC v4 draft 13.4.1 step 3), at ``as_of`` (the vector's, or
     the corpus's; None: the current time)."""
     from .verify import classify_bundle
@@ -161,13 +162,9 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
     conformant iff it accepts every 'valid' vector, rejects every 'invalid' one with a plain rejection, and
     reports the named fail-forward verdict for every 'unsupported' / 'unsupported-alg' one.
 
-    'unreadable' vectors (SPEC v4 draft 13.3) do not test `verify_fn`. This runner is library mode: it parses
-    each text with the shared guarded loader and hands `verify_fn` a parsed value, and SPEC v4 draft 4.2 item 10
-    says such an entry point "has no unreadable outcome". So when the loader refuses an 'unreadable' vector's
-    text, `verify_fn` is never called and the vector is listed in `not_applicable`, NOT counted in `passed`
-    (`passed + len(not_applicable) == total` on a clean run). It is still checked: if the loader ACCEPTS the
-    text, `verify_fn` runs and the vector is a failure. Per-verifier coverage of the parse rules belongs to a
-    runner that gives the verifier the raw text. A battery with no applicable vector never certifies.
+    `verify_fn` (and ``policy_fn``) receive each vector's exact BYTES and parse them themselves (SPEC 4, 17.3.2), so
+    an 'unreadable' vector is checked like any other: the verifier must report the state `unreadable`.
+    `not_applicable` is always empty (kept for callers that read it).
 
     'policy' vectors (runner protocol v2) carry their own receiver policy file. They run through ``policy_fn(bundle,
     policy, caller_pins, as_of=...)`` (the vector's `as_of`, else the manifest's `corpus_as_of`), which returns a classify_bundle-style dict or raises an exception whose ``kind`` names
@@ -199,34 +196,20 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
         # a vector that names its own policy runs under it, whatever its `expect` (SPEC 13.3; a `valid` vector with its
         # own policy, such as the trusted-time vectors that carry test-TSA pins, must reach an accept state under it)
         if isinstance(entry, dict) and (entry.get("expect") == "policy" or "policy" in entry):
-            try:
-                text = raw.decode("utf-8")
-            except ValueError as exc:
-                failures.append({"file": entry["file"], "expected": "policy", "got": f"error: {exc}",
-                                 "note": entry.get("note", "")})
-                continue
-            ok, got = _policy_entry(d, entry, text, policy_fn, states, manifest.get("corpus_as_of"))
+            ok, got = _policy_entry(d, entry, raw, policy_fn, states, manifest.get("corpus_as_of"))
             if ok:
                 passed += 1
             else:
                 failures.append({"file": entry["file"], "expected": entry.get("expect"), "got": got,
                                  "note": entry.get("note", "")})
             continue
-        loader_refused = False
+        # SPEC 4 / 17.3.2: the verifier gets the vector's exact BYTES and parses them itself, so the parse rules
+        # (invalid UTF-8, a duplicate key, NaN, an overflowing literal, too deep, too big) are its own verdict
+        # (`unreadable`), never a verdict on an object someone else parsed
         try:
-            # the exact bytes, decoded as strict UTF-8: invalid UTF-8 is unreadable (SPEC 4.1 item 1;
-            # UnicodeDecodeError is a ValueError), like every other refusal of the hardened loader
-            bundle = _loads(raw.decode("utf-8"))
-        except ValueError as exc:
-            loader_refused = True
-            # the hardened loader REFUSED the text (dup key, NaN, an overflowing literal, too deep, too big): the
-            # state is `unreadable` (SPEC v4 draft 13.1, 4.2), the same verdict the CLI gives (exit 2). Only an
-            # 'unreadable' vector expects it; for every other expectation it is a failure. (Before the v4 draft
-            # added the `unreadable` expectation this counted as 'invalid'; no v3 vector is unreadable, so no
-            # v3 vector's outcome changes.)
-            accepted, state, problems = False, STATE_UNREADABLE, [f"unreadable: {exc}"]
-        else:
-            accepted, state, problems = _interpret(verify_fn(bundle))
+            accepted, state, problems = _interpret(verify_fn(raw))
+        except (TypeError, ValueError) as exc:
+            accepted, state, problems = False, None, [f"the verifier raised {type(exc).__name__}: {exc}"]
         expect = entry["expect"]
         unsupported = _is_unsupported_canon(state, problems)
         unsupported_alg = _is_unsupported_alg(state, problems)
@@ -253,9 +236,7 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
         else:
             ok = False  # an UNRECOGNIZED expect token is a conformance FAILURE, never coerced
             got = f"{got} (unknown expect {expect!r})"
-        if ok and loader_refused:
-            not_applicable.append(entry["file"])   # the loader's verdict, not verify_fn's (see docstring)
-        elif ok:
+        if ok:
             passed += 1
         else:
             failures.append({"file": entry["file"], "expected": expect,
