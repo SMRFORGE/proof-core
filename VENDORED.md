@@ -6,7 +6,7 @@ plugin — fixes go upstream, then re-vendor.
 
 - **Upstream:** https://gitlab.com/proof-core/proof-core (MIT)
 - **Version:** 0.24.0
-- **main commit:** 2a3afdb (release/v0.24.0; switch to the tag commit after tagging)
+- **main commit:** ecdc523 (tag v0.24.0)
 - **Vendored:** 2026-11-03
 
 ## Why vendored
