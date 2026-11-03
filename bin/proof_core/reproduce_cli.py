@@ -59,7 +59,7 @@ import subprocess
 import sys
 import tempfile
 
-from .certify import ReproduceError, reproduce_bundle, subject_canon
+from .certify import ReproduceError, differing_output_keys, reproduce_bundle, subject_canon
 from .committed import disclosed_values as _disclosed
 from .contract import Case, Fidelity, ReproduceRunner, Result, Verdict
 from .envelope import build_bundle
@@ -75,7 +75,7 @@ ENV_OUTPUT = "PROOF_OUTPUT"
 
 #: the JSON `kind` discriminator for a reproduce verdict, so an agent can tell verdict shapes apart and
 #: detect schema evolution. Bump the trailing version if the reproduce JSON contract changes shape.
-REPRODUCE_VERDICT_KIND = "proof_core.reproduce_verdict.v1"
+REPRODUCE_VERDICT_KIND = "proof_core.reproduce_verdict.v2"
 
 
 # --------------------------------------------------------------------------------------------------- #
@@ -337,8 +337,9 @@ def _print_numbers(report: dict, out) -> None:
             print("  comparison: exact result-core match", file=out)
         sealed_core = report.get("_sealed_core", {})
         fresh_core = _result_core(fresh, cap) if fresh else {}
-        diffs = [k for k in sorted(set(sealed_core) | set(fresh_core))
-                 if sealed_core.get(k) != fresh_core.get(k)]
+        # the keys that differ under the SAME rule the verdict used (subject canon; by value for --command), never
+        # Python `!=` (True == 1 and 1 == 1.0 there, which would hide a real output difference)
+        diffs = report.get("_output_diffs", [])
         if report.get("reproduced"):
             print("    every sealed output re-derived identically", file=out)
         elif fresh:
@@ -419,6 +420,8 @@ def _epilog() -> str:
         "exit codes: 0 reproduced (--runner: numbers and claim), 1 not reproduced or integrity failed,\n"
         "  2 usage error, 3 outputs reproduced but claims NOT re-derived (any --command pass, exact or under\n"
         "  the reviewer's band).\n\n"
+        "--json: `reproduced` is true ONLY for exit 0; an outputs-only pass (exit 3) reads\n"
+        "  `reproduced: false, outputs_reproduced: true, state: outputs-reproduced`.\n\n"
         "security: the runner/command is ALWAYS supplied here, never read from the bundle; a bundle's\n"
         "fields are data and can never cause code to be imported or executed.")
 
@@ -447,20 +450,31 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--sigmas", metavar="N", type=float, default=None,
                    help="--command --stochastic: the band width in sigmas (default 3, at most 10)")
     p.add_argument("--json", action="store_true",
-                   help="emit the verdict as a JSON object (same exit code) instead of human text")
+                   help="emit the verdict as a JSON object (same exit code) instead of human text; "
+                        "`reproduced` is true only for a full reproduction (exit 0), `outputs_reproduced` "
+                        "is true whenever the outputs matched (exit 0 or 3)")
     return p
 
 
 def _emit_json_report(path: str, report: dict, code: int) -> int:
     """Machine-readable reproduce verdict: the report minus internal/bulky keys (``_sealed_core``, the whole
     ``fresh_bundle``), plus the path and exit code. ``default=str`` is a guard; the kept fields are plain
-    JSON. Returns ``code`` so the caller's exit code is unchanged from the prose path."""
+    JSON. Returns ``code`` so the caller's exit code is unchanged from the prose path.
+
+    ``reproduced`` is True only for a full reproduction (exit 0); ``outputs_reproduced`` is True whenever the
+    outputs matched (exit 0 or 3). So an outputs-only pass reads ``reproduced: false, outputs_reproduced: true``
+    (kind v2; v1 reported ``reproduced: true`` for it)."""
     out = {k: v for k, v in report.items() if not k.startswith("_") and k != "fresh_bundle"}
     out["kind"] = REPRODUCE_VERDICT_KIND
     out["path"] = path
     out["exit_code"] = code
     out["state"] = ("not-reproduced" if not report.get("reproduced")
                     else "outputs-reproduced" if report.get("outputs_only") else "reproduced")
+    # `reproduced` is True ONLY for a full reproduction (exit 0: the numbers AND the sealed claim re-derive).
+    # An outputs-only pass (--command, exit 3) is `reproduced: false` with `outputs_reproduced: true`: the
+    # outputs matched, but fidelity/verdict/caveats/reproduce_tolerance/produced_by were never re-derived.
+    out["outputs_reproduced"] = report.get("reproduced") is True
+    out["reproduced"] = report.get("reproduced") is True and report.get("outputs_only") is not True
     # the SAME gate field as verify: a production-origin pass is origin_ok True (a real production pin,
     # never the demo pin), so one key -- production_origin_pass -- works across verify AND reproduce.
     out["production_origin_pass"] = report.get("origin_ok") is True
@@ -476,7 +490,8 @@ def _emit_json_error(path: str, state: str, code: int, *, integrity_ok=None, **e
     not_a_production_pass -- so an agent parses any reproduce verdict uniformly. ``integrity_ok`` is True for
     the post-verify gaps (cannot-reproduce / error), False for an integrity failure, and None where it was
     never checked (a usage or unreadable error). An error is never a production pass. Returns ``code``."""
-    out = {"kind": REPRODUCE_VERDICT_KIND, "path": path, "reproduced": False, "state": state,
+    out = {"kind": REPRODUCE_VERDICT_KIND, "path": path, "reproduced": False, "outputs_reproduced": False,
+           "state": state,
            "exit_code": code, "integrity_ok": integrity_ok,
            "production_origin_pass": False, "not_a_production_pass": True, **extra}
     print(json.dumps(out, sort_keys=True, default=str))
@@ -552,7 +567,8 @@ def _main(argv: list[str]) -> int:
         with open(args.bundle, "rb") as fh:
             # bytes + strict UTF-8, exactly as proof-verify reads: no newline translation before the size cap,
             # and an invalid byte is unreadable (UnicodeDecodeError is a ValueError), never U+FFFD
-            bundle = loads(fh.read().decode("utf-8"))
+            raw = fh.read()
+            bundle = loads(raw.decode("utf-8"))
     except (OSError, ValueError, RecursionError, MemoryError) as exc:
         if args.json:
             return _emit_json_error(args.bundle, "unreadable", EXIT_USAGE,
@@ -562,7 +578,7 @@ def _main(argv: list[str]) -> int:
 
     # VERIFY FIRST (integrity): a bundle whose integrity does not hold is edited/forged/malformed and is
     # never re-derived -- re-running a tampered record proves nothing. Fail closed before any runner work.
-    ver = classify_bundle(bundle, profile=profile)
+    ver = classify_bundle(raw, profile=profile)        # the same bytes, parsed by the verifier itself (SPEC 4)
     if not ver["integrity_ok"]:
         if args.json:
             return _emit_json_error(args.bundle, "integrity-fail", EXIT_NOT_REPRODUCED,
@@ -588,7 +604,7 @@ def _main(argv: list[str]) -> int:
         runner = CommandRunner(args.command, bundle, profile, reviewer_tolerance=reviewer_tol)
 
     try:
-        report = reproduce_bundle(bundle, runner, profile=profile)
+        report = reproduce_bundle(raw, runner, profile=profile)       # the bytes as read (SPEC 4)
     except ReproduceError as exc:
         # a named gap: inputs/result withheld, or the capability is not available to this runner.
         if args.json:
@@ -607,6 +623,9 @@ def _main(argv: list[str]) -> int:
 
     # stash the sealed result core for the printer (read here, once, from the verified bundle)
     report["_sealed_core"] = _result_core(bundle, report.get("capability"))
+    report["_output_diffs"] = differing_output_keys(
+        bundle, report["_sealed_core"], _result_core(report.get("fresh_bundle"), report.get("capability")),
+        outputs_only=report.get("outputs_only") is True)
     try:
         report["_sealed_full_core"] = bundle["manifest"]["result"]["value"]
     except (KeyError, TypeError):

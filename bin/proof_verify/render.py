@@ -10,6 +10,7 @@ Standard library only; imports nothing from the producer.
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 #: SPEC 13.6: "A render that shows at least one attestation MUST show this sentence once".
@@ -80,7 +81,31 @@ def headline(reasons: list[str]) -> str | None:
         return f"fail (sign-off policy: {code})"
     if code in ("time_invalid", "time_malformed"):
         return "fail (invalid timestamp)"
+    if code == "reproduce_tolerance_unusable":
+        return "fail (unusable reproduce tolerance)"
     return f"fail (policy: {code})"
+
+
+def claims_lines(rep: dict, bundle: Any) -> list[str]:
+    """SPEC 13.6 "Producer claims": the sealed producer claims are shown as claimed and NOT checked by verification
+    (only reproduce can check them), `produced_by` by value; an unusable statistical band says so (13.4.3 row 22)."""
+    out = []
+    claims = rep.get("claims_not_checked") or []
+    if claims:
+        prov = {}
+        try:
+            v = bundle["manifest"]["provenance"]["value"]
+            prov = v if isinstance(v, dict) else {}
+        except (KeyError, TypeError):
+            pass
+        pb = f" (produced_by {E(json.dumps(prov['produced_by']))})" if "produced_by" in prov else ""
+        out.append(f"producer claims{pb}: claimed by the producer, NOT checked by verify; only reproduce can check "
+                   f"them: {', '.join(E(str(c)) for c in claims)}")
+    t = rep.get("reproduce_tolerance") or {}
+    if t.get("state") == "unusable":
+        why = "; ".join(E(str(p)) for p in t.get("problems") or [])
+        out.append(f"reproduce_tolerance: the sealed statistical band is UNUSABLE ({why}); reproduce compares exactly")
+    return out
 
 
 def seal_signer_lines(rep: dict) -> list[str]:
