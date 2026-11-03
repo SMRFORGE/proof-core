@@ -698,7 +698,7 @@ def utc_now() -> str:
 def _verdict_int(v: Any) -> bool:
     """An integer-valued number read from a verdict, as @proof-core/verify's Number.isInteger reads it: an int or a
     whole finite float, never a boolean (`True` is an int in Python, so a bare isinstance check would accept it)."""
-    return type(v) is int or (type(v) is float and math.isfinite(v) and v.is_integer())
+    return (isinstance(v, int) and not isinstance(v, bool)) or (type(v) is float and math.isfinite(v) and v.is_integer())
 
 
 #: Member names of @proof-core/verify's library verdict. Their presence means a verdict in that implementation's
@@ -1465,10 +1465,22 @@ def loads(text: str) -> dict:
 _MAX_INT_DIGITS = 4300
 
 
+class _NegativeZero(int):
+    """The integer literal `-0` as the loader read it. Its value is the integer 0 (SPEC 4.3) and it canonicalizes as
+    `0` under every canon; the type only keeps the spelling, so SPEC v4 8.4 ("an integer literal is written without a
+    minus sign on zero") can be checked on the parsed value. The JS reference reads the same from its NumLit text."""
+    __slots__ = ()
+
+
+_NEG_ZERO = _NegativeZero(0)
+
+
 def _parse_bounded_int(literal: str) -> int:
     digits = literal.lstrip("-")
     if len(digits) > _MAX_INT_DIGITS:
         raise ValueError(f"integer literal has more than {_MAX_INT_DIGITS} digits (rejected fail-closed)")
+    if literal == "-0":                       # the JSON grammar has no other zero with a sign or a leading zero
+        return _NEG_ZERO
     # SPEC 4.2 item 8: the verdict never depends on PYTHONINTMAXSTRDIGITS. Every entry point runs under
     # `_int_digits()`, which lifts this interpreter's int-string limit to at least _MAX_INT_DIGITS for the duration.
     with _int_digits():
@@ -2310,7 +2322,7 @@ _V4_INTEGER_FIELDS = (("result", ("schema_version",)), ("provenance", ("rng_seed
 def _v4_integer_literal_problems(bundle: dict) -> list[str]:
     """SPEC v4 8.4: in a v4 bundle, `schema_version`, `rng_seed` and `lineage.count` MUST be integer literals (an
     int in the parsed value model of 4.3); a whole-number double such as `1.0` or `1e0` fails the bundle. Read on the
-    parsed value, before any canonicalization. Booleans and other types are the type rules' business (8.1, 8.2)."""
+    parsed value, before any canonicalization; `-0` fails as well (an integer literal has no minus sign on zero). Booleans and other types are the type rules' business (8.1, 8.2)."""
     out = []
     manifest = bundle.get("manifest") if isinstance(bundle.get("manifest"), dict) else {}
     copies = {"result": bundle.get("result"), "provenance": bundle.get("reproducibility")}
@@ -2324,6 +2336,9 @@ def _v4_integer_literal_problems(bundle: dict) -> list[str]:
             if isinstance(v, float):
                 out.append(f"{label}.{'.'.join(path)} must be an integer literal in a v4 bundle, not the "
                            f"whole-number double {v!r} (SPEC 8.4)")
+            elif isinstance(v, _NegativeZero):
+                out.append(f"{label}.{'.'.join(path)} must be an integer literal in a v4 bundle, not the "
+                           "negative zero -0 (SPEC 8.4)")
     return out
 
 
@@ -2561,7 +2576,7 @@ def tolerance_report(bundle: Any, profile=None) -> dict:
         return {"state": "not_checked", "problems": ["the provenance section is withheld (rng_seed)"]}
     seed = prov.get("rng_seed") if isinstance(prov, dict) else None
     placeholder = _profile_value(profile, "rng_seed_placeholder", _TOL_PLACEHOLDER_SEED)
-    if type(seed) in (int, float) and seed == placeholder:
+    if isinstance(seed, (int, float)) and not isinstance(seed, bool) and seed == placeholder:
         return {"state": "unusable",
                 "problems": [f"rng_seed is the placeholder {placeholder!r} (a stochastic result records its seed)"]}
     return {"state": "sound", "problems": []}
@@ -3292,6 +3307,9 @@ def _reviewed_copy_problems(rc: Any) -> list[str]:
     n = rc["withheld_items_count"]
     if isinstance(n, float):                 # SPEC v4 8.4 / 10.3.6: an integer literal, never `0.0`
         out.append("reviewed_copy.withheld_items_count must be an integer literal, not a whole-number double "
+                   "(SPEC 8.4)")
+    elif isinstance(n, _NegativeZero):       # SPEC v4 8.4: nor `-0`
+        out.append("reviewed_copy.withheld_items_count must be an integer literal, not the negative zero -0 "
                    "(SPEC 8.4)")
     elif not _json_int(n, 0, _MAX_WITHHELD_ITEMS_RC):
         out.append("reviewed_copy.withheld_items_count must be a JSON integer from 0 to 16,384")
