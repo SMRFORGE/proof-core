@@ -139,7 +139,8 @@ path after the plugin's `bin/` (`:` separates entries on POSIX, `;` on Windows):
 
 ```
 cd "$(mktemp -d)"
-PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin:/abs/path/to/your/project" python -P -m proof_core   reproduce /abs/path/to/bundle.json --runner mypkg.module:RunnerClass --json
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin:/abs/path/to/your/project" python -P -m proof_core \
+  reproduce /abs/path/to/bundle.json --runner mypkg.module:RunnerClass --json
 ```
 
 Exit codes: `0` reproduced (`--runner`: the numbers and the sealed claim re-derive), `1` not
