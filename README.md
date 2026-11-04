@@ -39,8 +39,8 @@ PYTHONPATH=bin python -P -m proof_core seal --capability arith:add --engine my-t
 PYTHONPATH=bin python -P -m proof_core verify bundle.json
 ```
 
-In Windows PowerShell, `echo '...' > inputs.json` writes a byte-order mark and `seal` refuses the file
-(`Unexpected UTF-8 BOM`), so write the files with `Set-Content -Encoding ascii` (or from Python):
+In Windows PowerShell, `echo '...' > inputs.json` writes a byte-order mark (UTF-16 by default in 5.1, UTF-8 under
+some settings) and `seal` refuses the file (`can't decode byte 0xff` or `Unexpected UTF-8 BOM`), so write the files with `Set-Content -Encoding ascii` (or from Python):
 
 ```powershell
 git clone https://gitlab.com/proof-core/skill; cd skill
