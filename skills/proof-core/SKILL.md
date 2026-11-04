@@ -55,12 +55,15 @@ Optional: `--verdict pass|advisory|fail` (default pass), `--fidelity screening|r
 short note goes to stderr. The producer sets `--verdict`/`--fidelity` as its own claims;
 they are not vouched for by verify.
 
-A receiver using the `calc-package` policy preset (version 2) accepts a bundle only if it
-declares how it reproduces. For a deterministic result, seal with `--tolerance tol.json`
-where `tol.json` is exactly `{"kind": "exact"}` (in Python,
-`reproduce_tolerance=proof_core.exact_tolerance()`); a stochastic result declares a
-statistical band (`proof_core.stat_tolerance`) instead. Declare `exact` only when a re-run
-really gives the same result.
+**This `seal` makes a v3 bundle, and neither shipped policy preset accepts one.** Both
+`calc-package` and `two-person-review` need a v4 bundle; a v3 bundle is refused under either
+(reason `envelope_below_minimum`), whatever `--tolerance` says. A v4 bundle needs the Python API:
+`proof_core.build_bundle(..., canon_version=3)` (canon 3 is the canonicalization
+`evidence.envelope.v4` uses, not a typo), with `bin/` on `PYTHONPATH`. `calc-package` also
+requires the bundle to declare how it reproduces: for a deterministic result
+`reproduce_tolerance=proof_core.exact_tolerance()` (on the CLI, `--tolerance tol.json` with
+`tol.json` exactly `{"kind": "exact"}`), for a stochastic one a statistical band
+(`proof_core.stat_tolerance`). Declare `exact` only when a re-run really gives the same result.
 
 ## verify
 
@@ -117,7 +120,8 @@ Re-runs the work on the bundle's sealed inputs and checks the result re-derives.
 ```
 # with your own tool as a subprocess (the tool reads the two env vars itself):
 PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core reproduce bundle.json \
-  --command "python recompute.py" --json
+  --command "python /abs/path/to/recompute.py" --json
+# on Windows (cmd.exe runs it, even from Git Bash) the path is C:\abs\path\to\recompute.py or C:/abs/...
 
 # or with a Python ReproduceRunner / @sealed function:
 PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core reproduce bundle.json \
@@ -146,10 +150,16 @@ hands back the sealed value. Name your runner one of two ways.
   absolute paths only (`:` separates on POSIX, `;` on Windows).
 - As a file: give its absolute path, `--runner /abs/path/to/your/project/mypkg/module.py:RunnerClass`
   (on Windows `C:\path\to\module.py:RunnerClass`; the spec splits at the last `:`). A relative
-  file path is refused (exit 2).
+  file path is refused (exit 2). Under Git Bash, write the `C:\...` (or `C:/...`) form: a
+  `/c/...` path is not absolute to Windows Python and is refused as relative.
 
 ```
+# POSIX (Linux, macOS): entries separated by ':'
 PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin:/abs/path/to/your/project" python -P -m proof_core \
+  reproduce bundle.json --runner mypkg.module:RunnerClass --json
+
+# Windows (Git Bash shown): entries separated by ';', C:\ paths
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin;C:\abs\path\to\your\project" python -P -m proof_core \
   reproduce bundle.json --runner mypkg.module:RunnerClass --json
 ```
 
