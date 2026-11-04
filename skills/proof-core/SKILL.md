@@ -3,7 +3,7 @@ name: proof-core
 description: Seal a computed result into a tamper-evident, independently re-runnable evidence bundle, and verify or reproduce one. Use when an agent produces a result (a number, a decision, a test or evaluation outcome, a file digest) that someone downstream has to trust and may need to re-run or audit later. Seals the result with its inputs so a neutral party can re-derive it offline, with no account and no network. Not a correctness check and not a logger; it makes a result re-runnable and tamper-evident, nothing more.
 license: MIT
 metadata:
-  wraps: proof-core 0.25.1 (vendored, MIT)
+  wraps: proof-core 0.26.0 (vendored, MIT)
   offline: true
 ---
 
@@ -80,6 +80,23 @@ only when a real production trust root is pinned (`--pubkey HEX` / a dialect pro
 A bundle that cites earlier bundles (`derived_from`) is reported as `chain: not_checked`
 unless you pass them: `--upstream PATH` (a file or a folder of `*.json`, repeatable) walks the
 chain offline, and exit 5 means a link is missing or could not be checked.
+
+## policy (receiver policy)
+
+A receiver policy says which keys, sign-offs and timestamps the receiver trusts; `verify --policy FILE` decides
+under it. The vendored `policy` verb (proof-core's `proof-policy`) writes and reads one:
+
+```
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core policy init --list
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core policy explain policy.json
+```
+
+`init --preset NAME --fill SLOT=VALUE` writes a starter policy, `explain` prints its `policy_sha256` and what a
+bundle must show to be accepted, and `add-pin` / `add-person` edit one. `add-pin --from-bundle` is not
+authentication: the bundle's integrity says nothing about whose key signed it, so confirm the key id with its
+holder and pass `--expect-key-id ID`. Without `--policy`, `verify` uses the file an absolute `PROOF_POLICY` names
+(no folder is searched); every verdict reports `policy_source`, and `--expect-policy sha256:HEX` refuses (exit 2)
+any other policy.
 
 ## reproduce
 

@@ -1,0 +1,103 @@
+{
+  "schema": "proof_verify.policy_preset.v1",
+  "preset": "two-person-review",
+  "version": 1,
+  "description": "A result is accepted only with an independent verifier's review and an approver's approval: a production origin key, an eligible review from the roster verifier and an eligible approval from the roster approver (different persons, different keys), the approval citing some valid verifier review (rule O does not require it to be the roster verifier's), no self-verification, v4 bundles only.",
+  "slots": [
+    {
+      "name": "originator-key",
+      "kind": "key_id",
+      "at": "/pins/0/key_id",
+      "marker": "/pins/0",
+      "means": "the key id of the producer's production signing key (the key that signs the seal)"
+    },
+    {
+      "name": "verifier-key",
+      "kind": "key_id",
+      "at": "/roster/0/keys/0",
+      "marker": "/roster/0",
+      "means": "the key id the verifier signs sign-offs with"
+    },
+    {
+      "name": "verifier-signer-id",
+      "kind": "signer_id",
+      "at": "/roster/0/signer_id",
+      "marker": "/roster/0",
+      "means": "the verifier's signer_id, exactly as their sign-offs carry it"
+    },
+    {
+      "name": "verifier-name",
+      "kind": "printed_name",
+      "at": "/roster/0/printed_name",
+      "marker": "/roster/0",
+      "means": "the verifier's printed name, exactly as their sign-offs carry it"
+    },
+    {
+      "name": "approver-key",
+      "kind": "key_id",
+      "at": "/roster/1/keys/0",
+      "marker": "/roster/1",
+      "means": "the key id the approver signs sign-offs with"
+    },
+    {
+      "name": "approver-signer-id",
+      "kind": "signer_id",
+      "at": "/roster/1/signer_id",
+      "marker": "/roster/1",
+      "means": "the approver's signer_id, exactly as their sign-offs carry it"
+    },
+    {
+      "name": "approver-name",
+      "kind": "printed_name",
+      "at": "/roster/1/printed_name",
+      "marker": "/roster/1",
+      "means": "the approver's printed name, exactly as their sign-offs carry it"
+    }
+  ],
+  "policy": {
+    "schema": "evidence.receiver-policy.v1",
+    "pins": [
+      {
+        "key_id": "ed25519:sha256:0000000000000000000000000000000000000000000000000000000000000001",
+        "demo": false,
+        "label": "producer production signing key",
+        "replace_me": "placeholder: replace key_id with the key id of the producer's production signing key, then delete this member (or: proof-policy init --fill originator-key=KEY)"
+      }
+    ],
+    "min_envelope": "v4",
+    "roster": [
+      {
+        "person_id": "verifier-1",
+        "printed_name": "REPLACE-ME verifier printed name",
+        "signer_id": "REPLACE-ME-verifier-signer-id",
+        "keys": [
+          "ed25519:sha256:0000000000000000000000000000000000000000000000000000000000000002"
+        ],
+        "roles": [
+          "verifier"
+        ],
+        "replace_me": "placeholder: replace keys, signer_id and printed_name with the verifier's own key id, signer id and printed name exactly as their sign-offs carry them, then delete this member (or: proof-policy init --fill verifier-key=KEY --fill verifier-signer-id=ID --fill verifier-name=NAME)"
+      },
+      {
+        "person_id": "approver-1",
+        "printed_name": "REPLACE-ME approver printed name",
+        "signer_id": "REPLACE-ME-approver-signer-id",
+        "keys": [
+          "ed25519:sha256:0000000000000000000000000000000000000000000000000000000000000003"
+        ],
+        "roles": [
+          "approver"
+        ],
+        "replace_me": "placeholder: replace keys, signer_id and printed_name with the approver's own key id, signer id and printed name exactly as their sign-offs carry them, then delete this member (or: proof-policy init --fill approver-key=KEY --fill approver-signer-id=ID --fill approver-name=NAME)"
+      }
+    ],
+    "require_roles": [
+      "verifier",
+      "approver"
+    ],
+    "require_order": true,
+    "allow_self_verify": false
+  },
+  "template_sha256": "sha256:6fd4d8c9b146a47002537a39cc5c937a9a974068b119eec060dd9614d2aa98ea",
+  "template_policy_sha256": "sha256:630d066a1839e29a0318d1e598f4d0806f0a78a2e808b1c2df24f9e5daadadb7"
+}

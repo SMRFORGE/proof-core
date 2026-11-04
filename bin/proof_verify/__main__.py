@@ -13,6 +13,7 @@ import sys
 # The parse-time guards (duplicate-key / NaN / depth / size) live in ONE place, `verify.loads`, so every
 # bundle reader shares them. Re-exported here (``cli._text_depth_ok``, ``cli.loads``) for callers/tests
 # that reach for them on the CLI module.
+from . import policy_source as _ps
 from .render import RenderError, claims_lines, headline, seal_signer_lines, signoff_lines, time_lines
 from .verify import (  # noqa: F401 -- re-exported for backward-compatible access
     _MAX_JSON_DEPTH,
@@ -35,19 +36,28 @@ from .verify import (  # noqa: F401 -- re-exported for backward-compatible acces
     _text_depth_ok,
     _utc_or_null,
     _verify_chain_parsed,
+    effective_policy,
     key_id,
     key_label,
     loads,
     pin_key,
     pinned_key_fingerprint,
+    policy_sha256,
     safe_terminal_output,
 )
 
 _USAGE = ("usage: proof-verify <bundle.json> [--profile pkg.module:attr] [--pubkey HEX] [--json]\n"
-          "                    [--policy FILE] [--allow-self-verify] [--as-of T] [--upstream PATH ...]\n"
+          "                    [--policy FILE | --policy preset:NAME] [--no-policy-discovery]\n"
+          "                    [--expect-policy sha256:HEX] [--allow-self-verify] [--as-of T] [--upstream PATH ...]\n"
           "                    (or: python -m proof_verify ...)\n"
           "  --policy FILE    a receiver policy (evidence.receiver-policy.v1) whose pins replace the built-in demo\n"
           "                   pin; --pubkey is then merged into it. A malformed policy exits 2 with no verdict.\n"
+          "                   preset:NAME uses a shipped preset only if it needs no filling (none does today:\n"
+          "                   use proof-policy init). Without --policy: the file $PROOF_POLICY names, else the\n"
+          "                   built-in default policy; no folder is searched (a .proof-policy.json is never read).\n"
+          "                   The verdict names the source (policy_source). A malformed PROOF_POLICY file exits 2.\n"
+          "  --no-policy-discovery  ignore PROOF_POLICY (also PROOF_NO_POLICY_DISCOVERY=1)\n"
+          "  --expect-policy sha256:HEX  exit 2 with no verdict unless the effective policy_sha256 is HEX\n"
           "  --allow-self-verify  accept a verifier or approver sign-off made with an originator's key or signer\n"
           "                   id (sets allow_self_verify in the effective policy; rejected by default).\n"
           "  --as-of T        the evaluation instant, a UTC timestamp YYYY-MM-DDTHH:MM:SSZ (default: now, whole\n"
@@ -260,7 +270,8 @@ def _now_utc() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _emit_json(path: str, bundle: dict, rep: dict, chain: dict | None = None, as_of: str | None = None) -> int:
+def _emit_json(path: str, bundle: dict, rep: dict, chain: dict | None = None, as_of: str | None = None,
+               policy_source: dict | None = None) -> int:
     """Emit the machine-readable verdict (the classify_bundle report plus a few CLI-level facts) and return
     the matching exit code. The demo-pin / not-a-production-pass fact is made UNAMBIGUOUS via
     ``production_origin_pass`` so an automated gate never mistakes an integrity-only (exit 3) record for a
@@ -286,6 +297,8 @@ def _emit_json(path: str, bundle: dict, rep: dict, chain: dict | None = None, as
     # the one fact an origin gate keys on: exit 0 under a real PRODUCTION pin is the only pass.
     out["production_origin_pass"] = code == EXIT_VERIFIED
     out["not_a_production_pass"] = code != EXIT_VERIFIED
+    if policy_source is not None:
+        out["policy_source"] = policy_source            # which policy this verdict was made under (policy_source.py)
     # SPEC v4 draft 13.5: `state` is ALWAYS the 13.1 state, never rewritten -- the former strings
     # "fail (invalid sign-off)", "fail (chain)" and "incomplete (chain)" are retired for every input. Why the CLI
     # failed closed is in `exit_code`, `decision` (reasons such as `signoffs_invalid`), `dims` and the `chain`
@@ -294,28 +307,61 @@ def _emit_json(path: str, bundle: dict, rep: dict, chain: dict | None = None, as
     return code
 
 
-def _policy_error(exc: Exception, as_json: bool) -> int:
+def _policy_error(exc: Exception, as_json: bool, source: dict | None = None) -> int:
     """SPEC 13.4.1: a malformed policy is refused; "the CLI exits 2 with no verdict". Runner protocol v2 (13.3):
-    print ``{"error": "<kind>", "message": "..."}`` with no ``state``."""
+    print ``{"error": "<kind>", "message": "..."}`` with no ``state``. A policy not named by ``--policy FILE`` (a
+    preset, or a discovered one) also names its source, so the refusal says which file was read; the output for
+    ``--policy FILE`` is unchanged."""
     kind = getattr(exc, "kind", "policy")       # "policy" (malformed) or "policy_unsupported" (not evaluated by this release)
+    msg = str(exc)
+    shown = source is not None and source["kind"] != "flag"
+    if shown and _ps.describe(source) not in msg:
+        msg = f"{msg} ({_ps.describe(source)})"
     if as_json:
-        print(json.dumps({"error": kind, "message": str(exc)}, sort_keys=True))
+        out = {"error": kind, "message": msg}
+        if shown:
+            out["policy_source"] = source
+        print(json.dumps(out, sort_keys=True))
+    else:
+        print(f"error: policy refused: {msg}", file=sys.stderr)
+    return EXIT_UNREADABLE
+
+
+def _source_member(source: dict | None) -> dict:
+    return {} if source is None else {"policy_source": source}
+
+
+def _expect_refused(expect: str | None, actual: str | None, source: dict, as_json: bool) -> int | None:
+    """--expect-policy: EXIT_UNREADABLE (2, no verdict) when the effective policy_sha256 is not ``expect``."""
+    if expect is None or actual == expect:
+        return None
+    exc = _ps.PolicyMismatch(f"--expect-policy {expect}: the effective policy ({_ps.describe(source)}) has "
+                             f"policy_sha256 {actual}; no verdict is given under a policy other than the one expected")
+    if as_json:
+        print(json.dumps({"error": exc.kind, "message": str(exc), "expected": expect, "policy_sha256": actual,
+                          "policy_source": source}, sort_keys=True))
     else:
         print(f"error: policy refused: {exc}", file=sys.stderr)
     return EXIT_UNREADABLE
 
 
 def verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: list[str] | None = None,
-                policy=None, pins=None, as_of: str | None = None) -> int:
+                policy=None, pins=None, as_of: str | None = None, policy_source: dict | None = None,
+                expect_policy: str | None = None) -> int:
     """See `_verify_path`. In text mode everything printed is escaped to printable ASCII (`safe_text`): problem
-    lists and link details carry bundle text, and a bundle must never drive the reader's terminal."""
+    lists and link details carry bundle text, and a bundle must never drive the reader's terminal.
+
+    ``policy_source`` (from `policy_source.resolve`) is reported with the verdict: the ``policy_source`` member in
+    JSON, a final ``policy:`` line in text. ``expect_policy`` (``sha256:<64 hex>``) refuses with exit 2 and no
+    verdict unless the verdict's ``policy_sha256`` equals it. Neither changes the verdict."""
     with safe_terminal_output(enabled=not as_json):
         return _verify_path(path, profile=profile, as_json=as_json, upstreams=upstreams, policy=policy, pins=pins,
-                            as_of=as_of)
+                            as_of=as_of, policy_source=policy_source, expect_policy=expect_policy)
 
 
 def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: list[str] | None = None,
-                 policy=None, pins=None, as_of: str | None = None) -> int:
+                 policy=None, pins=None, as_of: str | None = None, policy_source: dict | None = None,
+                 expect_policy: str | None = None) -> int:
     """Verify the bundle JSON at ``path``; print a human-readable result; return an exit code:
 
       0  verified (integrity + origin): every hash recomputes and the signature is valid under a real
@@ -361,7 +407,7 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
             print(json.dumps({"kind": VERIFY_VERDICT_KIND, "path": path, "state": "unreadable",
                               "integrity_ok": False, "error": f"{type(exc).__name__}: {exc}",
                               "exit_code": EXIT_UNREADABLE, "production_origin_pass": False,
-                              "not_a_production_pass": True}, sort_keys=True))
+                              "not_a_production_pass": True, **_source_member(policy_source)}, sort_keys=True))
             return EXIT_UNREADABLE
         print(f"error: cannot read bundle {path!r}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_UNREADABLE
@@ -374,7 +420,8 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
                 print(json.dumps({"kind": VERIFY_VERDICT_KIND, "path": path, "state": "unreadable",
                                   "integrity_ok": False, "error": str(exc),
                                   "exit_code": EXIT_UNREADABLE, "production_origin_pass": False,
-                                  "not_a_production_pass": True}, sort_keys=True))
+                                  "not_a_production_pass": True, **_source_member(policy_source)},
+                                 sort_keys=True))
                 return EXIT_UNREADABLE
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_UNREADABLE
@@ -383,12 +430,26 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
         # is the public one's verdict on these bytes
         rep = _classify_parsed(bundle, profile=profile, policy=policy, pins=pins, as_of=as_of)
     except PolicyError as exc:
-        return _policy_error(exc, as_json)
+        return _policy_error(exc, as_json, policy_source)
+    # --expect-policy: the verdict records the policy_sha256 it was made under (13.4.2); nothing is printed unless it
+    # is the one the receiver meant
+    refused = _expect_refused(expect_policy, rep.get("policy_sha256"), policy_source or {"kind": "default"}, as_json)
+    if refused is not None:
+        return refused
     chain = None if ups is None else _verify_chain_parsed(bundle, _index_upstreams_parsed(ups, profile=profile).get,
                                                   profile=profile)
     if as_json:
         # machine-readable verdict: the SAME exit code as the prose path, no prose printed.
-        return _emit_json(path, bundle, rep, chain, as_of)
+        return _emit_json(path, bundle, rep, chain, as_of, policy_source)
+    try:
+        return _verify_text(path, bundle, rep, chain, ups, policy)
+    finally:
+        if policy_source is not None:
+            print(f"    policy: {_ps.describe(policy_source)}; policy_sha256 {rep.get('policy_sha256')}")
+
+
+def _verify_text(path: str, bundle, rep: dict, chain: dict | None, ups: list | None, policy) -> int:
+    """The human-readable verdict of `_verify_path` (unchanged; moved here so the policy line follows it)."""
     if rep.get("state") == STATE_UNSUPPORTED_CANON:
         # ADR-050 fail-FORWARD: a signed record sealed under a canon this verifier does not support. The
         # header seals and its signature verifies, so the sha256sums header is unedited since signing -- but
@@ -710,6 +771,10 @@ def _main(args: list[str]) -> int:
                    help="emit the verdict as a JSON object (same exit code) instead of human text")
     p.add_argument("--policy", metavar="FILE",
                    help="a receiver policy JSON file (evidence.receiver-policy.v1); its pins replace the demo pin")
+    p.add_argument("--no-policy-discovery", dest="no_policy_discovery", action="store_true",
+                   help="do not read PROOF_POLICY (only --policy, else the default policy)")
+    p.add_argument("--expect-policy", dest="expect_policy", metavar="sha256:HEX",
+                   help="exit 2 with no verdict unless the effective policy's policy_sha256 is this")
     p.add_argument("--allow-self-verify", dest="allow_self_verify", action="store_true",
                    help="accept a verifier/approver sign-off under an originator's key or signer id (SPEC 13.5)")
     p.add_argument("--as-of", dest="as_of", metavar="T",
@@ -737,17 +802,27 @@ def _main(args: list[str]) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_UNREADABLE
-    policy = pins = None
-    if ns.policy is not None:
+    bad = _ps.check_expect(ns.expect_policy)
+    if bad:
+        if ns.json:
+            print(json.dumps({"error": "usage", "message": bad}, sort_keys=True))
+        else:
+            print(f"error: {bad}", file=sys.stderr)
+        return EXIT_UNREADABLE
+    pins = None
+    # which policy (policy_source.py): --policy FILE > --policy preset:NAME > $PROOF_POLICY > the built-in default
+    # (no folder is searched). Selection only; the policy found is then read exactly as --policy FILE always was.
+    try:
+        policy, source = _ps.resolve(ns.policy, no_discovery=ns.no_policy_discovery)
+    except PolicyError as exc:
+        return _policy_error(exc, ns.json, getattr(exc, "source", None))
+    note = _ps.ignored_note(source)
+    if note:
+        print(note, file=sys.stderr)
+    if policy is not None:
         # SPEC 7.12 / 13.4.1 step 3: pins from outside the policy file -- the CLI's built-in demo pin and
         # --pubkey -- are MERGED into it with the demo-wins rule, so a demo-signed bundle reads
         # `integrity-only (demo pin)` under any policy.
-        try:
-            with open(ns.policy, "rb") as handle:
-                policy = loads(handle.read().decode("utf-8"))
-        except (OSError, ValueError, RecursionError) as exc:
-            return _policy_error(PolicyError(f"cannot read policy {ns.policy!r}: {type(exc).__name__}: {exc}"),
-                                 ns.json)
         # "the CLI's built-in demo pin" (13.4.1 step 3): every demo key of SPEC section 2 (the Ed25519 and the P-256
         # demo key), as a demo pin, so a demo-signed bundle of either suite reads `integrity-only (demo pin)`.
         pins = [dict(p) for p in BUILTIN_DEMO_PINS]
@@ -763,7 +838,7 @@ def _main(args: list[str]) -> int:
             if ns.pubkey is not None:
                 pins.append({"legacy_raw_key": ns.pubkey, "demo": False})
         if not isinstance(policy, dict):
-            return _policy_error(PolicyError("a receiver policy must be a JSON object"), ns.json)
+            return _policy_error(PolicyError("a receiver policy must be a JSON object"), ns.json, source)
         policy = {**policy, "allow_self_verify": True}
     if ns.pubkey is not None and pins is None:
         try:
@@ -771,8 +846,19 @@ def _main(args: list[str]) -> int:
         except (ValueError, TypeError) as exc:
             print(f"error: --pubkey must be 64 lowercase hex characters: {exc}", file=sys.stderr)
             return EXIT_UNREADABLE
+    if ns.expect_policy is not None and policy is not None:
+        # checked before the bundle is read too, so not even an `unreadable` result is printed under another policy
+        # (the verdict's own policy_sha256 is checked again in verify_path; without a policy file the default
+        # policy's digest depends on the pin, so only that later check applies)
+        try:
+            pin_set, members = effective_policy(policy, pins)
+        except PolicyError as exc:
+            return _policy_error(exc, ns.json, source)
+        refused = _expect_refused(ns.expect_policy, policy_sha256(members, pin_set), source, ns.json)
+        if refused is not None:
+            return refused
     return verify_path(ns.bundle, profile=profile, as_json=ns.json, upstreams=ns.upstream, policy=policy,
-                       pins=pins, as_of=ns.as_of)
+                       pins=pins, as_of=ns.as_of, policy_source=source, expect_policy=ns.expect_policy)
 
 
 if __name__ == "__main__":
