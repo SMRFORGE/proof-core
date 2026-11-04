@@ -88,6 +88,9 @@ flowchart TB
 All three verbs run from the vendored copy with `PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core
 <seal|verify|reproduce>`. Keep `-P` (Python 3.11+): plain `python -m` puts the current folder first on
 `sys.path`, so a `proof_verify/` or `hashlib.py` in the folder being checked would run instead of the verifier.
+`-P` alone does not protect `reproduce --runner`, which still imports from the current folder: run it only from
+a folder you control, never the bundle's or the sender's, with the runner's project on `PYTHONPATH` by absolute
+path.
 
 - **seal** a result (its inputs and outputs) into a signed, canonical JSON bundle.
 - **verify** a bundle offline: the hashes recompute and the signature checks. This is a standalone second

@@ -22,7 +22,8 @@ PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core <seal|verify|repr
 
 **Never drop `-P`.** Without it, `python -m` puts the current folder ahead of `PYTHONPATH`, so a
 `proof_verify/` or `hashlib.py` in the folder being checked runs instead of the vendored verifier and
-can fake a pass.
+can fake a pass. `-P` covers `verify`; it does not make `reproduce --runner` safe on its own (see
+reproduce below).
 
 ## When to use it
 
@@ -128,6 +129,18 @@ environment works on both. The command runs in a fresh temporary working directo
 tool by an ABSOLUTE path (or have it on PATH); a bare relative script name will not be
 found. The runner/command is ALWAYS supplied here on the command line, never read from
 the bundle.
+
+**Run `reproduce --runner` only from a folder you control.** The bundled `reproduce` still adds
+the current folder to the import path for `--runner`, even under `-P`, so a `mypkg/` planted next
+to a bundle replaces your runner and can report REPRODUCED for a wrong result. Never run it inside
+the bundle's folder or the sender's project. `cd` to a folder of your own (an empty temp folder is
+fine), pass the bundle by absolute path, and put the runner's project on `PYTHONPATH` by absolute
+path after the plugin's `bin/` (`:` separates entries on POSIX, `;` on Windows):
+
+```
+cd "$(mktemp -d)"
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin:/abs/path/to/your/project" python -P -m proof_core   reproduce /abs/path/to/bundle.json --runner mypkg.module:RunnerClass --json
+```
 
 Exit codes: `0` reproduced (`--runner`: the numbers and the sealed claim re-derive), `1` not
 reproduced (or integrity failed, so it was never re-run), `2` usage / unreadable bundle, `3`
