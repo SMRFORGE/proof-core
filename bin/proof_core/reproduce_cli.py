@@ -634,4 +634,7 @@ def _main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    # `python -m` without -P: say the cwd could shadow this tool (stderr only; see _spec_loader)
+    from proof_verify._spec_loader import warn_if_cwd_on_path
+    warn_if_cwd_on_path()
     raise SystemExit(main())

@@ -7,7 +7,7 @@
 **Give a Claude Code agent three verbs: seal a result, verify a record, re-run it.** Not "trust us". Check us.
 
 Repo: `gitlab.com/proof-core/skill` · MIT · a Claude Code plugin with one Agent Skill · Python 3.11+ standard
-library · plugin v0.6.2 · vendors [proof-core](https://gitlab.com/proof-core/proof-core) 0.27.1 · no install,
+library · plugin v0.7.0 · vendors [proof-core](https://gitlab.com/proof-core/proof-core) 0.28.0 · no install,
 no network, no account
 
 ## What this is
@@ -51,7 +51,8 @@ python -P -m proof_core seal --capability arith:add --engine my-tool --engine-ve
 python -P -m proof_core verify bundle.json
 ```
 
-What `verify` prints, trimmed (exit 3, the normal result under the public demo key):
+`seal` makes a v4 bundle (`evidence.envelope.v4`) by default; `--envelope v3` makes the frozen legacy
+envelope. What `verify` prints, trimmed (exit 3, the normal result under the public demo key):
 
 ```text
 OK  integrity verified -- origin NOT established (demo pin): bundle.json
@@ -87,10 +88,10 @@ What the plugin bundles:
 
 ```mermaid
 flowchart TB
-    subgraph plugin["proof-core plugin 0.6.2"]
+    subgraph plugin["proof-core plugin 0.7.0"]
         MAN[".claude-plugin/<br/>plugin.json, marketplace.json"]
         SKILL["skills/proof-core/SKILL.md<br/>when and how to seal, verify, reproduce"]
-        subgraph bin["bin/ (proof-core 0.27.1, verbatim, MIT)"]
+        subgraph bin["bin/ (proof-core 0.28.0, verbatim, MIT)"]
             PC["proof_core<br/>seal and reproduce"]
             PV["proof_verify<br/>the standalone verifier"]
         end
@@ -105,7 +106,10 @@ All three verbs run from the vendored copy with `PYTHONPATH="${CLAUDE_PLUGIN_ROO
 (absolute paths) or by the absolute path of its file; a relative file path is refused. Never point at a runner
 inside the bundle's folder.
 
-- **seal** a result (its inputs and outputs) into a signed, canonical JSON bundle.
+- **seal** a result (its inputs and outputs) into a signed, canonical JSON bundle: v4 by default, `--envelope v3`
+  for the legacy envelope. A v4 seal with `--tolerance` (`{"kind": "exact"}`) under a production key, plus
+  `policy init --preset calc-package --fill originator-key=ID`, passes the `calc-package` receiver policy
+  (exit 0); [SKILL.md](skills/proof-core/SKILL.md) shows the three commands.
 - **verify** a bundle offline: the hashes recompute and the signature checks. This is a standalone second
   implementation (`proof_verify`) that imports no producer code.
 - **reproduce** a bundle by re-running the work on its sealed inputs and confirming the result re-derives.
@@ -163,11 +167,11 @@ flowchart LR
 
 | Repo | Use it to |
 |---|---|
-| [proof-core](https://gitlab.com/proof-core/proof-core) | v0.27.1, the Python kernel and verifier: seal, verify and reproduce any computed result (standard library only), envelope v3 and v4 |
-| [proof-core-kernel-js](https://gitlab.com/proof-core/proof-core-kernel-js) | v0.9.1 (`@proof-core/verify`), the JavaScript verifier: verify bundles in Node or a browser, with no dependencies |
-| [envelope-spec](https://gitlab.com/proof-core/envelope-spec) | v1.1.1, the spec and its corpus: the bundle format's written standard, JSON Schema, and 671 conformance vectors to test any verifier against |
+| [proof-core](https://gitlab.com/proof-core/proof-core) | v0.28.0, the Python kernel and verifier: seal, verify and reproduce any computed result (standard library only), envelope v3 and v4 |
+| [proof-core-kernel-js](https://gitlab.com/proof-core/proof-core-kernel-js) | v0.10.0 (`@proof-core/verify`), the JavaScript verifier: verify bundles in Node or a browser, with no dependencies |
+| [envelope-spec](https://gitlab.com/proof-core/envelope-spec) | v1.2.0, the spec and its corpus: the bundle format's written standard, JSON Schema, and 691 conformance vectors to test any verifier against |
 | [proof-mcp](https://gitlab.com/proof-core/proof-mcp) | v0.9.1, MCP receipts and an evidence server: receipt format v2 with a coverage section, code-mode receipts and loop receipts for ordinary tool-calling loops, MCP over stdio and streamable HTTP, async hosts, `proof-accept` to accept or reject a sealed run, and `proof-mcp serve`, an evidence MCP server |
-| [skill](https://gitlab.com/proof-core/skill) | v0.6.2, the Claude Code plugin: give an agent seal, verify and reproduce as a skill, with proof-core 0.27.1 bundled so it runs offline |
+| [skill](https://gitlab.com/proof-core/skill) | v0.7.0, the Claude Code plugin: give an agent seal, verify and reproduce as a skill, with proof-core 0.28.0 bundled so it runs offline |
 | [pytest-proof-core](https://gitlab.com/proof-core/pytest-proof-core) | v0.1.0, sealed test outcomes: seal each test's outcome and re-check it later in CI |
 | [pytest-proof-core-plugin](https://gitlab.com/proof-core/pytest-proof-core-plugin) | v0.3.0, sealed test outcomes for Claude Code: pytest-proof-core packaged as a plugin (it bundles proof-core 0.24.0) |
 

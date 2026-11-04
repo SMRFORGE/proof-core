@@ -429,12 +429,12 @@ _POLICY_DEFAULTS: dict[str, Any] = {
     "min_seal_tsas": 0, "require_archive": False, "min_archive_tsas": 1, "roster": [], "require_roles": [],
     "require_order": True, "require_signoff_timestamps": False, "allow_self_verify": False, "originator_keys": [],
     "originator_signer_ids": [], "max_attest_lag_s": 86400, "allow_ess_v1": False, "require_full_copy_review": False,
-    "require_order_eligible": False, "require_reproduce_tolerance": False,
+    "require_order_eligible": False, "require_reproduce_tolerance": False, "ignore_unrecognised_signoffs": False,
 }
 #: SPEC 13.4.1 (spec 1.1): the opt-in members added after spec 1.0. Each is in the effective policy only when it is
 #: true (step 5 drops it at its default `false`), so every policy that leaves it off keeps the policy_sha256 it had
 #: under spec 1.0, and the members form of `evaluate` may omit it (a members object written for 1.0 still evaluates).
-_POLICY_OPT_IN = ("require_order_eligible", "require_reproduce_tolerance")
+_POLICY_OPT_IN = ("require_order_eligible", "require_reproduce_tolerance", "ignore_unrecognised_signoffs")
 
 
 def _same_json(a: Any, b: Any) -> bool:
@@ -567,6 +567,7 @@ _POLICY_SHAPES = {
     "require_full_copy_review": lambda v: isinstance(v, bool),
     "require_order_eligible": lambda v: isinstance(v, bool),
     "require_reproduce_tolerance": lambda v: isinstance(v, bool),
+    "ignore_unrecognised_signoffs": lambda v: isinstance(v, bool),
 }
 #: The members whose type is "JSON integer" (SPEC 2): a whole double such as `1.0` is the same value as `1`, so it is
 #: normalized to the integer before the policy is hashed (13.4.1: policies with the same meaning have the same digest).
@@ -581,7 +582,8 @@ _POLICY_EVALUATED = frozenset({"min_envelope", "origin_quorum", "require_seal_su
                                "roster", "require_roles", "require_order", "allow_self_verify", "originator_keys",
                                "originator_signer_ids", "tsas", "min_seal_tsas", "require_signoff_timestamps",
                                "max_attest_lag_s", "allow_ess_v1", "require_full_copy_review", "require_archive",
-                               "min_archive_tsas", "require_order_eligible", "require_reproduce_tolerance"})
+                               "min_archive_tsas", "require_order_eligible", "require_reproduce_tolerance",
+                               "ignore_unrecognised_signoffs"})
 
 
 def _check_member_combination(m: dict, where: str = "policy") -> None:
@@ -853,10 +855,19 @@ def order_eligible_reasons(signoffs: dict, members: dict, *, v2: bool) -> list[s
     entries = [x for x in (signoffs.get("entries") or []) if isinstance(x, dict)]
     eligible = {x.get("entry_sha256") for x in entries if _eligible(x, "verifier", members)}
     eligible.discard(None)
-    if any(x.get("state") == "valid" and x.get("role") == "approver" and not eligible & set(x.get("prior") or [])
-           for x in entries):
+    if any(x.get("state") == "valid" and x.get("role") == "approver" and not _ignored(x, members)
+           and not eligible & set(x.get("prior") or []) for x in entries):
         return ["order_review_not_eligible"]
     return []
+
+
+def _oe_cited(entries: list[dict], members: dict) -> set[str] | None:
+    """SPEC 13.4.3 row 21 (spec 1.2): the entry digests rule OE relies on, the `prior` of every `valid` v2 approver
+    entry rule OE checks (13.4.4); None when rule OE does not apply (`require_order` or `require_order_eligible` off)."""
+    if not (members.get("require_order_eligible") is True and members.get("require_order", True)):
+        return None
+    return {d for x in entries if x.get("state") == "valid" and x.get("role") == "approver" and not _ignored(x, members)
+            for d in (x.get("prior") or []) if isinstance(d, str)}
 
 
 def archive_reliance_reasons(rep: dict, members: dict) -> list[str]:
@@ -875,7 +886,12 @@ def archive_reliance_reasons(rep: dict, members: dict) -> list[str]:
     entries = ([x for x in (signoffs.get("entries") or []) if isinstance(x, dict)]
                if rep.get("canon_version") == 3 else [])
     nc = a.get("not_covered") if isinstance(a.get("not_covered"), list) else None
-    relied = [x for x in entries if any(_eligible(x, r, members) for r in set(members.get("require_roles") or []))]
+    # spec 1.2: under rule OE the eligible review each approval cites is relied on too, whether or not require_roles
+    # names verifier (13.4.3 "What require_archive requires" item 4)
+    cited = _oe_cited(entries, members)
+    relied = [x for x in entries if any(_eligible(x, r, members) for r in set(members.get("require_roles") or []))
+              or (cited is not None and isinstance(x.get("entry_sha256"), str) and x["entry_sha256"] in cited
+                  and _eligible(x, "verifier", members))]
     if any(nc is None or not isinstance(x.get("entry_sha256"), str) or x["entry_sha256"] in nc for x in relied):
         out.append("archive_not_covering_signoffs")
     return out
@@ -2613,6 +2629,10 @@ def stat_band_problem(tol: Any, outputs: Any) -> str | None:
 _TOL_DECLARED_STATES = frozenset({"exact", "sound", "unusable"})
 #: SPEC 13.4.3 "The statistical band" (spec 1.1): the one declaration of an exact (deterministic) reproduction.
 TOL_EXACT = {"kind": "exact"}
+#: SPEC 13.4.3 "The statistical band" item 3: the band's quantity or sigma is a committed item (6.6), so the band
+#: cannot be checked (`not_checked`). The `problems` entry of exactly that case; 13.7 item 4 notes it
+#: (NOTE_TOLERANCE_COMMITTED).
+TOL_COMMITTED_PROBLEM = "the quantity or the sigma is a committed item"
 
 
 def tolerance_report(bundle: Any, profile=None) -> dict:
@@ -2633,7 +2653,7 @@ def tolerance_report(bundle: Any, profile=None) -> dict:
     outputs = stat_band_outputs(core)
     if isinstance(outputs, dict) and any(isinstance(outputs.get(k), dict) and "$committed" in outputs[k]
                                          for k in (tol.get("quantity"), tol.get("sigma_key")) if isinstance(k, str)):
-        return {"state": "not_checked", "problems": ["the quantity or the sigma is a committed item"]}
+        return {"state": "not_checked", "problems": [TOL_COMMITTED_PROBLEM]}
     why = stat_band_problem(tol, outputs)
     if why is not None:
         return {"state": "unusable", "problems": [why]}
@@ -3515,6 +3535,13 @@ NOTE_ORIGIN_ARCHIVE_RESCUE = "origin_archive_rescue"
 #: SPEC 13.4.1 "Derived default": the receiver policy pins TSAs but states `require_signoff_timestamps: false`, so a
 #: sign-off without an accepted token (its token may have been deleted) is not rejected by row 12.
 NOTE_SIGNOFF_TIMESTAMPS_NOT_REQUIRED = "signoff_timestamps_not_required"
+#: SPEC 13.4.3 "The statistical band" / 13.7 item 4 (spec 1.2): a v4 bundle whose integrity holds seals a statistical
+#: band whose quantity or sigma is a committed item, so `reproduce_tolerance` is `not_checked` and no row rejects it
+#: under the default policy (row 22 reads `unusable` only). `require_reproduce_tolerance` (row 24) rejects it.
+NOTE_TOLERANCE_COMMITTED = "tolerance_committed_not_checked"
+#: SPEC 13.4.4 "Unrecognised sign-offs" / 13.7 item 4 (spec 1.2): under `ignore_unrecognised_signoffs`, the bundle has
+#: at least one valid v2 entry under an unpinned or demo key, which the decision rows skipped.
+NOTE_UNRECOGNISED_SIGNOFFS_IGNORED = "unrecognised_signoffs_ignored"
 
 
 def _future_advisory(reports: list[dict], tok: dict) -> list[dict]:
@@ -3699,6 +3726,19 @@ def _pinned(x: dict) -> bool:
     return (x.get("roster") or {}).get("status") in ("pinned_key", "pinned_person")
 
 
+def unrecognised(x: dict) -> bool:
+    """SPEC 13.4.4 "Unrecognised sign-offs" (spec 1.2): a `valid` v2 entry under a key the receiver does not recognise,
+    roster status `unpinned_key` or `demo_key`. Anyone can append one. `invalid` and `not_checked` entries are never
+    unrecognised (whose key made them is not shown)."""
+    return x.get("state") == "valid" and (x.get("roster") or {}).get("status") in ("unpinned_key", "demo_key")
+
+
+def _ignored(x: dict, members: dict) -> bool:
+    """Under `ignore_unrecognised_signoffs` (spec 1.2, opt-in), an unrecognised entry is noted but neither counted nor
+    blocking: rows 4, 5 and 9 and rules O and OE skip it (13.4.4)."""
+    return members.get("ignore_unrecognised_signoffs") is True and unrecognised(x)
+
+
 def partial_copy_reasons(signoffs: dict, members: dict, *, v2: bool) -> list[str]:
     """SPEC 13.4.3 row 19: under `require_full_copy_review`, a valid v2 entry under a pinned key made on a copy with
     something withheld counts toward no rule (13.4.4) and rejects with `partial_copy_review`."""
@@ -3719,9 +3759,13 @@ def signoff_reasons(signoffs: dict, members: dict, *, v2: bool) -> list[str]:
     """SPEC 13.4.3 rows 4 to 12. ``v2`` is False for v3 input: v1 entries never trigger rows 4 to 12 and never count toward rule R
     (13.4.6), so only rule R can apply there (it is then unsatisfied whenever a role is required)."""
     entries = [x for x in (signoffs.get("entries") or []) if isinstance(x, dict)] if v2 else []
-    valid = [x for x in entries if x.get("state") == "valid"]
+    # spec 1.2 (opt-in `ignore_unrecognised_signoffs`, 13.4.4): rows 4, 5 and 9 and rule O read only the entries that
+    # are not unrecognised; without the member `_ignored` is always false and the rows read every entry, as in 1.1
+    valid = [x for x in entries if x.get("state") == "valid" and not _ignored(x, members)]
     out = []
-    if signoffs.get("state") == "self_verified" and not members.get("allow_self_verify"):
+    if signoffs.get("state") == "self_verified" and not members.get("allow_self_verify") and (
+            members.get("ignore_unrecognised_signoffs") is not True or not v2
+            or any(x.get("self_verify") and not _ignored(x, members) for x in entries)):
         out.append("self_verified")
     if any(x.get("meaning") == "rejection" for x in valid):
         out.append("signed_rejection")
@@ -4370,6 +4414,16 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
         notes = notes + [NOTE_SIGNOFF_TIMESTAMPS_NOT_REQUIRED]
     if origin_basis != "current":
         notes = notes + [NOTE_ORIGIN_ARCHIVE_RESCUE]
+    # SPEC 13.5 / 14 item 7: the sealed statistical band, as a verifier can check it (row 22). 13.7 item 4 (spec 1.2):
+    # a v4 band that cannot be checked because its quantity or sigma is a committed item is noted, since only
+    # require_reproduce_tolerance (row 24) rejects it
+    tolerance = (tolerance_report(bundle, profile) if integrity_ok else
+                 {"state": "not_checked", "problems": ["integrity does not hold"]})
+    if cv == 3 and tolerance["state"] == "not_checked" and tolerance["problems"] == [TOL_COMMITTED_PROBLEM]:
+        notes = notes + [NOTE_TOLERANCE_COMMITTED]
+    if (cv == 3 and members.get("ignore_unrecognised_signoffs") is True
+            and any(unrecognised(x) for x in signoffs["entries"])):
+        notes = notes + [NOTE_UNRECOGNISED_SIGNOFFS_IGNORED]
     signer_alg = (sig_info.get("primary") or {}).get("alg") or "ed25519"
     try:
         signer_kid = key_id(signer_alg, signer) if isinstance(signer, str) else None
@@ -4423,8 +4477,7 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
         "notes": notes,
         "note_details": {NOTE_COMMITTED_KEY_PLAIN_DATA: plain} if plain else {},
         # SPEC 13.5 / 14 item 7: the sealed statistical band, as a verifier can check it (row 22)
-        "reproduce_tolerance": (tolerance_report(bundle, profile) if integrity_ok else
-                                {"state": "not_checked", "problems": ["integrity does not hold"]}),
+        "reproduce_tolerance": tolerance,
         # SPEC 13.5: sealed producer claims that verification never checks (only reproduce can)
         "claims_not_checked": claims_not_checked(bundle),
     }

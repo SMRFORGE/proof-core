@@ -3,7 +3,7 @@ name: proof-core
 description: Seal a computed result into a tamper-evident, independently re-runnable evidence bundle, and verify or reproduce one. Use when an agent produces a result (a number, a decision, a test or evaluation outcome, a file digest) that someone downstream has to trust and may need to re-run or audit later. Seals the result with its inputs so a neutral party can re-derive it offline, with no account and no network. Not a correctness check and not a logger; it makes a result re-runnable and tamper-evident, nothing more.
 license: MIT
 metadata:
-  wraps: proof-core 0.27.1 (vendored, MIT)
+  wraps: proof-core 0.28.0 (vendored, MIT)
   offline: true
 ---
 
@@ -50,20 +50,35 @@ Required: `--capability`, `--engine`, `--engine-version`, `--inputs`, `--outputs
 Optional: `--verdict pass|advisory|fail` (default pass), `--fidelity screening|reference`
 (default screening), `--caveat "..."` (repeatable), `--provenance prov.json`,
 `--data-label ID --data-sha sha256:HEX` (pin the data set, both together),
-`--tolerance tol.json` (a stochastic producer's statistical band), `-o bundle.json`
+`--tolerance tol.json` (how the result reproduces: `{"kind": "exact"}`, or a stochastic
+producer's statistical band), `--envelope v4|v3` (default `v4`), `-o bundle.json`
 (default stdout). Add `--json` to print a machine summary (requires `-o`); without it a
 short note goes to stderr. The producer sets `--verdict`/`--fidelity` as its own claims;
-they are not vouched for by verify.
+they are not vouched for by verify. Flags are spelled out in full: an abbreviation such as
+`--env` or `--tol` is refused (exit 2).
 
-**This `seal` makes a v3 bundle, and neither shipped policy preset accepts one.** Both
-`calc-package` and `two-person-review` need a v4 bundle; a v3 bundle is refused under either
-(reason `envelope_below_minimum`), whatever `--tolerance` says. A v4 bundle needs the Python API:
-`proof_core.build_bundle(..., canon_version=3)` (canon 3 is the canonicalization
-`evidence.envelope.v4` uses, not a typo), with `bin/` on `PYTHONPATH`. `calc-package` also
-requires the bundle to declare how it reproduces: for a deterministic result
-`reproduce_tolerance=proof_core.exact_tolerance()` (on the CLI, `--tolerance tol.json` with
-`tol.json` exactly `{"kind": "exact"}`), for a stochastic one a statistical band
-(`proof_core.stat_tolerance`). Declare `exact` only when a re-run really gives the same result.
+**`seal` makes a v4 bundle (`evidence.envelope.v4`) by default**, the envelope both shipped
+policy presets (`calc-package`, `two-person-review`) require. `--envelope v3` makes the frozen
+legacy envelope, which either preset refuses (reason `envelope_below_minimum`). `calc-package` also
+requires the bundle to declare how it reproduces: for a deterministic result pass `--tolerance
+tol.json` with `tol.json` exactly `{"kind": "exact"}`; for a stochastic one, a statistical band.
+Declare `exact` only when a re-run really gives the same result. `two-person-review` also needs two
+human sign-offs, which `seal` does not add.
+
+A seal plus `policy init --fill` passes `calc-package`. The key must be a production key, injected
+out of band as `PROOF_SIGNING_SEED` (never the demo key: `init` refuses it, exit 2), and the key id
+you fill in must be one you confirmed with its holder:
+
+```
+echo '{"kind": "exact"}' > exact.json
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core seal \
+  --capability "my:task" --engine "my-tool" --engine-version "1.2.3" \
+  --inputs inputs.json --outputs outputs.json --tolerance exact.json -o bundle.json
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core policy init --preset calc-package \
+  --fill originator-key=ed25519:sha256:<64 hex> -o policy.json
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core verify bundle.json --policy policy.json --json
+# exit 0: integrity + origin, decision accept
+```
 
 ## verify
 
