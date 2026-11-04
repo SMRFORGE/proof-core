@@ -34,9 +34,9 @@ without an agent, run the vendored copy from a clone:
 git clone https://gitlab.com/proof-core/skill && cd skill
 echo '{"a": 2, "b": 3}' > inputs.json
 echo '{"total": 5}' > outputs.json
-PYTHONPATH=bin python -m proof_core seal --capability arith:add --engine my-tool --engine-version 1.0 \
+PYTHONPATH=bin python -P -m proof_core seal --capability arith:add --engine my-tool --engine-version 1.0 \
     --inputs inputs.json --outputs outputs.json -o bundle.json
-PYTHONPATH=bin python -m proof_core verify bundle.json
+PYTHONPATH=bin python -P -m proof_core verify bundle.json
 ```
 
 What `verify` prints, trimmed (exit 3, the normal result under the public demo key):
@@ -61,9 +61,9 @@ plugin:
 
 ```mermaid
 flowchart LR
-    A["the assistant<br/>computes a result"] -->|"inputs.json + outputs.json"| S["seal<br/>python -m proof_core seal"]
+    A["the assistant<br/>computes a result"] -->|"inputs.json + outputs.json"| S["seal<br/>python -P -m proof_core seal"]
     S --> B[("bundle.json<br/>inputs + result, hashed<br/>and signed (demo key)")]
-    B --> V["verify<br/>python -m proof_core verify<br/>offline, no producer code"]
+    B --> V["verify<br/>python -P -m proof_core verify<br/>offline, no producer code"]
     V -->|"exit 1: edited or malformed"| X["stop: do not trust it"]
     V -->|"exit 3 (demo key) or 0: unedited"| R["reproduce<br/>re-run your tool on the<br/>sealed inputs"]
     R -->|"exit 0, or 3 with --command"| OK["the result re-derives<br/>(still not proven correct)"]
@@ -85,8 +85,12 @@ flowchart TB
     SKILL -->|"PYTHONPATH=${CLAUDE_PLUGIN_ROOT}/bin"| bin
 ```
 
-All three verbs run from the vendored copy with `PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core
-<seal|verify|reproduce>`:
+All three verbs run from the vendored copy with `PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core
+<seal|verify|reproduce>`. Keep `-P` (Python 3.11+): plain `python -m` puts the current folder first on
+`sys.path`, so a `proof_verify/` or `hashlib.py` in the folder being checked would run instead of the verifier.
+`-P` alone does not protect `reproduce --runner`, which still imports from the current folder: run it only from
+a folder you control, never the bundle's or the sender's, with the runner's project on `PYTHONPATH` by absolute
+path.
 
 - **seal** a result (its inputs and outputs) into a signed, canonical JSON bundle.
 - **verify** a bundle offline: the hashes recompute and the signature checks. This is a standalone second

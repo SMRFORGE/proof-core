@@ -17,8 +17,13 @@ It is vendored into this plugin and runs offline, standard-library only, no inst
 All three verbs run from the vendored copy. Put the plugin's `bin/` on `PYTHONPATH`:
 
 ```
-PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core <seal|verify|reproduce> ...
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core <seal|verify|reproduce> ...
 ```
+
+**Never drop `-P`.** Without it, `python -m` puts the current folder ahead of `PYTHONPATH`, so a
+`proof_verify/` or `hashlib.py` in the folder being checked runs instead of the vendored verifier and
+can fake a pass. `-P` covers `verify`; it does not make `reproduce --runner` safe on its own (see
+reproduce below).
 
 ## When to use it
 
@@ -34,7 +39,7 @@ PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core <seal|verify|reprodu
 Write the inputs and outputs you want sealed as two JSON files, then:
 
 ```
-PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core seal \
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core seal \
   --capability "my:task" \
   --engine "my-tool" --engine-version "1.2.3" \
   --inputs inputs.json --outputs outputs.json \
@@ -53,7 +58,7 @@ they are not vouched for by verify.
 ## verify
 
 ```
-PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core verify bundle.json --json
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core verify bundle.json --json
 ```
 
 `--json` prints one object. **Gate on `exit_code` and `production_origin_pass`, never on
@@ -87,8 +92,8 @@ A receiver policy says which keys, sign-offs and timestamps the receiver trusts;
 under it. The vendored `policy` verb (proof-core's `proof-policy`) writes and reads one:
 
 ```
-PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core policy init --list
-PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core policy explain policy.json
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core policy init --list
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core policy explain policy.json
 ```
 
 `init --preset NAME --fill SLOT=VALUE` writes a starter policy, `explain` prints its `policy_sha256` and what a
@@ -104,11 +109,11 @@ Re-runs the work on the bundle's sealed inputs and checks the result re-derives.
 
 ```
 # with your own tool as a subprocess (the tool reads the two env vars itself):
-PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core reproduce bundle.json \
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core reproduce bundle.json \
   --command "python recompute.py" --json
 
 # or with a Python ReproduceRunner / @sealed function:
-PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -m proof_core reproduce bundle.json \
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core reproduce bundle.json \
   --runner mypkg.module:RunnerClass --json
 ```
 
@@ -124,6 +129,19 @@ environment works on both. The command runs in a fresh temporary working directo
 tool by an ABSOLUTE path (or have it on PATH); a bare relative script name will not be
 found. The runner/command is ALWAYS supplied here on the command line, never read from
 the bundle.
+
+**Run `reproduce --runner` only from a folder you control.** The bundled `reproduce` still adds
+the current folder to the import path for `--runner`, even under `-P`, so a `mypkg/` planted next
+to a bundle replaces your runner and can report REPRODUCED for a wrong result. Never run it inside
+the bundle's folder or the sender's project. `cd` to a folder of your own (an empty temp folder is
+fine), pass the bundle by absolute path, and put the runner's project on `PYTHONPATH` by absolute
+path after the plugin's `bin/` (`:` separates entries on POSIX, `;` on Windows):
+
+```
+cd "$(mktemp -d)"
+PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin:/abs/path/to/your/project" python -P -m proof_core \
+  reproduce /abs/path/to/bundle.json --runner mypkg.module:RunnerClass --json
+```
 
 Exit codes: `0` reproduced (`--runner`: the numbers and the sealed claim re-derive), `1` not
 reproduced (or integrity failed, so it was never re-run), `2` usage / unreadable bundle, `3`
@@ -143,7 +161,7 @@ the bundle's `bundle_sha256` with it so the record can be found and checked.
 
 - Runs fully offline: standard library only, no third-party dependencies, no network, no
   account.
-- Needs Python 3.11+ on PATH. If `python` is not 3.11+ on this host, use `py -3.11` (Windows)
-  or `python3.11`. `PYTHONPATH` must be the ABSOLUTE plugin path; the host supplies
+- Needs Python 3.11+ on PATH. If `python` is not 3.11+ on this host, use `py -3.11 -P` (Windows)
+  or `python3.11 -P`. `PYTHONPATH` must be the ABSOLUTE plugin path; the host supplies
   `${CLAUDE_PLUGIN_ROOT}` for you, so prefer it over a relative `bin/`.
 - proof-core is MIT and not on PyPI; the source is vendored under this plugin's `bin/`.

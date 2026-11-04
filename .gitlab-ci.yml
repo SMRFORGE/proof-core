@@ -36,8 +36,8 @@ smoke:
   stage: check
   script:
     - PYTHONPATH=bin python -c "import proof_core, proof_verify; print('proof_core', proof_core.__version__)"
-    - PYTHONPATH=bin python -m proof_verify --help > /dev/null
-    - PYTHONPATH=bin python -m proof_core --help > /dev/null   # the entry point SKILL.md documents
+    - PYTHONPATH=bin python -P -m proof_verify --help > /dev/null
+    - PYTHONPATH=bin python -P -m proof_core --help > /dev/null   # the entry point SKILL.md documents
 
 freshness:
   stage: check
