@@ -40,14 +40,14 @@ from .contract import (
 from .envelope import build_bundle, canon, sha
 from .profile import NEUTRAL, Profile
 from .redaction import redact_bundle
-from .result import build_result_core, stat_tolerance
+from .result import build_result_core, exact_tolerance, stat_tolerance
 from .seal import SealedFunction, sealed
 from .signing import use_signer
 from .testing import assert_integration
 
 #: Single source of truth for the version. pyproject derives the dist version from this
 #: (see [tool.setuptools.dynamic]). Independent of any consumer's version line.
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 
 __all__ = [
     "ATTESTATION_SCHEMA",
@@ -70,6 +70,7 @@ __all__ = [
     "build_result_core",
     "canon",
     "certify_bundle",
+    "exact_tolerance",
     "make_attestation",
     "make_signoff",
     "redact_bundle",

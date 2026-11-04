@@ -108,6 +108,19 @@ def claims_lines(rep: dict, bundle: Any) -> list[str]:
     return out
 
 
+#: The fixed guidance line under a row 24 (`reproduce_tolerance_undeclared`) rejection: it names the producer's fix.
+#: Text output only; the JSON verdict and the decision are unchanged.
+UNDECLARED_TOLERANCE_HINT = ("reproduce_tolerance_undeclared (row 24): the sealed result core declares no reproduction. "
+                             "The producer re-seals with `reproduce_tolerance=exact_tolerance()` for a deterministic "
+                             "result, or a stat band (`stat_tolerance(...)`) for a stochastic one")
+
+
+def decision_hint_lines(rep: dict) -> list[str]:
+    """Guidance for a receiver-decision reason whose fix is the producer's (text output only): today row 24."""
+    reasons = (rep.get("decision") or {}).get("reasons") or []
+    return [UNDECLARED_TOLERANCE_HINT] if "reproduce_tolerance_undeclared" in reasons else []
+
+
 def seal_signer_lines(rep: dict) -> list[str]:
     """SPEC 13.6: "A seal signer MUST be shown as `sealed by key <key_id>` and never as a person's sign-off". One
     line per verified seal signature (v4 input, or v3 with a verified signature)."""

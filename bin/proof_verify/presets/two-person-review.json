@@ -1,8 +1,8 @@
 {
   "schema": "proof_verify.policy_preset.v1",
   "preset": "two-person-review",
-  "version": 1,
-  "description": "A result is accepted only with an independent verifier's review and an approver's approval: a production origin key, an eligible review from the roster verifier and an eligible approval from the roster approver (different persons, different keys), the approval citing some valid verifier review (rule O does not require it to be the roster verifier's), no self-verification, v4 bundles only.",
+  "version": 2,
+  "description": "A result is accepted only with an independent verifier's review and an approver's approval: a production origin key, an eligible review from the roster verifier and an eligible approval from the roster approver (different persons, different keys), the approval citing an eligible verifier review (require_order_eligible, rule OE: a review under an unpinned key or outside the roster does not count), no self-verification, v4 bundles only.",
   "slots": [
     {
       "name": "originator-key",
@@ -96,8 +96,9 @@
       "approver"
     ],
     "require_order": true,
+    "require_order_eligible": true,
     "allow_self_verify": false
   },
-  "template_sha256": "sha256:6fd4d8c9b146a47002537a39cc5c937a9a974068b119eec060dd9614d2aa98ea",
-  "template_policy_sha256": "sha256:630d066a1839e29a0318d1e598f4d0806f0a78a2e808b1c2df24f9e5daadadb7"
+  "template_sha256": "sha256:c2b7c4388a757f5fff9ed63319cc2d2fe9843c37516d634b33a42094ec786bf0",
+  "template_policy_sha256": "sha256:c232aaafc187fb63c57c17ea72fc03c55c21c123c2ef4a94892f7da03aff3a41"
 }
