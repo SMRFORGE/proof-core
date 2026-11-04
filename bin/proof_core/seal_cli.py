@@ -18,10 +18,10 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
-import os
 import sys
+
+from proof_verify import _spec_loader
 
 from .contract import Case, Fidelity, Result, Verdict
 from .envelope import build_bundle
@@ -34,16 +34,9 @@ def _resolve_profile(spec: str):
     """Import a reviewer-named ``pkg.module:attr`` dialect Profile (a class is instantiated with no args; a
     constructed Profile is used as-is). Reads ONLY the command-line ``spec``. Raises ValueError on failure.
     Mirrors the resolver in ``reproduce_cli`` / ``proof_verify.__main__``."""
-    if ":" not in spec:
-        raise ValueError(f"--profile must be 'pkg.module:attr' (got {spec!r})")
-    module_name, _, attr_path = spec.partition(":")
-    if not module_name or not attr_path:
-        raise ValueError(f"--profile must be 'pkg.module:attr' (got {spec!r})")
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
-    try:
-        obj = importlib.import_module(module_name)
+    module_name, attr_path = _spec_loader.split_spec(spec, "--profile", "pkg.module:attr")
+    try:  # never the cwd: a module from the normal import path, or an absolute /abs/path/file.py
+        obj = _spec_loader.import_spec_module(module_name, "profile")
     except ImportError as exc:
         raise ValueError(f"cannot import profile module {module_name!r}: {exc}") from exc
     except Exception as exc:
@@ -90,7 +83,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--tolerance", metavar="tol.json",
                    help="path to a JSON reproduce_tolerance for a stochastic producer (sampled run/model)")
     p.add_argument("--profile", metavar="pkg.module:attr",
-                   help="mint under this dialect Profile (duck-typed); None -> the neutral evidence.* dialect")
+                   help="mint under this dialect Profile (duck-typed); None -> the neutral evidence.* dialect. "
+                        "Imported from the import path (PYTHONPATH / installed), never the current directory; "
+                        "or name a file by absolute path, /abs/path/file.py:attr")
     p.add_argument("-o", "--output", metavar="bundle.json",
                    help="write the bundle here (default: stdout)")
     p.add_argument("--json", action="store_true",

@@ -14,7 +14,10 @@ bundle -- see SECURITY):
       Import that object and use it as a ``proof_core.contract.ReproduceRunner`` (two methods:
       ``can_run(capability)`` and ``run(capability, inputs)``). A class is instantiated with no args; an
       already-constructed runner (e.g. a function decorated with ``proof_core.sealed``) is used as-is. The
-      reviewer points this at the SAME producer that minted the bundle.
+      reviewer points this at the SAME producer that minted the bundle. The module comes from the normal
+      import path (installed, or ``PYTHONPATH``), never the current directory: a reviewer often runs this
+      inside an unpacked bundle folder, where a sender could plant a same-named module. Name a file
+      explicitly by an ABSOLUTE path, ``/abs/path/file.py:ClassName`` (a relative one is refused).
 
   --command "<cmd>"
       A built-in subprocess runner, so a reviewer can reproduce with their OWN installed tool and no
@@ -22,7 +25,8 @@ bundle -- see SECURITY):
         1. the bundle's sealed case ``{"capability", "inputs"}`` is written as JSON to a fresh temp dir;
            the path is handed to the command in the env var ``PROOF_INPUTS``.
         2. ``<cmd>`` is run with that temp dir as its working directory (``shell=True``). It must not rely
-           on the network; it reads ``PROOF_INPUTS`` and recomputes the result.
+           on the network; it reads ``PROOF_INPUTS`` and recomputes the result. Nothing enforces that: the
+           command is not sandboxed and runs with the reviewer's own access, network included.
         3. the command writes the recomputed OUTPUTS -- a JSON object of the capability's output keys,
            the same shape as the sealed ``result[<capability>]`` -- to the path in ``PROOF_OUTPUT``.
         4. those fresh outputs are spliced onto the sealed bundle's shape (same inputs, fidelity, verdict,
@@ -52,12 +56,13 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
+
+from proof_verify import _spec_loader
 
 from .certify import ReproduceError, differing_output_keys, reproduce_bundle, subject_canon
 from .committed import disclosed_values as _disclosed
@@ -88,20 +93,13 @@ def _resolve_runner(spec: str) -> ReproduceRunner:
     which IS a runner) is used as-is. Raises ValueError with a plain reason if the spec is malformed, the
     import fails, or the resolved object is not a ReproduceRunner. This reads ONLY the command-line ``spec``;
     it never consults the bundle."""
-    if ":" not in spec:
-        raise ValueError(f"--runner must be 'pkg.module:ClassName' (got {spec!r})")
-    module_name, _, attr_path = spec.partition(":")
-    if not module_name or not attr_path:
-        raise ValueError(f"--runner must be 'pkg.module:ClassName' (got {spec!r})")
-    # The `proof-reproduce` console-script entry point puts the launcher's bin directory on sys.path[0], NOT
-    # the current directory -- so `--runner mymodule:ClassName` for a module in the cwd would fail to import,
-    # unlike `python -m proof_core.reproduce_cli` (which adds the cwd). The runner is a deliberate,
-    # command-line-named target (never a bundle field), so make the cwd importable here to match `-m`.
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
+    module_name, attr_path = _spec_loader.split_spec(spec, "--runner", "pkg.module:ClassName")
+    # The current directory is NEVER added to the import path: a reviewer often runs this inside an unpacked
+    # bundle folder, and a sender-planted `myrunner.py` there would replace the reviewer's runner (a "re-run"
+    # that hands back the sealed value). A module comes from the normal import path (PYTHONPATH / installed);
+    # a file is named explicitly by an absolute path, `/abs/path/file.py:ClassName` (relative is refused).
     try:
-        obj = importlib.import_module(module_name)
+        obj = _spec_loader.import_spec_module(module_name, "runner")
     except ImportError as exc:
         raise ValueError(f"cannot import runner module {module_name!r}: {exc}") from exc
     except SystemExit as exc:  # a module that calls sys.exit() at import is an unusable --runner arg
@@ -138,16 +136,9 @@ def _resolve_profile(spec: str):
     with no args; an already-constructed Profile is used as-is). Duck-typed: the verifier reads a profile
     attribute-only, so any object carrying the dialect fields works. Mirrors ``_resolve_runner`` -- it reads
     ONLY the command-line ``spec``, never the bundle, and raises ValueError with a plain reason on failure."""
-    if ":" not in spec:
-        raise ValueError(f"--profile must be 'pkg.module:attr' (got {spec!r})")
-    module_name, _, attr_path = spec.partition(":")
-    if not module_name or not attr_path:
-        raise ValueError(f"--profile must be 'pkg.module:attr' (got {spec!r})")
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
-    try:
-        obj = importlib.import_module(module_name)
+    module_name, attr_path = _spec_loader.split_spec(spec, "--profile", "pkg.module:attr")
+    try:  # never the cwd (see _resolve_runner): a planted profile would pin the sender's key
+        obj = _spec_loader.import_spec_module(module_name, "profile")
     except ImportError as exc:
         raise ValueError(f"cannot import profile module {module_name!r}: {exc}") from exc
     except Exception as exc:  # any import-time failure is a bad --profile arg, not a CLI crash
@@ -410,8 +401,9 @@ def _epilog() -> str:
     return (
         "the --command contract:\n"
         f"  the sealed case {{capability, inputs}} is written as JSON to a temp dir; its path is in\n"
-        f"  the env var {ENV_INPUTS}. The command runs there (shell, no network) and writes the\n"
-        f"  recomputed outputs -- a JSON object of the capability's output keys -- to {ENV_OUTPUT}.\n"
+        f"  the env var {ENV_INPUTS}. The command runs there through the shell and writes the recomputed\n"
+        f"  outputs -- a JSON object of the capability's output keys -- to {ENV_OUTPUT}. It must not rely on\n"
+        "  the network, but it is NOT sandboxed: it runs with your user's full access (network included).\n"
         "  Those fresh outputs are compared against the sealed ones OUTPUTS ONLY and EXACTLY: --command never\n"
         "  applies the bundle's sealed statistical band, and it cannot re-derive fidelity, verdict, caveats,\n"
         "  reproduce_tolerance or produced_by (they are taken from the bundle; the report says so). For a\n"
@@ -434,12 +426,15 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("bundle", help="path to the evidence bundle JSON to reproduce")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--runner", metavar="pkg.module:ClassName",
-                   help="import this ReproduceRunner (or @sealed function) and re-run the producer")
+                   help="import this ReproduceRunner (or @sealed function) and re-run the producer; the "
+                        "module comes from the import path (PYTHONPATH / installed), never the current "
+                        "directory; or name a file by absolute path, /abs/path/file.py:ClassName")
     g.add_argument("--command", metavar='"<cmd>"',
                    help="run this command as the reproducer (reads PROOF_INPUTS, writes PROOF_OUTPUT)")
     p.add_argument("--profile", metavar="pkg.module:attr",
                    help="import this dialect Profile (duck-typed) and verify + reproduce under it; needed "
-                        "for a branded consumer whose bundle is not the neutral evidence.* dialect")
+                        "for a branded consumer whose bundle is not the neutral evidence.* dialect (import "
+                        "path only, never the current directory; or /abs/path/file.py:attr)")
     p.add_argument("--pubkey", metavar="HEX",
                    help="pin this 64-hex Ed25519 public key as the origin trust root for the verify step "
                         "(a convenience for a dialect with no Profile; profile.pinned_pubkey wins if both)")

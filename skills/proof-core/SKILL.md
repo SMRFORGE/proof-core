@@ -3,7 +3,7 @@ name: proof-core
 description: Seal a computed result into a tamper-evident, independently re-runnable evidence bundle, and verify or reproduce one. Use when an agent produces a result (a number, a decision, a test or evaluation outcome, a file digest) that someone downstream has to trust and may need to re-run or audit later. Seals the result with its inputs so a neutral party can re-derive it offline, with no account and no network. Not a correctness check and not a logger; it makes a result re-runnable and tamper-evident, nothing more.
 license: MIT
 metadata:
-  wraps: proof-core 0.27.0 (vendored, MIT)
+  wraps: proof-core 0.27.1 (vendored, MIT)
   offline: true
 ---
 
@@ -22,7 +22,7 @@ PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin" python -P -m proof_core <seal|verify|repr
 
 **Never drop `-P`.** Without it, `python -m` puts the current folder ahead of `PYTHONPATH`, so a
 `proof_verify/` or `hashlib.py` in the folder being checked runs instead of the vendored verifier and
-can fake a pass. `-P` covers `verify`; it does not make `reproduce --runner` safe on its own (see
+can fake a pass. `reproduce` itself never imports a `--runner` from the current folder either (see
 reproduce below).
 
 ## When to use it
@@ -137,18 +137,25 @@ tool by an ABSOLUTE path (or have it on PATH); a bare relative script name will 
 found. The runner/command is ALWAYS supplied here on the command line, never read from
 the bundle.
 
-**Run `reproduce --runner` only from a folder you control.** The bundled `reproduce` still adds
-the current folder to the import path for `--runner`, even under `-P`, so a `mypkg/` planted next
-to a bundle replaces your runner and can report REPRODUCED for a wrong result. Never run it inside
-the bundle's folder or the sender's project. `cd` to a folder of your own (an empty temp folder is
-fine), pass the bundle by absolute path, and put the runner's project on `PYTHONPATH` by absolute
-path after the plugin's `bin/` (`:` separates entries on POSIX, `;` on Windows):
+**Using your own Python runner (`--runner`).** `reproduce` never imports a runner from the current
+folder, and `-P` keeps `python -m` from doing so either: the folder you run in is often the sender's
+unpacked bundle, and a planted `mypkg/module.py` there could replace your runner with one that just
+hands back the sealed value. Name your runner one of two ways.
+
+- As a module: put the folder that contains your package on `PYTHONPATH` next to the plugin,
+  absolute paths only (`:` separates on POSIX, `;` on Windows).
+- As a file: give its absolute path, `--runner /abs/path/to/your/project/mypkg/module.py:RunnerClass`
+  (on Windows `C:\path\to\module.py:RunnerClass`; the spec splits at the last `:`). A relative
+  file path is refused (exit 2).
 
 ```
-cd "$(mktemp -d)"
 PYTHONPATH="${CLAUDE_PLUGIN_ROOT}/bin:/abs/path/to/your/project" python -P -m proof_core \
-  reproduce /abs/path/to/bundle.json --runner mypkg.module:RunnerClass --json
+  reproduce bundle.json --runner mypkg.module:RunnerClass --json
 ```
+
+Never point at a runner inside the bundle's folder. If `--runner mypkg.module:...` says
+`No module named 'mypkg'`, your project isn't on `PYTHONPATH`: add its absolute path. Don't `cd` into
+the bundle folder to make it resolve.
 
 Exit codes: `0` reproduced (`--runner`: the numbers and the sealed claim re-derive), `1` not
 reproduced (or integrity failed, so it was never re-run), `2` usage / unreadable bundle, `3`

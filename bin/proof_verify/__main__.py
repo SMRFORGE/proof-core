@@ -5,7 +5,6 @@ passing check is a genuine second opinion, not the producer marking its own home
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 import sys
@@ -13,6 +12,7 @@ import sys
 # The parse-time guards (duplicate-key / NaN / depth / size) live in ONE place, `verify.loads`, so every
 # bundle reader shares them. Re-exported here (``cli._text_depth_ok``, ``cli.loads``) for callers/tests
 # that reach for them on the CLI module.
+from . import _spec_loader
 from . import policy_source as _ps
 from .render import (
     RenderError,
@@ -57,7 +57,14 @@ from .verify import (  # noqa: F401 -- re-exported for backward-compatible acces
 _USAGE = ("usage: proof-verify <bundle.json> [--profile pkg.module:attr] [--pubkey HEX] [--json]\n"
           "                    [--policy FILE | --policy preset:NAME] [--no-policy-discovery]\n"
           "                    [--expect-policy sha256:HEX] [--allow-self-verify] [--as-of T] [--upstream PATH ...]\n"
-          "                    (or: python -m proof_verify ...)\n"
+          "                    (or: python -P -m proof_verify ...;\n"
+          "                     -P: under -m Python puts the cwd first on the import\n"
+          "                     path, so a planted proof_verify/ or profile module would win)\n"
+          "  --profile SPEC   a dialect Profile: pkg.module:attr from the import path (PYTHONPATH / installed),\n"
+          "                   or /abs/path/file.py:attr (an absolute path; a relative one exits 2). The current\n"
+          "                   directory is never searched (a sender could plant a module in an unpacked bundle\n"
+          "                   folder); python -m itself puts the current directory on the path, so there prefer\n"
+          "                   the proof-verify script or python -P -m.\n"
           "  --policy FILE    a receiver policy (evidence.receiver-policy.v1) whose pins replace the built-in demo\n"
           "                   pin; --pubkey is then merged into it. A malformed policy exits 2 with no verdict.\n"
           "                   preset:NAME uses a shipped preset only if it needs no filling (none does today:\n"
@@ -193,11 +200,32 @@ def DEMO_KEY_ID_OF(fingerprint: str) -> str:
 
 
 def _pins_text(rep: dict) -> str:
-    """What the verdict was pinned to: the module pin's fingerprint on the single-pin path, else the pin set."""
+    """What the verdict was pinned to: on the single-pin path the pin it used (a --profile's pinned_pubkey, else the
+    module pin, as the verdict reports it in ``pinned_key``), else the pin set."""
     ps = rep.get("pin_set")
     if ps is None:
-        return pinned_key_fingerprint()
+        pk = rep.get("pinned_key")
+        return pk if isinstance(pk, str) else pinned_key_fingerprint()
     return "the pin set: " + (", ".join(e["key_id"] for e in ps) if ps else "empty")
+
+
+def _matched_pins(rep: dict) -> list[str]:
+    """The pin(s) the origin decision matched: under a pin set (--policy, --pubkey merged into it) the key id of every
+    verified seal signature whose key is pinned, in E order; on the single-pin path the one pin, when it matched."""
+    if rep.get("pin_set") is None:
+        pk = rep.get("pinned_key")
+        return [pk] if rep.get("key_matches_pin") and isinstance(pk, str) else []
+    out: list[str] = []
+    for e in rep.get("signers") or []:
+        if e.get("checked") and e.get("valid") and e.get("pinned") and e.get("key_id") not in out:
+            out.append(e["key_id"])
+    return out
+
+
+def _origin_pin_text(rep: dict) -> str:
+    """The key(s) actually used for the origin decision: the matched pin(s), else what the verdict was pinned to."""
+    matched = _matched_pins(rep)
+    return ", ".join(matched) if matched else _pins_text(rep)
 
 
 def _print_seal_keys(rep: dict, signer_hex: str | None) -> None:
@@ -301,7 +329,12 @@ def _emit_json(path: str, bundle: dict, rep: dict, chain: dict | None = None, as
     out["withheld_items"] = [e.get("path") for e in _withheld_items(rep)]
     out["not_checked"] = ([f"section {s}" for s in out["withheld"]]
                           + [f"item {e.get('path')}" for e in _withheld_items(rep)])
-    out["pinned_key_fingerprint"] = pinned_key_fingerprint()
+    # the key the ORIGIN decision used, never the module pin when a --profile or --policy supplied the pin: on the
+    # single-pin path the profile / module pin; under a pin set the first matched pin (null when none matched).
+    # `matched_pins` lists every pin a verified seal signature matched.
+    out["pinned_key_fingerprint"] = (_pins_text(rep) if rep.get("pin_set") is None
+                                     else (_matched_pins(rep) or [None])[0])
+    out["matched_pins"] = _matched_pins(rep)
     # the one fact an origin gate keys on: exit 0 under a real PRODUCTION pin is the only pass.
     out["production_origin_pass"] = code == EXIT_VERIFIED
     out["not_a_production_pass"] = code != EXIT_VERIFIED
@@ -444,8 +477,10 @@ def _verify_path(path: str, *, profile=None, as_json: bool = False, upstreams: l
     refused = _expect_refused(expect_policy, rep.get("policy_sha256"), policy_source or {"kind": "default"}, as_json)
     if refused is not None:
         return refused
-    chain = None if ups is None else _verify_chain_parsed(bundle, _index_upstreams_parsed(ups, profile=profile).get,
-                                                  profile=profile)
+    # SPEC 9.3: every upstream is judged under the SAME trust inputs as the root (policy pins, origin quorum, required
+    # suites, aging at as_of), never under the profile pin alone
+    judge = {"profile": profile, "policy": policy, "pins": pins, "as_of": as_of}
+    chain = None if ups is None else _verify_chain_parsed(bundle, _index_upstreams_parsed(ups, **judge).get, **judge)
     if as_json:
         # machine-readable verdict: the SAME exit code as the prose path, no prose printed.
         return _emit_json(path, bundle, rep, chain, as_of, policy_source)
@@ -555,7 +590,7 @@ def _verify_text(path: str, bundle, rep: dict, chain: dict | None, ups: list | N
             print(f"    every hash recomputes and the {_suite_signature(rep)} is valid under the key this bundle")
             print("    carries, so the record is UNEDITED since it was signed -- but that key is not the pin:")
             _print_seal_keys(rep, signer_hex)
-            print(f"      pinned key: {pinned_key_fingerprint()}")
+            print(f"      pinned key: {_pins_text(rep)}")
             print("    Anyone can sign with a public seed, so this proves INTEGRITY, not that the record came")
             print("    from the pinned signer (ORIGIN). Expected for a bundle you signed yourself (on a")
             print("    machine without the pinned signer's key).")
@@ -584,7 +619,7 @@ def _verify_text(path: str, bundle, rep: dict, chain: dict | None, ups: list | N
         print(f"    origin holds only through the archive, which shows the seal signatures existed no later than {t0}")
         print("    (archive rescue, SPEC 7.13). It is only as good as the archive's TSAs.")
     _print_seal_keys(rep, None)
-    print(f"    pinned key: {pinned_key_fingerprint()}")
+    print(f"    pinned key: {_origin_pin_text(rep)}")
     print("    cross-check this fingerprint against the published trust root before")
     print("    relying on origin -- see docs/TRUST_ROOT.md. Origin holds only if it matches.")
     _print_canon_note(bundle)
@@ -731,16 +766,12 @@ def _resolve_profile(spec: str):
     so any object carrying the dialect fields works. This imports the CONSUMER's module, NEVER proof_core --
     the verifier stays stdlib-only. Reads ONLY the command-line ``spec``, never the bundle. Raises ValueError
     with a plain reason on failure, so main() can map it to a usage exit."""
-    if ":" not in spec:
-        raise ValueError(f"--profile must be 'pkg.module:attr' (got {spec!r})")
-    module_name, _, attr_path = spec.partition(":")
-    if not module_name or not attr_path:
-        raise ValueError(f"--profile must be 'pkg.module:attr' (got {spec!r})")
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
+    module_name, attr_path = _spec_loader.split_spec(spec, "--profile", "pkg.module:attr")
+    # The current directory is NEVER added to the import path: a sender-planted `acme_profile.py` in an
+    # unpacked bundle folder would otherwise pin the sender's key and read as an origin pass. A module comes
+    # from the normal import path (PYTHONPATH / installed); a file is named by an absolute path, `/abs/path/file.py:attr`.
     try:
-        obj = importlib.import_module(module_name)
+        obj = _spec_loader.import_spec_module(module_name, "profile")
     except ImportError as exc:
         raise ValueError(f"cannot import profile module {module_name!r}: {exc}") from exc
     except Exception as exc:  # any import-time failure is a bad --profile arg, not a CLI crash
@@ -772,7 +803,8 @@ def _main(args: list[str]) -> int:
                                 description="Independently verify an evidence bundle (integrity + origin).")
     p.add_argument("bundle")
     p.add_argument("--profile", metavar="pkg.module:attr",
-                   help="verify under this dialect Profile (duck-typed; needed for a non-neutral bundle)")
+                   help="verify under this dialect Profile (duck-typed; needed for a non-neutral bundle); "
+                        "import path only, never the current directory, or /abs/path/file.py:attr")
     p.add_argument("--pubkey", metavar="HEX",
                    help="pin this 64-hex Ed25519 public key as the origin trust root")
     p.add_argument("--json", action="store_true",

@@ -8,14 +8,16 @@ from __future__ import annotations
 
 import sys
 
-_USAGE = "usage: python -m proof_core <seal|verify|reproduce|policy> [args...]"
+_USAGE = "usage: python -P -m proof_core <seal|verify|reproduce|policy> [args...]"
 _HELP = (
     _USAGE + "\n\n"
     "  seal       seal a pre-computed result (inputs + outputs JSON) into a signed bundle\n"
     "  verify     independently verify a bundle (integrity + origin); --json for a machine verdict\n"
     "  reproduce  re-derive a bundle's numbers with the open engine; --json for a machine verdict\n"
     "  policy     explain a receiver policy (its policy_sha256, what it requires) or init one from a preset\n\n"
-    "run `python -m proof_core <verb> --help` for that verb's own options.")
+    "-P matters: under -m Python puts the current directory first on the import path, so a planted\n"
+    "proof_verify/ or profile module there would win over the installed one.\n\n"
+    "run `python -P -m proof_core <verb> --help` for that verb's own options.")
 
 
 def main(argv: list[str] | None = None) -> int:
