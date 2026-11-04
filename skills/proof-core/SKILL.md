@@ -50,6 +50,13 @@ Optional: `--verdict pass|advisory|fail` (default pass), `--fidelity screening|r
 short note goes to stderr. The producer sets `--verdict`/`--fidelity` as its own claims;
 they are not vouched for by verify.
 
+A receiver using the `calc-package` policy preset (version 2) accepts a bundle only if it
+declares how it reproduces. For a deterministic result, seal with `--tolerance tol.json`
+where `tol.json` is exactly `{"kind": "exact"}` (in Python,
+`reproduce_tolerance=proof_core.exact_tolerance()`); a stochastic result declares a
+statistical band (`proof_core.stat_tolerance`) instead. Declare `exact` only when a re-run
+really gives the same result.
+
 ## verify
 
 ```
@@ -133,8 +140,9 @@ never a pass). `--json` emits a parseable verdict with the same
 
 ## The honest boundary (state this plainly)
 
-A seal proves the record is **unaltered** since it was signed and that it **re-derives**
-from its sealed inputs. It does **not** prove the result is correct, and it does **not**
+A seal proves the record is **unaltered** since it was signed. Sealing runs nothing, so it
+does not show the result re-derives; `reproduce` is what shows it re-derives from its sealed
+inputs (exit 0 only). It does **not** prove the result is correct, and it does **not**
 prove the agent ran what it claims to have run. Closing that gap takes **independent
 reproduction** by a party the producer does not control. When you hand off a claim, carry
 the bundle's `bundle_sha256` with it so the record can be found and checked.
