@@ -105,10 +105,17 @@ def _policy_entry(d: pathlib.Path, entry: dict, text: str, policy_fn, states: di
         bundle = text                   # the vector's BYTES: the verifier parses them itself (SPEC 4)
     except (OSError, KeyError, ValueError) as exc:
         return False, f"error: {exc}"
+    caller_pins = entry.get("caller_pins")
+    if caller_pins is None and "expect_policy_sha256" in entry:
+        # SPEC 13.3: `expect_policy_sha256` is the digest the runner's verifier COMMAND prints. A CLI with no key of
+        # its own merges its built-in demo pins as caller pins (13.4.1 step 3), and they are in the effective policy
+        # the digest covers, so this vector runs with them, as the command does.
+        from .verify import BUILTIN_DEMO_PINS
+        caller_pins = [dict(p) for p in BUILTIN_DEMO_PINS]
     try:
         as_of = entry.get("as_of", corpus_as_of)
-        result = (policy_fn(bundle, policy, entry.get("caller_pins"), as_of=as_of) if as_of is not None
-                  else policy_fn(bundle, policy, entry.get("caller_pins")))
+        result = (policy_fn(bundle, policy, caller_pins, as_of=as_of) if as_of is not None
+                  else policy_fn(bundle, policy, caller_pins))
     except Exception as exc:  # noqa: BLE001 -- the verifier REFUSED the policy: right only when the vector expects that error
         kind = getattr(exc, "kind", None)
         if "expect_error" in entry:
@@ -132,6 +139,9 @@ def _policy_entry(d: pathlib.Path, entry: dict, text: str, policy_fn, states: di
         return False, f"decision.accept {decision.get('accept')!r}, expected {entry['expect_decision']}"
     if "expect_reasons" in entry and decision.get("reasons") != entry["expect_reasons"]:
         return False, f"decision.reasons {decision.get('reasons')!r}, expected {entry['expect_reasons']}"
+    if "expect_policy_sha256" in entry and decision.get("policy_sha256") != entry["expect_policy_sha256"]:
+        return False, (f"decision.policy_sha256 {decision.get('policy_sha256')!r}, expected "
+                       f"{entry['expect_policy_sha256']}")
     dims = result.get("dims") if isinstance(result.get("dims"), dict) else {}
     for dim, want_dim in entry.get("expect_dims", {}).items():
         if dims.get(dim) != want_dim:
@@ -147,6 +157,34 @@ def classify_with_policy(bundle, policy, caller_pins=None, as_of=None) -> dict:
     return classify_bundle(bundle, policy=policy, pins=caller_pins, as_of=as_of)
 
 
+def walk_chain_with_policy(bundle, upstreams, policy=None, caller_pins=None, as_of=None) -> dict:
+    """The reference chain walk as a ``chain_fn`` for `run_conformance`: ``verify_chain`` of the root's bytes through
+    the upstreams' bytes, under the vector's receiver policy, caller pins and ``as_of`` (SPEC v4 9.3 trust inputs:
+    the same ones as the root's single-bundle verdict). ``policy`` None: the default pin, as `classify_bundle`."""
+    from .verify import index_upstreams, verify_chain
+    judge = {"policy": policy, "pins": caller_pins, "as_of": as_of}
+    return verify_chain(bundle, index_upstreams(upstreams, **judge).get, **judge)
+
+
+def _chain_entry(d: pathlib.Path, entry: dict, raw: bytes, chain_fn, corpus_as_of) -> tuple[bool, str]:
+    """Walk a chain vector (`upstreams` + `expect_chain`) with ``chain_fn`` under the vector's own policy (or none)
+    and compare the chain and link states exactly. Returns (ok, got)."""
+    try:
+        ups = [_safe_vector_path(d, u).read_bytes() for u in entry["upstreams"]]
+        policy = (_loads(_safe_vector_path(d, entry["policy"]).read_text(encoding="utf-8"))
+                  if "policy" in entry else None)
+        want = entry["expect_chain"]
+        report = chain_fn(raw, ups, policy, entry.get("caller_pins"),
+                          as_of=entry.get("as_of", corpus_as_of) if policy is not None else entry.get("as_of"))
+    except Exception as exc:  # noqa: BLE001 -- a walk that raises is a failure of the vector, never a pass
+        return False, f"chain walk error ({type(exc).__name__}: {exc})"
+    links = [ln.get("state") for ln in report.get("links", [])] if isinstance(report, dict) else None
+    got = report.get("chain") if isinstance(report, dict) else None
+    if got != want["chain"] or links != want["links"]:
+        return False, f"chain {got!r} links {links}, expected chain {want['chain']!r} links {want['links']}"
+    return True, "chain"
+
+
 def _load_states(d: pathlib.Path) -> dict:
     path = d.parent / "expected_states.json"
     if not path.is_file():
@@ -155,7 +193,8 @@ def _load_states(d: pathlib.Path) -> dict:
     return states if isinstance(states, dict) else {}
 
 
-def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | None = None) -> dict:
+def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | None = None,
+                    chain_fn: Callable | None = None) -> dict:
     """Run `verify_fn` over every vector and check it matches the expected verdict.
 
     Returns {conformant, total, passed, not_applicable, failures:[{file, expected, got}]}. A verifier is
@@ -172,6 +211,12 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
     ``expected_states.json`` beside the vectors directory, or be refused when it carries ``expect_error``. Without
     a ``policy_fn`` they are NOT RUN, which is a failure (13.3: "the others count as not run, which is a failure of
     the run").
+
+    'chain' vectors (`upstreams` + `expect_chain`, SPEC v4 9.3) are also walked with ``chain_fn(bundle, upstreams,
+    policy, caller_pins, as_of=...)`` (the bytes of the root and of each upstream; the vector's policy or None),
+    which returns a `verify_chain`-style report whose chain and link states must equal `expect_chain`. Without a
+    ``chain_fn`` (a verifier that does not walk chains) only the root's verdict is checked and the vector is listed in
+    ``chain_not_checked``: never reported as a checked chain.
     """
     d = pathlib.Path(vectors_dir)
     manifest = load_manifest(d)
@@ -183,6 +228,7 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
     failures = []
     passed = 0
     not_applicable = []   # 'unreadable' vectors the runner's own loader refused; verify_fn was not consulted
+    chain_not_checked = []   # chain vectors whose expect_chain was not walked (no chain_fn)
     states = _load_states(d)
     for entry in vectors:
         try:
@@ -197,6 +243,11 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
         # own policy, such as the trusted-time vectors that carry test-TSA pins, must reach an accept state under it)
         if isinstance(entry, dict) and (entry.get("expect") == "policy" or "policy" in entry):
             ok, got = _policy_entry(d, entry, raw, policy_fn, states, manifest.get("corpus_as_of"))
+            if ok and "expect_chain" in entry:
+                if chain_fn is None:
+                    chain_not_checked.append(entry["file"])
+                else:
+                    ok, got = _chain_entry(d, entry, raw, chain_fn, manifest.get("corpus_as_of"))
             if ok:
                 passed += 1
             else:
@@ -236,6 +287,11 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
         else:
             ok = False  # an UNRECOGNIZED expect token is a conformance FAILURE, never coerced
             got = f"{got} (unknown expect {expect!r})"
+        if ok and isinstance(entry, dict) and "expect_chain" in entry:
+            if chain_fn is None:
+                chain_not_checked.append(entry["file"])
+            else:
+                ok, got = _chain_entry(d, entry, raw, chain_fn, manifest.get("corpus_as_of"))
         if ok:
             passed += 1
         else:
@@ -247,7 +303,8 @@ def run_conformance(verify_fn: Callable, vectors_dir, *, policy_fn: Callable | N
     # battery whose every vector is not applicable: `verify_fn` was never called, so nothing was certified.
     applicable = total - len(not_applicable)
     return {"conformant": applicable > 0 and not failures, "total": total, "passed": passed,
-            "not_applicable": not_applicable, "failures": failures}
+            "not_applicable": not_applicable, "failures": failures, "chain_walk": chain_fn is not None,
+            "chain_not_checked": chain_not_checked}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -261,11 +318,13 @@ def main(argv: list[str] | None = None) -> int:
 
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) != 1 or args[0] in ("-h", "--help"):
-        print("usage: python -m proof_verify.conformance VECTORS_DIR   (the directory holding manifest.json)",
+        print("usage: python -P -m proof_verify.conformance VECTORS_DIR   (the directory holding manifest.json;\n"
+              "       -P: under -m Python puts the cwd first on the import path, so a planted module would win)",
               file=sys.stderr if args[:1] not in (["-h"], ["--help"]) else sys.stdout)
         return 0 if args[:1] in (["-h"], ["--help"]) else 2
     try:
-        report = run_conformance(classify_bundle, args[0], policy_fn=classify_with_policy)
+        report = run_conformance(classify_bundle, args[0], policy_fn=classify_with_policy,
+                                 chain_fn=walk_chain_with_policy)
     except (OSError, ValueError, TypeError) as exc:
         print(f"error: cannot run the vectors in {safe_text(args[0])}: {safe_text(exc)}", file=sys.stderr)
         return 2

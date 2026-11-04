@@ -784,6 +784,12 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
     for k in _POLICY_DEFAULTS:
         if not _POLICY_SHAPES[k](members[k]):
             raise PolicyError(f'evaluate: policy member "{k}" has a wrong type or a value out of range')
+    # the roster shape above only checks "a list of objects"; its person objects are read by key below (and by
+    # policy_sha256), so validate them in full as a policy file's roster is: `[{}]` is malformed, not a KeyError
+    try:
+        _check_roster(members["roster"])
+    except PolicyError as exc:
+        raise PolicyError(f"evaluate: {exc}") from exc
     _check_member_combination(members, "evaluate")
     recorded = rep.get("policy_sha256")
     if recorded is None and isinstance(rep.get("decision"), dict):
@@ -4971,9 +4977,11 @@ def _chain_state(bundle: Any, problems: list[str]) -> str:
     return "declared-unwalked"
 
 
-def _classify_chain(bundle: Any, profile) -> dict:
-    """`classify_bundle` under `profile`, augmented with the sealed-chain state the walker folds over."""
-    rep = dict(_classify_parsed(bundle, profile=profile))
+def _classify_chain(bundle: Any, profile=None, *, policy=None, pins=None, as_of: str | None = None) -> dict:
+    """`classify_bundle` under `profile` and the receiver's `policy` / `pins` / `as_of` (SPEC 9.3: every bundle of
+    the walk, the root and each upstream, is judged under the SAME trust inputs), augmented with the sealed-chain
+    state the walker folds over."""
+    rep = dict(_classify_parsed(bundle, profile=profile, policy=policy, pins=pins, as_of=as_of))
     rep["chain"] = _chain_state(bundle, rep["integrity_problems"])
     return rep
 
@@ -5027,17 +5035,18 @@ def _result_block(bundle: Any) -> Any:
     return manifest.get("result") if isinstance(manifest, dict) else None
 
 
-def _candidate_rank(bundle: dict, profile) -> tuple[int, int, int]:
-    rep = _classify_parsed(bundle, profile=profile)
+def _candidate_rank(bundle: dict, judge: dict) -> tuple[int, int, int]:
+    rep = _classify_parsed(bundle, **judge)
     res = _result_block(bundle)
     return (int(rep["integrity_ok"]), int(isinstance(res, dict) and "value" in res), int(rep["origin_ok"]))
 
 
-def index_upstreams(datas, *, profile=None) -> dict[str, str]:
+def index_upstreams(datas, *, profile=None, policy=None, pins=None, as_of: str | None = None) -> dict[str, str]:
     """Index candidate upstream bundles, each given as its BYTES or text, by their RECOMPUTED seal (a convenience to
     build a `resolve` from: `index_upstreams(...).get`, which returns the upstream's text). An unreadable candidate is
     skipped. When two copies share a seal, the intact copy with its `result` present (then: signed under the pin)
-    wins; among equals the FIRST seen wins."""
+    wins; among equals the FIRST seen wins. Pass the same `policy` / `pins` / `as_of` as to `verify_chain`, so the
+    copy that wins is the one with origin under the receiver's trust inputs."""
     texts = {}
     parsed = []
     for d in datas:
@@ -5047,11 +5056,14 @@ def index_upstreams(datas, *, profile=None) -> dict[str, str]:
             continue
         texts[id(b)] = d if isinstance(d, str) else bytes(d).decode("utf-8")
         parsed.append(b)
-    return {seal: texts[id(b)] for seal, b in _index_upstreams_parsed(parsed, profile=profile).items()}
+    return {seal: texts[id(b)] for seal, b in _index_upstreams_parsed(parsed, profile=profile, policy=policy,
+                                                                      pins=pins, as_of=as_of).items()}
 
 
-def _index_upstreams_parsed(bundles, *, profile=None) -> dict[str, dict]:
+def _index_upstreams_parsed(bundles, *, profile=None, policy=None, pins=None,
+                            as_of: str | None = None) -> dict[str, dict]:
     """PRIVATE: `index_upstreams` over objects the caller parsed (see `_classify_parsed`)."""
+    judge = {"profile": profile, "policy": policy, "pins": pins, "as_of": as_of}
     index: dict[str, dict] = {}
     ranks: dict[str, tuple[int, int, int]] = {}
     for b in bundles:
@@ -5062,8 +5074,8 @@ def _index_upstreams_parsed(bundles, *, profile=None) -> dict[str, dict]:
             index[seal] = b
             continue
         if seal not in ranks:
-            ranks[seal] = _candidate_rank(index[seal], profile)
-        rank = _candidate_rank(b, profile)
+            ranks[seal] = _candidate_rank(index[seal], judge)
+        rank = _candidate_rank(b, judge)
         if rank > ranks[seal]:
             index[seal], ranks[seal] = b, rank
     return index
@@ -5263,8 +5275,9 @@ def _consumes_verdict(citing_cap, up: dict, allowed) -> tuple[str, str] | None:
     return None
 
 
-def verify_chain(data: bytes | str, resolve, *, profile=None, consumes_of=None,
-                 max_depth: int = _MAX_CHAIN_DEPTH, max_visited: int = _MAX_CHAIN_VISITED) -> dict:
+def verify_chain(data: bytes | str, resolve, *, profile=None, consumes_of=None, policy=None, pins=None,
+                 as_of: str | None = None, max_depth: int = _MAX_CHAIN_DEPTH,
+                 max_visited: int = _MAX_CHAIN_VISITED) -> dict:
     """The chain walk of the bundle given as its BYTES or text (SPEC 4), through `resolve(seal) -> bytes | str |
     None` (build one with `index_upstreams(texts).get`). Each upstream is parsed with the hardened loader too; an
     unreadable one is read as an empty object, so its link fails. A parsed root is refused with TypeError. See
@@ -5280,18 +5293,22 @@ def verify_chain(data: bytes | str, resolve, *, profile=None, consumes_of=None,
                 return parse_bundle(up)
             except (ValueError, RecursionError, TypeError):
                 return {}
-        return _verify_chain_parsed(root, resolve_parsed, profile=profile, consumes_of=consumes_of,
-                                    max_depth=max_depth, max_visited=max_visited)
+        return _verify_chain_parsed(root, resolve_parsed, profile=profile, consumes_of=consumes_of, policy=policy,
+                                    pins=pins, as_of=as_of, max_depth=max_depth, max_visited=max_visited)
 
 
-def _verify_chain_parsed(bundle: Any, resolve, *, profile=None, consumes_of=None,
-                         max_depth: int = _MAX_CHAIN_DEPTH, max_visited: int = _MAX_CHAIN_VISITED) -> dict:
+def _verify_chain_parsed(bundle: Any, resolve, *, profile=None, consumes_of=None, policy=None, pins=None,
+                         as_of: str | None = None, max_depth: int = _MAX_CHAIN_DEPTH,
+                         max_visited: int = _MAX_CHAIN_VISITED) -> dict:
     """PRIVATE: walk `bundle`'s sealed `derived_from` links through the supplied upstreams; return the chain report.
     The root and the upstreams `resolve` returns are objects the caller parsed (see `_classify_parsed`).
 
     DOMAIN-NEUTRAL + OFF-PATH: a Stage-2 addition nothing on the neutral verify path calls. `resolve(seal)
     -> bundle | None` is the air-gapped upstream seam (build one with `index_upstreams(...).get`); nothing
-    is fetched. `profile` selects the dialect for every `classify_bundle` the walk performs. `consumes_of`
+    is fetched. `profile` selects the dialect for every `classify_bundle` the walk performs, and `policy` / `pins` /
+    `as_of` are the receiver's trust inputs (13.4.1): the root AND every upstream is judged under them, the same
+    pin set, origin quorum, required suites and aging (SPEC 9.3), so a link's origin is never weaker than what the
+    receiver demands of the root, and a policy pin is honoured on an upstream as on the root. `consumes_of`
     is the OPTIONAL cross-capability POLICY resolver (capability-name -> allowed upstream capability names,
     or None for a card the caller does not know); without it the registry-free STRUCTURAL kind check still
     runs and the report says the policy guard was `not-applied`.
@@ -5306,7 +5323,8 @@ def _verify_chain_parsed(bundle: Any, resolve, *, profile=None, consumes_of=None
     upstream's sealed capability). A root whose link cannot be walked (malformed shape, a consumed value that
     does not bind) yields `fail` with a problem saying so -- never an exception; the single-bundle verdicts
     (`root_state`, integrity) are still reported."""
-    root = _classify_chain(bundle, profile)
+    judge = {"profile": profile, "policy": policy, "pins": pins, "as_of": as_of}
+    root = _classify_chain(bundle, **judge)
     report: dict[str, Any] = {
         "chain": CHAIN_FAIL,
         "root_state": root["state"],
@@ -5334,14 +5352,14 @@ def _verify_chain_parsed(bundle: Any, resolve, *, profile=None, consumes_of=None
     ranks = [3 if root["origin_ok"] else 2]
     state = {"visited": set(), "classified": {}, "walked": set(), "noted": set()}
     _walk(bundle, report["root_bundle_sha256"], 1, frozenset([report["root_bundle_sha256"]]),
-          resolve, report, ranks, state, max_depth, max_visited, consumes_of, profile)
+          resolve, report, ranks, state, max_depth, max_visited, consumes_of, judge)
     report["visited"] = len(state["visited"])
     report["chain"] = _CHAIN_OF_RANK[min(ranks)]
     return report
 
 
 def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, report: dict,
-          ranks: list[int], state: dict, max_depth: int, max_visited: int, consumes_of, profile) -> None:
+          ranks: list[int], state: dict, max_depth: int, max_visited: int, consumes_of, judge: dict) -> None:
     _, prov = _sealed_provenance(citing)
     links = prov["derived_from"]                      # well-formed: the citing bundle classified intact
     own_inputs = _own_inputs(citing)
@@ -5373,7 +5391,7 @@ def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, 
         state["visited"].add(target)
         rep = state["classified"].get(target)           # one Ed25519 verify per DISTINCT upstream
         if rep is None:
-            rep = state["classified"][target] = _classify_chain(up, profile)
+            rep = state["classified"][target] = _classify_chain(up, **judge)
         entry["signer"], entry["signer_is_demo"] = rep["signer"], rep["signer_is_demo"]
         if rep["state"] == STATE_UNSUPPORTED_CANON:
             # ADR-050 fail-FORWARD: the upstream's header seals + signs but was sealed under a newer canon
@@ -5403,8 +5421,12 @@ def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, 
             _finish(entry, ranks, LINK_VERIFIED, "integrity + origin; consumed value matches on both ends")
         else:
             _finish(entry, ranks, LINK_INTEGRITY_ONLY,
-                    (f"untampered, but signed by {key_label(signer_hex)} -- origin NOT established; a "
-                     "production-signed downstream does not launder it"))
+                    # the verdict's own origin problem names the real reason (a quorum short, an aged suite, no
+                    # pin); key_label alone would call a key the policy pins "unrecognised"
+                    ((f"untampered, but origin NOT established: {rep['origin_problems'][0]} (signed by "
+                      f"{rep['signer']})") if rep.get("origin_problems") else
+                     f"untampered, but signed by {key_label(signer_hex)} -- origin NOT established")
+                    + "; a production-signed downstream does not launder it")
         if rep["chain"] == "unknown":
             _note(report, state, f"upstream {target} has its provenance withheld: its own derived_from "
                                  "links (if any) are invisible, so the chain beyond it is unknown")
@@ -5412,4 +5434,4 @@ def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, 
         elif rep["chain"] == "declared-unwalked" and target not in state["walked"]:
             state["walked"].add(target)
             _walk(up, target, depth + 1, path | {target}, resolve, report, ranks, state, max_depth,
-                  max_visited, consumes_of, profile)
+                  max_visited, consumes_of, judge)

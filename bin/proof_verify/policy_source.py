@@ -72,11 +72,18 @@ def check_expect(value: str | None) -> str | None:
 def _read(path: str, source: dict):
     try:
         with open(path, "rb") as handle:
-            return loads(handle.read().decode("utf-8"))
+            policy = loads(handle.read().decode("utf-8"))
     except (OSError, ValueError, RecursionError) as exc:
         err = PolicyError(f"cannot read policy {path!r}: {type(exc).__name__}: {exc}")
         err.source = source
         raise err from exc
+    if not isinstance(policy, dict):
+        # SPEC v4: "A policy MUST be a JSON object". A file holding `null` must not read as "no policy" (the
+        # built-in default): the receiver named a file, so a file that is not a policy is refused (exit 2).
+        err = PolicyError("a receiver policy must be a JSON object")
+        err.source = source
+        raise err
+    return policy
 
 
 def _preset(name: str):

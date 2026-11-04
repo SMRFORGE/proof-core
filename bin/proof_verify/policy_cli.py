@@ -111,7 +111,8 @@ _USAGE = (
     "           Both refuse demo and placeholder keys and duplicates, never write a policy proof-verify would\n"
     "           refuse, write atomically and never overwrite another file (-o FILE must be new; --in-place\n"
     "           rewrites the policy; with neither the edited policy goes to stdout). They print policy_sha256.\n"
-    "           (or: python -m proof_core policy ...)")
+    "           (or: python -P -m proof_core policy ...; -P: under -m Python puts the cwd first on the\n"
+    "           import path, so a planted proof_verify/ or profile module would win)")
 
 
 class PlaceholderError(PolicyError):
@@ -201,12 +202,16 @@ def effective(policy: Any, *, pubkey: str | None = None, allow_self_verify: bool
 
 
 def read_policy(path: str) -> Any:
-    """Read a policy file as proof-verify does (hardened loader). Raises PolicyError with verify's message."""
+    """Read a policy file as proof-verify does (hardened loader). Raises PolicyError with verify's message, also for a
+    file that parses but is not a JSON object (SPEC v4: a policy MUST be one; `null` is not "no policy")."""
     try:
         with open(path, "rb") as handle:
-            return loads(handle.read().decode("utf-8"))
+            policy = loads(handle.read().decode("utf-8"))
     except (OSError, ValueError, RecursionError) as exc:
         raise PolicyError(f"cannot read policy {path!r}: {type(exc).__name__}: {exc}") from exc
+    if not isinstance(policy, dict):
+        raise PolicyError("a receiver policy must be a JSON object")
+    return policy
 
 
 # ---- explain ----------------------------------------------------------------------------------------------------
