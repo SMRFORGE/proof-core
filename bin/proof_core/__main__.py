@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import sys
 
-_USAGE = "usage: python -m proof_core <seal|verify|reproduce> [args...]"
+_USAGE = "usage: python -m proof_core <seal|verify|reproduce|policy> [args...]"
 _HELP = (
     _USAGE + "\n\n"
     "  seal       seal a pre-computed result (inputs + outputs JSON) into a signed bundle\n"
     "  verify     independently verify a bundle (integrity + origin); --json for a machine verdict\n"
-    "  reproduce  re-derive a bundle's numbers with the open engine; --json for a machine verdict\n\n"
+    "  reproduce  re-derive a bundle's numbers with the open engine; --json for a machine verdict\n"
+    "  policy     explain a receiver policy (its policy_sha256, what it requires) or init one from a preset\n\n"
     "run `python -m proof_core <verb> --help` for that verb's own options.")
 
 
@@ -35,7 +36,10 @@ def main(argv: list[str] | None = None) -> int:
     if verb == "verify":
         from proof_verify.__main__ import main as verify_main
         return verify_main(rest)
-    print(f"error: unknown verb {verb!r}; use one of seal | verify | reproduce", file=sys.stderr)
+    if verb == "policy":
+        from proof_verify.policy_cli import main as policy_main
+        return policy_main(rest)
+    print(f"error: unknown verb {verb!r}; use one of seal | verify | reproduce | policy", file=sys.stderr)
     print(_USAGE, file=sys.stderr)
     return 2
 

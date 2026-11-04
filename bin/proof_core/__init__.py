@@ -47,7 +47,7 @@ from .testing import assert_integration
 
 #: Single source of truth for the version. pyproject derives the dist version from this
 #: (see [tool.setuptools.dynamic]). Independent of any consumer's version line.
-__version__ = "0.25.1"
+__version__ = "0.26.0"
 
 __all__ = [
     "ATTESTATION_SCHEMA",
