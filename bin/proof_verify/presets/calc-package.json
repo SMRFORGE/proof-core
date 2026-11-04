@@ -1,8 +1,8 @@
 {
   "schema": "proof_verify.policy_preset.v1",
   "preset": "calc-package",
-  "version": 1,
-  "description": "For handing a sealed calculation to a reviewer: the bundle must be v4, sealed under the receiver's pinned production key, and its statistical band (if it has one) must be usable. No sign-off, seal timestamp or archive is required by default; the members to enable them are present at their off values.",
+  "version": 2,
+  "description": "For handing a sealed calculation to a reviewer: the bundle must be v4, sealed under the receiver's pinned production key, and must declare how it reproduces: exactly {\"kind\": \"exact\"} (deterministic) or a sound statistical band (require_reproduce_tolerance; an unusable band is refused under every policy). No sign-off, seal timestamp or archive is required by default; the members to enable them are present at their off values.",
   "slots": [
     {
       "name": "originator-key",
@@ -23,11 +23,12 @@
       }
     ],
     "min_envelope": "v4",
+    "require_reproduce_tolerance": true,
     "tsas": [],
     "min_seal_tsas": 0,
     "require_archive": false,
     "min_archive_tsas": 1
   },
-  "template_sha256": "sha256:850853fe18fbfe7d56c927feb57a1ef4c11ed5acc904925c2f79fc4733fec61e",
-  "template_policy_sha256": "sha256:7799edcf395997214ed98d8b707e5e3ee172dc346f4ff817182eda355fb2ae1a"
+  "template_sha256": "sha256:2672d7de2e0b6494f5725db7185b49e7107e6b6d1fa13378966f69501ec64813",
+  "template_policy_sha256": "sha256:8928fd17512127a448a3d27d421165dfea164ef9a08d6a024697a0df008bad74"
 }

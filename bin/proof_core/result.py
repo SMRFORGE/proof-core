@@ -41,6 +41,20 @@ def build_result_core(case: Case, result: Result, *, profile=None) -> dict:
     return core
 
 
+def exact_tolerance() -> dict:
+    """Declare that a card's result is deterministic: `reproduce` compares it exactly. Put the returned dict,
+    exactly ``{"kind": "exact"}``, on ``Result.reproduce_tolerance``; like a stat band it rides in the signed core,
+    and a verifier reports the tolerance state ``exact``. A receiver policy with ``require_reproduce_tolerance``
+    (SPEC 13.4.3 row 24, e.g. the ``calc-package`` preset) accepts a bundle only if it declares this or a sound
+    statistical band (`stat_tolerance`).
+
+    Nothing seals it for you: a bundle that leaves ``reproduce_tolerance`` unset declares nothing, and reproduce
+    still compares it exactly. Declaring exact is a deliberate claim that a re-run gives the same result core, so
+    use it only for a deterministic result; a stochastic one declares a `stat_tolerance` band. A fresh dict each
+    call, so a caller that edits it cannot change the next one."""
+    return {"kind": "exact"}
+
+
 def stat_tolerance(quantity: str, sigma_key: str, sigmas: float = 3.0,
                    derived: Sequence[str] = ()) -> dict:
     """Declare that `quantity` in a card's outputs is stochastic. `reproduce` then accepts a re-run

@@ -1,7 +1,7 @@
 {
   "name": "proof-core",
-  "version": "0.5.0",
-  "description": "Seal, verify, and reproduce a computed result so a neutral party can independently re-run it and confirm it re-derives, tamper-evident, with no account and no network. Wraps the open (MIT) proof-core kernel v0.26.0, vendored into this plugin so it runs offline with no install. Use it to turn an agent's output into a re-runnable, tamper-evident evidence bundle.",
+  "version": "0.6.0",
+  "description": "Seal, verify, and reproduce a computed result so a neutral party can independently re-run it and confirm it re-derives, tamper-evident, with no account and no network. Wraps the open (MIT) proof-core kernel v0.27.0, vendored into this plugin so it runs offline with no install. Use it to turn an agent's output into a re-runnable, tamper-evident evidence bundle.",
   "author": { "name": "SMRFORGE LLC" },
   "license": "MIT",
   "homepage": "https://gitlab.com/proof-core/skill",

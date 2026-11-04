@@ -14,7 +14,15 @@ import sys
 # bundle reader shares them. Re-exported here (``cli._text_depth_ok``, ``cli.loads``) for callers/tests
 # that reach for them on the CLI module.
 from . import policy_source as _ps
-from .render import RenderError, claims_lines, headline, seal_signer_lines, signoff_lines, time_lines
+from .render import (
+    RenderError,
+    claims_lines,
+    decision_hint_lines,
+    headline,
+    seal_signer_lines,
+    signoff_lines,
+    time_lines,
+)
 from .verify import (  # noqa: F401 -- re-exported for backward-compatible access
     _MAX_JSON_DEPTH,
     _SUITE_NAME,
@@ -560,7 +568,7 @@ def _verify_text(path: str, bundle, rep: dict, chain: dict | None, ups: list | N
         _print_canon_note(bundle)
         _print_signoffs(rep, policy)
         _print_frontier(rep, walked=chain is not None)
-        for line in claims_lines(rep, bundle):
+        for line in claims_lines(rep, bundle) + decision_hint_lines(rep):
             print(f"    {line}")
         _print_chain(chain, len(ups or []))
         return _chain_gate(chain, _attestation_gate(rep, EXIT_INTEGRITY_ONLY), announce=True)
@@ -582,7 +590,7 @@ def _verify_text(path: str, bundle, rep: dict, chain: dict | None, ups: list | N
     _print_canon_note(bundle)
     _print_signoffs(rep, policy)
     _print_frontier(rep, walked=chain is not None)
-    for line in claims_lines(rep, bundle):
+    for line in claims_lines(rep, bundle) + decision_hint_lines(rep):
         print(f"    {line}")
     _print_chain(chain, len(ups or []))
     return _chain_gate(chain, _attestation_gate(rep, EXIT_VERIFIED), announce=True)

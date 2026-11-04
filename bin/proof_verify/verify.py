@@ -422,13 +422,19 @@ def resolve_pins(pins: Any, *, where: str = "pins", duplicates: str = "merge",
 #: `min_envelope`, the origin members of 7.13 (quorum, required suites, aging) and the sign-off members of 13.4.4
 #: (roster, roles, order, self-verification) and the trusted-time members of 10.7 (TSA pins, `min_seal_tsas`,
 #: `require_signoff_timestamps`, `max_attest_lag_s`, `allow_ess_v1`), `require_full_copy_review` (13.4.4) and the
-#: archive members of 10.8 and 13.4.3 row 18 (`require_archive`, `min_archive_tsas`): every member.
+#: archive members of 10.8 and 13.4.3 row 18 (`require_archive`, `min_archive_tsas`), and the spec 1.1 opt-in members
+#: `require_order_eligible` (13.4.4 rule OE, row 23) and `require_reproduce_tolerance` (row 24): every member.
 _POLICY_DEFAULTS: dict[str, Any] = {
     "origin_quorum": 1, "require_seal_suites": [], "min_envelope": "v3", "suites": {}, "hashes": {}, "tsas": [],
     "min_seal_tsas": 0, "require_archive": False, "min_archive_tsas": 1, "roster": [], "require_roles": [],
     "require_order": True, "require_signoff_timestamps": False, "allow_self_verify": False, "originator_keys": [],
     "originator_signer_ids": [], "max_attest_lag_s": 86400, "allow_ess_v1": False, "require_full_copy_review": False,
+    "require_order_eligible": False, "require_reproduce_tolerance": False,
 }
+#: SPEC 13.4.1 (spec 1.1): the opt-in members added after spec 1.0. Each is in the effective policy only when it is
+#: true (step 5 drops it at its default `false`), so every policy that leaves it off keeps the policy_sha256 it had
+#: under spec 1.0, and the members form of `evaluate` may omit it (a members object written for 1.0 still evaluates).
+_POLICY_OPT_IN = ("require_order_eligible", "require_reproduce_tolerance")
 
 
 def _same_json(a: Any, b: Any) -> bool:
@@ -559,6 +565,8 @@ _POLICY_SHAPES = {
     "max_attest_lag_s": lambda v: _json_int(v, 0, 31_622_400),
     "allow_ess_v1": lambda v: isinstance(v, bool),
     "require_full_copy_review": lambda v: isinstance(v, bool),
+    "require_order_eligible": lambda v: isinstance(v, bool),
+    "require_reproduce_tolerance": lambda v: isinstance(v, bool),
 }
 #: The members whose type is "JSON integer" (SPEC 2): a whole double such as `1.0` is the same value as `1`, so it is
 #: normalized to the integer before the policy is hashed (13.4.1: policies with the same meaning have the same digest).
@@ -573,7 +581,16 @@ _POLICY_EVALUATED = frozenset({"min_envelope", "origin_quorum", "require_seal_su
                                "roster", "require_roles", "require_order", "allow_self_verify", "originator_keys",
                                "originator_signer_ids", "tsas", "min_seal_tsas", "require_signoff_timestamps",
                                "max_attest_lag_s", "allow_ess_v1", "require_full_copy_review", "require_archive",
-                               "min_archive_tsas"})
+                               "min_archive_tsas", "require_order_eligible", "require_reproduce_tolerance"})
+
+
+def _check_member_combination(m: dict, where: str = "policy") -> None:
+    """SPEC 13.4.1 (spec 1.1): `require_order_eligible: true` strengthens rule O, so it is meaningful only with
+    `require_order` true; with `require_order: false` the policy is malformed rather than the member silently ignored.
+    Raises PolicyError."""
+    if m.get("require_order_eligible") is True and m.get("require_order") is False:
+        raise PolicyError(f"{where}: require_order_eligible is true but require_order is false; rule OE strengthens "
+                          "rule O and cannot apply without it (SPEC 13.4.1)")
 
 
 def _derived_signoff_timestamps(policy: dict) -> bool:
@@ -606,6 +623,7 @@ def _policy_members(policy: Any) -> dict[str, Any]:
             raise PolicyError(f"policy member {k!r} has a wrong type or a value out of range: {policy[k]!r}")
     if "roster" in policy:
         _check_roster(policy["roster"])
+    _check_member_combination(policy)
     for k in sorted(set(policy) & set(_POLICY_DEFAULTS) - _POLICY_EVALUATED):
         if not _same_json(policy[k], _POLICY_DEFAULTS[k]):
             raise PolicyUnsupportedError(
@@ -660,6 +678,9 @@ def policy_sha256(members: dict, pin_set: dict[str, bool]) -> str:
                            key=lambda p: p["person_id"])
     eff["pins"] = [{"key_id": k, "demo": pin_set[k], **({"label": labels[k]} if k in labels else {})}
                    for k in sorted(pin_set)]
+    for m in _POLICY_OPT_IN:          # step 5 (spec 1.1): an opt-in member is in the effective policy only when true
+        if eff.get(m) is False:
+            del eff[m]
     return _sha(_canon(eff))
 
 
@@ -736,7 +757,9 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
     `signoffs` entries again
     (`partial_copy_reasons`, `require_full_copy_review`). Rows 20 and 21 read the `archive` dimension with the
     `signoffs` entries (`archive_reliance_reasons`: under `require_archive`, a valid archive must be continuous at
-    as_of and cover every sign-off counting toward `require_roles`).
+    as_of and cover every sign-off counting toward `require_roles`). Row 22 reads `reproduce_tolerance`. Row 23 (spec
+    1.1, opt-in `require_order_eligible`) reads the `signoffs` entries again (`order_eligible_reasons`, rule OE). Row
+    24 (spec 1.1, opt-in `require_reproduce_tolerance`) reads `reproduce_tolerance` and `integrity_ok` again.
 
     13.4.2: "`verdict` MUST have been produced under the same effective policy ... If the hashes differ, `evaluate`
     MUST refuse (an error, not a decision)". A verdict records its `policy_sha256`; ``members`` (with ``pin_set``,
@@ -751,6 +774,8 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
     unknown = sorted(k for k in members if k != "_labels" and k not in _POLICY_DEFAULTS)
     if unknown:          # as @proof-core/verify refuses (TypeError)
         raise TypeError(f"evaluate: unknown policy member(s) {unknown}")
+    # the spec 1.1 opt-in members may be omitted (a members object written for spec 1.0 still evaluates)
+    members = {**{k: _POLICY_DEFAULTS[k] for k in _POLICY_OPT_IN if k not in members}, **members}
     missing = sorted(k for k in _POLICY_DEFAULTS if k not in members)
     if missing:          # the members form needs every member, defaults filled in (as @proof-core/verify refuses)
         raise TypeError(f"evaluate: the members form needs every policy member, defaults filled in; missing {missing}")
@@ -759,6 +784,7 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
     for k in _POLICY_DEFAULTS:
         if not _POLICY_SHAPES[k](members[k]):
             raise PolicyError(f'evaluate: policy member "{k}" has a wrong type or a value out of range')
+    _check_member_combination(members, "evaluate")
     recorded = rep.get("policy_sha256")
     if recorded is None and isinstance(rep.get("decision"), dict):
         recorded = rep["decision"].get("policy_sha256")
@@ -801,7 +827,30 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
     # still REPORTS the band as unusable
     if rep.get("canon_version") == 3 and isinstance(t, dict) and t.get("state") == "unusable":
         reasons.append("reproduce_tolerance_unusable")
+    reasons += order_eligible_reasons(signoffs, members, v2=rep.get("canon_version") == 3)
+    # row 24 (spec 1.1, opt-in), for v4 input only: under require_reproduce_tolerance, a bundle whose integrity holds
+    # must declare how it reproduces, `exact` or a `sound` band; an `unusable` band is row 22's alone
+    if (members.get("require_reproduce_tolerance") is True and rep.get("canon_version") == 3
+            and rep.get("integrity_ok") is True
+            and not (isinstance(t, dict) and t.get("state") in _TOL_DECLARED_STATES)):
+        reasons.append("reproduce_tolerance_undeclared")
     return reasons
+
+
+def order_eligible_reasons(signoffs: dict, members: dict, *, v2: bool) -> list[str]:
+    """SPEC 13.4.3 row 23 / 13.4.4 rule OE (spec 1.1, opt-in): under `require_order` and `require_order_eligible`,
+    the `prior` of every `valid` v2 approver entry must contain the `entry_sha256` of an entry ELIGIBLE (13.4.4, the
+    same `_eligible` rule R counts with) for the role `verifier`. v2 entries only, so a v3 bundle (v1 entries) never
+    triggers it (13.4.6). A policy without the member (or with it false) never reaches this row."""
+    if not (v2 and members.get("require_order_eligible") is True and members.get("require_order", True)):
+        return []
+    entries = [x for x in (signoffs.get("entries") or []) if isinstance(x, dict)]
+    eligible = {x.get("entry_sha256") for x in entries if _eligible(x, "verifier", members)}
+    eligible.discard(None)
+    if any(x.get("state") == "valid" and x.get("role") == "approver" and not eligible & set(x.get("prior") or [])
+           for x in entries):
+        return ["order_review_not_eligible"]
+    return []
 
 
 def archive_reliance_reasons(rep: dict, members: dict) -> list[str]:
@@ -2553,9 +2602,17 @@ def stat_band_problem(tol: Any, outputs: Any) -> str | None:
     return None
 
 
+#: SPEC 13.4.3 row 24 (spec 1.1): the `reproduce_tolerance` states that show how a v4 bundle reproduces: `exact`
+#: (declared deterministic), `sound` (a usable statistical band) and `unusable` (declared, but row 22 rejects it).
+_TOL_DECLARED_STATES = frozenset({"exact", "sound", "unusable"})
+#: SPEC 13.4.3 "The statistical band" (spec 1.1): the one declaration of an exact (deterministic) reproduction.
+TOL_EXACT = {"kind": "exact"}
+
+
 def tolerance_report(bundle: Any, profile=None) -> dict:
-    """SPEC 14 item 7 / 13.5 `reproduce_tolerance`: {state, problems} for the sealed result core's tolerance. `none`:
-    no statistical band (`kind` is not "stat"); `not_checked`: the result (or the band's quantity or sigma, as an
+    """SPEC 14 item 7 / 13.5 `reproduce_tolerance`: {state, problems} for the sealed result core's tolerance. `exact`
+    (spec 1.1): the core declares exactly `{"kind": "exact"}`, an exact reproduction; `none`: neither that nor a
+    statistical band (`kind` is not "stat"); `not_checked`: the result (or the band's quantity or sigma, as an
     item) is withheld, or the provenance is; `sound`; `unusable`: `stat_band_problem` names a problem, or the seal
     holds the profile's placeholder seed. The reproducer reads the band the same way and falls back to an exact match
     on an unusable one; for a v4 bundle the decision rejects (13.4.3 row 22)."""
@@ -2563,6 +2620,8 @@ def tolerance_report(bundle: Any, profile=None) -> dict:
     if core is _END:
         return {"state": "not_checked", "problems": ["the result section is withheld"]}
     tol = core.get("reproduce_tolerance") if isinstance(core, dict) else None
+    if isinstance(tol, dict) and _same_json(tol, TOL_EXACT):
+        return {"state": "exact", "problems": []}    # spec 1.1: exactly {"kind": "exact"}, an exact reproduction
     if not (isinstance(tol, dict) and tol.get("kind") == "stat"):
         return {"state": "none", "problems": []}
     outputs = stat_band_outputs(core)

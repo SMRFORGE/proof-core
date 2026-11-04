@@ -349,11 +349,28 @@ def explain(policy: Any, *, pubkey: str | None = None, allow_self_verify: bool =
                                 "bundle can satisfy rule R, so this policy accepts nothing (row 10)")
     else:
         lines.append("No sign-off is required (require_roles is empty).")
-    if m["require_order"]:
+    if m["require_order"] and m["require_order_eligible"]:
+        lines.append("Order (rule O, row 11 order_unsatisfied): every valid approver sign-off must cite, in prior, the "
+                     "entry digest of some valid verifier sign-off with meaning review. With no approver sign-off "
+                     "this holds.")
+        lines.append("Eligible order (rule OE, require_order_eligible, row 23 order_review_not_eligible): the cited "
+                     "review must also be eligible for the verifier role, exactly a review rule R counts for "
+                     "verifier: a valid verifier sign-off with meaning review, "
+                     + ("under a roster person who holds verifier and whose printed_name and signer_id match"
+                        if roster else "under a pinned non-demo key")
+                     + ", whose time check did not fail"
+                     + (", made on the full copy" if m["require_full_copy_review"] else "")
+                     + ("" if m["allow_self_verify"] else ", not a self-verification")
+                     + ". A review under an unpinned or demo key"
+                     + (", or under a pinned key outside the roster," if roster else "")
+                     + " does not satisfy it. An approval citing no review fails both rules (rows 11 and 23). "
+                     "v4 bundles only: a v1 sign-off of a v3 bundle is checked by neither rule.")
+    elif m["require_order"]:
         lines.append("Order (rule O, row 11 order_unsatisfied): every valid approver sign-off must cite, in prior, the "
                      "entry digest of some valid verifier sign-off with meaning review. The cited review need not be "
                      "eligible for a role: it may be under an unpinned key or outside the roster, and need not be the "
-                     "review rule R counts. With no approver sign-off this holds.")
+                     "review rule R counts (set \"require_order_eligible\": true to require that, rule OE). With no "
+                     "approver sign-off this holds.")
     else:
         lines.append("Order is not checked (require_order is false): an approver need not cite a verifier review.")
     if roster:
@@ -436,11 +453,25 @@ def explain(policy: Any, *, pubkey: str | None = None, allow_self_verify: bool =
                          "require_archive.")
     sec("trusted time and archive", lines)
 
-    # -- the statistical band (row 22)
+    # -- the statistical band (rows 22 and 24)
     lines = [("A v4 bundle whose sealed statistical band (reproduce_tolerance of kind \"stat\") breaks a rule of "
               "13.4.3 \"The statistical band\" is refused (row 22 reproduce_tolerance_unusable), under every policy."),
              ("A bundle with no statistical band, or one whose band cannot be checked (withheld or committed), is not "
-              "refused by this row: the policy cannot require that a band exists.")]
+              "refused by row 22.")]
+    if m["require_reproduce_tolerance"]:
+        lines.append("A declared reproduction is required (require_reproduce_tolerance, row 24 "
+                     "reproduce_tolerance_undeclared): a v4 bundle whose integrity holds must declare how it "
+                     "reproduces in its sealed result core, either exactly {\"kind\": \"exact\"} (a deterministic "
+                     "result, reproduce compares exactly; the producer sets Result.reproduce_tolerance to it) or a "
+                     "sound statistical band (kind \"stat\"). A bundle with no reproduce_tolerance, any other "
+                     "object, or a band that cannot be checked (withheld or committed) is refused; an unusable band is "
+                     "row 22 alone. A v3 bundle is never checked by this row. A producer seals with "
+                     "`reproduce_tolerance=exact_tolerance()` for a deterministic result, or a stat band "
+                     "(`stat_tolerance(...)`) for a stochastic one; nothing declares exact automatically.")
+    else:
+        lines.append("A declared reproduction is not required: a bundle with no reproduce_tolerance passes (set "
+                     "\"require_reproduce_tolerance\": true to require {\"kind\": \"exact\"} or a sound band, "
+                     "row 24).")
     if m["min_envelope"] == "v3":
         lines.append("A v3 bundle is never checked by this row, and this policy accepts v3 bundles.")
     sec("statistical band", lines)
