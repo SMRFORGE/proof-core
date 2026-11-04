@@ -66,7 +66,8 @@ flowchart LR
     B --> V["verify<br/>python -P -m proof_core verify<br/>offline, no producer code"]
     V -->|"exit 1: edited or malformed"| X["stop: do not trust it"]
     V -->|"exit 3 (demo key) or 0: unedited"| R["reproduce<br/>re-run your tool on the<br/>sealed inputs"]
-    R -->|"exit 0, or 3 with --command"| OK["the result re-derives<br/>(still not proven correct)"]
+    R -->|"exit 0 (--runner)"| OK["the result re-derives<br/>(still not proven correct)"]
+    R -->|"exit 3 (--command)"| PART["outputs match, sealed claims<br/>not re-derived: partial, NOT a pass"]
     R -->|"exit 1"| NR["it does not re-derive"]
 ```
 
@@ -99,7 +100,9 @@ path.
 
 ## Limits, stated plainly
 
-- **A seal proves the record is unaltered and that it re-derives from its sealed inputs.** It does not prove
+- **A seal proves the record is unaltered; `reproduce` is what shows it re-derives.** Sealing runs nothing.
+  Only `reproduce` exit 0 shows the result re-derives from its sealed inputs; exit 3 (`--command`) means the
+  outputs matched but the sealed claims were not re-derived, a partial result and not a pass. Neither proves
   the result is correct, nor that the agent actually ran what it claims. Catching that needs independent
   reproduction by a party the producer does not control.
 - **The public build pins a demo key**, so verify reports "integrity-only" (exit 3). That is the normal result
