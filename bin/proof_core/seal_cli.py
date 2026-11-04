@@ -6,6 +6,9 @@ Python seals in-process. This CLI is the AGENT / SHELL use case -- a step (an ag
 has already computed a result and written its inputs and outputs as JSON, and wants a bundle WITHOUT
 writing Python. It reads those JSON files, builds the Case + Result, and emits the bundle.
 
+It mints ``evidence.envelope.v4`` by default (``build_bundle(..., canon_version=3)``), the envelope both shipped
+receiver-policy presets require; ``--envelope v3`` mints the frozen legacy ``evidence.envelope.v3`` (canon 1).
+
 It changes NOTHING about the trust model. The signing identity is whatever the process is configured with:
 the PUBLIC DEMO key by DEFAULT (so ``proof-verify`` reads integrity-only, never a production origin), or a
 production identity supplied out-of-band via ``PROOF_SIGNING_SEED`` (a secret manager / air-gapped machine;
@@ -28,6 +31,12 @@ from .envelope import build_bundle
 
 #: the JSON `kind` discriminator for a `proof-seal --json` summary (lets an agent tell verdict shapes apart).
 SEAL_RESULT_KIND = "proof_core.seal_result.v1"
+
+#: ``--envelope`` -> the ``build_bundle`` canon_version that mints it. ``canon_version`` numbers the
+#: canonicalization, not the envelope: canon 3 is the one `evidence.envelope.v4` uses, canon 1 (FROZEN) makes
+#: `evidence.envelope.v3`. v4 is the default: both shipped receiver-policy presets require it.
+ENVELOPE_CANON = {"v4": 3, "v3": 1}
+DEFAULT_ENVELOPE = "v4"
 
 
 def _resolve_profile(spec: str):
@@ -53,11 +62,23 @@ def _resolve_profile(spec: str):
         raise ValueError(f"cannot construct profile {spec!r}: {type(exc).__name__}: {exc}") from exc
 
 
+class _Once(argparse.Action):
+    """Store a flag that may be given at most once: a repeated ``--envelope`` is a usage error, never last-wins."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, "_seen_" + self.dest, False):
+            parser.error(f"{option_string} given more than once")
+        setattr(namespace, "_seen_" + self.dest, True)
+        setattr(namespace, self.dest, values)
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="proof-seal",
         description="Seal a pre-computed result (inputs + outputs JSON) into a signed evidence bundle.",
-        epilog="signing identity: the PUBLIC DEMO key by default (proof-verify then reads integrity-only, "
+        allow_abbrev=False,   # a prefix (--env) never stands for a flag: what is sealed is named in full
+        epilog="envelope: evidence.envelope.v4 by default (--envelope v3 for the frozen legacy envelope). "
+               "signing identity: the PUBLIC DEMO key by default (proof-verify then reads integrity-only, "
                "NOT a production origin pass); a production key is injected out-of-band via PROOF_SIGNING_SEED "
                "(see proof_core.signing). This CLI never takes a key on the command line.")
     p.add_argument("--capability", required=True,
@@ -80,8 +101,14 @@ def _parser() -> argparse.ArgumentParser:
                    help="identifier of the data set this run read (must be given with --data-sha)")
     p.add_argument("--data-sha", metavar="sha256:HEX",
                    help="content hash of the data set this run read (must be given with --data-label)")
+    p.add_argument("--envelope", choices=sorted(ENVELOPE_CANON, reverse=True), default=DEFAULT_ENVELOPE,
+                   action=_Once,
+                   help="the envelope to mint (default: v4, evidence.envelope.v4, which both shipped policy "
+                        "presets require; v3 is the frozen legacy envelope)")
     p.add_argument("--tolerance", metavar="tol.json",
-                   help="path to a JSON reproduce_tolerance for a stochastic producer (sampled run/model)")
+                   help="path to a JSON reproduce_tolerance: {\"kind\": \"exact\"} declares a deterministic "
+                        "result (the calc-package preset requires a declared tolerance), or a stat band for a "
+                        "stochastic producer (sampled run/model)")
     p.add_argument("--profile", metavar="pkg.module:attr",
                    help="mint under this dialect Profile (duck-typed); None -> the neutral evidence.* dialect. "
                         "Imported from the import path (PYTHONPATH / installed), never the current directory; "
@@ -89,8 +116,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", metavar="bundle.json",
                    help="write the bundle here (default: stdout)")
     p.add_argument("--json", action="store_true",
-                   help="emit a JSON summary {kind, bundle_sha256, demo_identity, output_path, capability, "
-                        "verdict, fidelity} to stdout (requires -o, since stdout then carries the summary)")
+                   help="emit a JSON summary {kind, bundle_sha256, demo_identity, envelope, output_path, "
+                        "capability, verdict, fidelity} to stdout (requires -o, since stdout then carries the "
+                        "summary)")
     return p
 
 
@@ -136,8 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         provenance = _load_json_object(ns.provenance, "--provenance") if ns.provenance else {}
         tolerance = None
         if ns.tolerance:
-            with open(ns.tolerance, encoding="utf-8") as fh:
-                tolerance = json.load(fh)
+            tolerance = _load_json_object(ns.tolerance, "--tolerance")
     except (OSError, ValueError) as exc:
         print(f"error: cannot read a JSON argument: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
@@ -158,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
             engine=ns.engine, engine_version=ns.engine_version,
             data_library=((ns.data_label, ns.data_sha) if ns.data_label is not None else None),
             profile=profile,
+            canon_version=ENVELOPE_CANON[ns.envelope],
         )
     except Exception as exc:  # noqa: BLE001 -- a bad tolerance/profile is a seal-time arg error, not a crash
         print(f"error: could not seal: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -179,15 +207,18 @@ def main(argv: list[str] | None = None) -> int:
         # machine summary to stdout (the bundle went to --output, required under --json). `demo_identity`
         # is the honesty bit: True means proof-verify reads integrity-only, NOT a production origin pass.
         print(json.dumps({"kind": SEAL_RESULT_KIND, "bundle_sha256": bundle["bundle_sha256"],
-                          "demo_identity": demo_identity, "output_path": ns.output,
+                          "demo_identity": demo_identity, "envelope": ns.envelope, "output_path": ns.output,
                           "capability": ns.capability, "verdict": ns.verdict, "fidelity": ns.fidelity},
                          sort_keys=True))
         return 0
     note = ("signed under the PUBLIC DEMO identity -- proof-verify will read integrity-only, NOT a production "
             "origin pass" if demo_identity else "signed under an injected production identity")
-    print(f"sealed {bundle['bundle_sha256']} ({note})", file=sys.stderr)
+    print(f"sealed {bundle['bundle_sha256']} as evidence.envelope.{ns.envelope} ({note})", file=sys.stderr)
     return 0
 
 
 if __name__ == "__main__":
+    # `python -m` without -P: say the cwd could shadow this tool (stderr only; see _spec_loader)
+    from proof_verify._spec_loader import warn_if_cwd_on_path
+    warn_if_cwd_on_path()
     raise SystemExit(main())

@@ -305,8 +305,20 @@ def explain(policy: Any, *, pubkey: str | None = None, allow_self_verify: bool =
     sec("origin", lines)
 
     # -- sign-offs (10.3.8, 13.4.4; rows 3 to 12, 19)
-    lines = [("Under every policy a bundle is refused when a sign-off is invalid (row 3) or a valid sign-off "
-              "records a rejection (row 5).")]
+    if m["ignore_unrecognised_signoffs"]:
+        lines = [("A bundle is refused when a sign-off is invalid, under any key (row 3), or when a valid sign-off "
+                  "under a pinned key records a rejection (row 5)."),
+                 ("ignore_unrecognised_signoffs is true (13.4.4 \"Unrecognised sign-offs\"): a valid sign-off under "
+                  "an unpinned or demo key is noted (unrecognised_signoffs_ignored) but neither counted nor blocking. "
+                  "Its rejection (row 5), self-verification (row 4), failed time check (row 9) or uncited approval "
+                  "(rules O and OE, rows 11 and 23) does not reject, and a review under such a key does not satisfy "
+                  "rule O. A sign-off under a pinned key keeps its full effect. v4 bundles only.")]
+    else:
+        lines = [("Under every policy a bundle is refused when a sign-off is invalid (row 3) or a valid sign-off "
+                  "records a rejection (row 5), under any key: anyone who can append a sign-off to a bundle can "
+                  "block its acceptance this way, also with an approval that cites no review (row 11, under require_order) or a "
+                  "self-verification (row 4). Set \"ignore_unrecognised_signoffs\": true to have a sign-off under an "
+                  "unpinned or demo key noted but not blocking (13.4.4 \"Unrecognised sign-offs\").")]
     if m["allow_self_verify"]:
         lines.append("allow_self_verify is true: a verifier or approver sign-off made with an originator's key or "
                      "signer id is accepted (row 4 off) and can count for its role.")
@@ -442,10 +454,12 @@ def explain(policy: Any, *, pubkey: str | None = None, allow_self_verify: bool =
                      "pinned TSA(s), counted by TSA key identity (row 18 archive_required);")
         lines.append("  3. it is continuous now: as_of is within the end of the last stamp of its verified prefix "
                      "(row 20 archive_not_continuous);")
+        oe = m["require_order"] and m["require_order_eligible"]
         lines.append("  4. every sign-off the policy relies on (every sign-off eligible for a role in "
-                     "require_roles) is covered by the archive; missing coverage information fails closed "
-                     "(row 21 archive_not_covering_signoffs)"
-                     + ("." if roles else ". This policy requires no role, so it relies on no sign-off."))
+                     "require_roles" + (", and, under rule OE, every eligible verifier review an approval cites"
+                                        if oe else "") + ") is covered by the archive; missing coverage information "
+                     "fails closed (row 21 archive_not_covering_signoffs)"
+                     + ("." if roles or oe else ". This policy requires no role, so it relies on no sign-off."))
         if len(m["tsas"]) < n:
             warnings.append(f"require_archive needs stamps from {n} distinct pinned TSA(s) but {len(m['tsas'])} "
                             "are pinned: this policy accepts nothing (row 18)")
@@ -477,10 +491,35 @@ def explain(policy: Any, *, pubkey: str | None = None, allow_self_verify: bool =
         lines.append("A declared reproduction is not required: a bundle with no reproduce_tolerance passes (set "
                      "\"require_reproduce_tolerance\": true to require {\"kind\": \"exact\"} or a sound band, "
                      "row 24).")
+        lines.append("A v4 band whose quantity or sigma is a committed item cannot be checked (reproduce_tolerance "
+                     "not_checked), so this policy accepts it unchecked; the verdict carries the advisory note "
+                     "tolerance_committed_not_checked (13.4.3 \"The statistical band\"). Set "
+                     "\"require_reproduce_tolerance\": true to reject such a band (row 24).")
     if m["min_envelope"] == "v3":
         lines.append("A v3 bundle is never checked by this row, and this policy accepts v3 bundles.")
     sec("statistical band", lines)
 
+    # SPEC 13.4.4 "Unrecognised sign-offs" (spec 1.2): a roster person's key that is also pinned demo: true reads
+    # demo_key (10.3.8 step 12 tests demo first), so under ignore_unrecognised_signoffs that person's sign-offs,
+    # rejections included, are ignored. Not a refusal: explain only says so.
+    if m["ignore_unrecognised_signoffs"]:
+        for p in sorted(roster, key=lambda x: x["person_id"]):
+            demo_kids = sorted(k for k in p["keys"] if pin_set.get(k) is True)
+            if demo_kids:
+                warnings.append(f"roster person {p['person_id']} holds key(s) {', '.join(demo_kids)} that are also "
+                                "pinned demo: true, so their sign-offs read demo_key (10.3.8 step 12): under "
+                                "ignore_unrecognised_signoffs they are ignored, a signed rejection included; remove "
+                                "the demo pin or the key")
+    # SPEC 13.4.1 "v4 bundles only" (spec 1.2): the 1.1 opt-in members constrain v4 bundles alone (13.4.6), so a
+    # receiver that sets one and still reads v3 bundles can be bypassed by a producer who mints v3. Not a refusal:
+    # the policy is well-formed and the decision is unchanged; explain only says so.
+    v4_only = [k for k in ("require_order_eligible", "require_reproduce_tolerance") if m[k] is True]
+    if v4_only and m["min_envelope"] != "v4":
+        warnings.append(", ".join(v4_only) + (" is" if len(v4_only) == 1 else " are") + " true but min_envelope is "
+                        "\"v3\": " + ("this member constrains" if len(v4_only) == 1 else "these members constrain")
+                        + " v4 bundles only (13.4.1 \"v4 bundles only\"), so a producer who mints a v3 bundle "
+                        "escapes " + ("it" if len(v4_only) == 1 else "them") + "; set \"min_envelope\": \"v4\" "
+                        "to close that")
     sec("scope", [("This describes what this receiver requires before it accepts a bundle. An accept means these "
                    "checks passed; it says nothing about whether the computation or its result is right.")])
     members = {k: v for k, v in m.items() if k != "_labels"}
@@ -1204,4 +1243,7 @@ __all__ = ["POLICY_SCHEMA", "EditError", "PlaceholderError", "add_person", "add_
            "preset_names", "read_bundle_checked", "role_warnings", "template_digest", "template_policy_sha256", "write_atomic"]
 
 if __name__ == "__main__":
+    # `python -m` without -P: say the cwd could shadow this tool (stderr only; see _spec_loader)
+    from ._spec_loader import warn_if_cwd_on_path
+    warn_if_cwd_on_path()
     raise SystemExit(main())

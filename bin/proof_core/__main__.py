@@ -16,7 +16,8 @@ _HELP = (
     "  reproduce  re-derive a bundle's numbers with the open engine; --json for a machine verdict\n"
     "  policy     explain a receiver policy (its policy_sha256, what it requires) or init one from a preset\n\n"
     "-P matters: under -m Python puts the current directory first on the import path, so a planted\n"
-    "proof_verify/ or profile module there would win over the installed one.\n\n"
+    "proof_verify/ or profile module there would win over the installed one. Without -P a warning goes\n"
+    "to stderr; a planted module that does shadow this tool runs instead, so it never prints.\n\n"
     "run `python -P -m proof_core <verb> --help` for that verb's own options.")
 
 
@@ -47,4 +48,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # `python -m` without -P: say the cwd could shadow this tool (stderr only; see _spec_loader)
+    from proof_verify._spec_loader import warn_if_cwd_on_path
+    warn_if_cwd_on_path()
     raise SystemExit(main())

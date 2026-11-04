@@ -16,7 +16,8 @@ profile that pins the sender's key). So:
 
 Note that ``python -m <tool>`` itself puts the current directory first on ``sys.path`` (a Python behavior, not
 this module's); use the console script (``proof-verify``, ``proof-reproduce``, ``proof-seal``) or ``python -P -m``
-when the working directory holds files you did not write.
+when the working directory holds files you did not write. Each ``python -m`` entry warns on stderr when run that
+way (:func:`warn_if_cwd_on_path`), but cannot warn if a planted module has already replaced it.
 """
 from __future__ import annotations
 
@@ -25,6 +26,34 @@ import importlib.util
 import os
 import sys
 import uuid
+
+#: the one stderr line a ``python -m`` run prints when the current directory is first on the import path.
+CWD_ON_PATH_WARNING = ("warning: running without -P: modules in the current folder could shadow this tool; use the "
+                       "installed command or python -P -m")
+
+
+def cwd_first_on_path() -> bool:
+    """True when ``sys.path[0]`` is the current directory: ``python -m`` without ``-P`` (or ``-I`` / PYTHONSAFEPATH).
+    False under ``-P`` and for a console script (whose ``sys.path[0]`` is the script's own folder)."""
+    if getattr(sys.flags, "safe_path", False) or not sys.path:
+        return False
+    first = sys.path[0]
+    if first == "":
+        return True
+    try:
+        return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(os.getcwd()))
+    except (OSError, ValueError):
+        return False
+
+
+def warn_if_cwd_on_path() -> None:
+    """A cheap mitigation, not a fix: called from each ``if __name__ == "__main__"`` block (the ``python -m`` entry,
+    never a console script), it prints :data:`CWD_ON_PATH_WARNING` to stderr when the cwd is first on the import
+    path. Exit codes and stdout (the JSON verdict) are unchanged. Its limit: if a module planted in the current
+    folder does shadow this tool (a ``proof_verify/`` or ``proof_core/`` package there), the planted code runs
+    INSTEAD of this one and this warning never prints. Only ``-P`` or the installed command closes that."""
+    if cwd_first_on_path():
+        print(CWD_ON_PATH_WARNING, file=sys.stderr)
 
 
 def is_file_spec(module_part: str) -> bool:

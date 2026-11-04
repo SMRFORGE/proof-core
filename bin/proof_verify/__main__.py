@@ -64,7 +64,10 @@ _USAGE = ("usage: proof-verify <bundle.json> [--profile pkg.module:attr] [--pubk
           "                   or /abs/path/file.py:attr (an absolute path; a relative one exits 2). The current\n"
           "                   directory is never searched (a sender could plant a module in an unpacked bundle\n"
           "                   folder); python -m itself puts the current directory on the path, so there prefer\n"
-          "                   the proof-verify script or python -P -m.\n"
+          "                   the proof-verify script or python -P -m. A profile that pins an origin key\n"
+          "                   (pinned_pubkey / pinned_keys) cannot be combined with a receiver policy (--policy,\n"
+          "                   PROOF_POLICY, --allow-self-verify) that does not pin the same key: the policy's\n"
+          "                   pins win, so that exits 2 (pin the key in the policy, or pass it as --pubkey).\n"
           "  --policy FILE    a receiver policy (evidence.receiver-policy.v1) whose pins replace the built-in demo\n"
           "                   pin; --pubkey is then merged into it. A malformed policy exits 2 with no verdict.\n"
           "                   preset:NAME uses a shipped preset only if it needs no filling (none does today:\n"
@@ -788,6 +791,57 @@ def _resolve_profile(spec: str):
         raise ValueError(f"cannot construct profile {spec!r}: {type(exc).__name__}: {exc}") from exc
 
 
+def _profile_pin_conflict(profile, spec: str, policy, pins, source: dict, self_verify_only: bool) -> str | None:
+    """The usage error when a ``--profile`` origin pin would be silently dropped, else None.
+
+    Under a receiver policy (``--policy``, ``PROOF_POLICY``, or the default policy ``--allow-self-verify`` builds) the
+    trust roots are the policy's pins plus the out-of-policy pins (the built-in demo pins and ``--pubkey``). The
+    profile's ``pinned_pubkey`` / ``pinned_keys`` are not among them, so a bundle signed under the profile's key read
+    integrity-only (exit 3) with no word why. The POLICY's pins win; this refuses (exit 2) unless every profile pin is
+    already in the effective pin set with the same demo flag, i.e. nothing is dropped. A policy that cannot be
+    evaluated is left to the normal path (its own exit 2)."""
+    from .verify import _profile_pin, resolve_pins
+    pin, malformed = _profile_pin(profile)
+    keys = getattr(profile, "pinned_keys", None)
+    if pin is None and not malformed and keys is None:
+        return None
+    if policy is None or not isinstance(policy, dict):
+        return None
+    if self_verify_only:
+        where = ("--allow-self-verify evaluates under a receiver policy (the default policy with allow_self_verify "
+                 "set), whose pins are the built-in demo pins plus --pubkey")
+        how = ("pass the profile's key as --pubkey HEX (merged into that policy) or name a policy file that pins it "
+               "(proof-policy add-pin), or drop --allow-self-verify to verify under the profile's pin alone")
+    else:
+        where = (f"a receiver policy is in effect ({_ps.describe(source)}), and under a policy only its pins plus the "
+                 "built-in demo pins and --pubkey are trust roots")
+        how = ("add the key to the policy's pins (proof-policy add-pin) or pass it as --pubkey HEX, or verify under "
+               "the profile's pin alone with no policy (drop --policy; for PROOF_POLICY use --no-policy-discovery)")
+    head = f"--profile {spec} pins an origin key, but {where}: the policy's pins win, so the profile's pin would be " \
+           "ignored and a bundle signed under it could only read integrity-only. Choose one pin source: " + how
+    if malformed:
+        return head + " (the profile's pinned_pubkey is also not 64 lowercase hex, so it can never be a trust root)"
+    if keys is not None and pin is not None:
+        # a duck-typed profile (Profile itself refuses this) that sets both: which one would count is not this
+        # check's to guess, so nothing it could compare is known to be the pin the verifier uses
+        return head + " (the profile sets both pinned_pubkey and pinned_keys; set one)"
+    try:
+        pin_set, _ = effective_policy(policy, pins)
+    except PolicyError:
+        return None                     # a malformed policy: refused on the normal path, with its own reason
+    demo = bool(getattr(profile, "pin_is_demo", False))   # truthy = demo, as the verifier reads it
+    # each entry exactly as the profile states it (resolve_pins requires a real boolean `demo`); pin_is_demo then
+    # marks every entry demo, as on the verifier's own path
+    entries = [{"legacy_raw_key": pin, "demo": False}] if pin is not None else keys
+    try:
+        wanted = {k: d or demo for k, d in resolve_pins(list(entries), where="--profile pinned_keys").items()}
+    except (PolicyError, TypeError):
+        return head                     # a malformed profile pin set can never be a trust root either
+    if pin_set is not None and all(pin_set.get(k) is d for k, d in wanted.items()):
+        return None                     # every profile pin is already a trust root of the policy: nothing dropped
+    return head
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     # SPEC 4.2 item 8: reading, canonicalizing and printing never depend on PYTHONINTMAXSTRDIGITS
@@ -859,6 +913,7 @@ def _main(args: list[str]) -> int:
     note = _ps.ignored_note(source)
     if note:
         print(note, file=sys.stderr)
+    self_verify_only = policy is None and ns.allow_self_verify   # the policy below is the one --allow-self-verify builds
     if policy is not None:
         # SPEC 7.12 / 13.4.1 step 3: pins from outside the policy file -- the CLI's built-in demo pin and
         # --pubkey -- are MERGED into it with the demo-wins rule, so a demo-signed bundle reads
@@ -880,6 +935,15 @@ def _main(args: list[str]) -> int:
         if not isinstance(policy, dict):
             return _policy_error(PolicyError("a receiver policy must be a JSON object"), ns.json, source)
         policy = {**policy, "allow_self_verify": True}
+    if profile is not None:
+        # a --profile origin pin is not a trust root under a receiver policy: refuse rather than drop it silently
+        conflict = _profile_pin_conflict(profile, ns.profile, policy, pins, source, self_verify_only)
+        if conflict is not None:
+            if ns.json:
+                print(json.dumps({"error": "usage", "message": conflict}, sort_keys=True))
+            else:
+                print(f"error: {conflict}", file=sys.stderr)
+            return EXIT_UNREADABLE
     if ns.pubkey is not None and pins is None:
         try:
             pin_key(ns.pubkey)
@@ -902,4 +966,7 @@ def _main(args: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    # `python -m` without -P: say the cwd could shadow this tool (stderr only; see _spec_loader)
+    from ._spec_loader import warn_if_cwd_on_path
+    warn_if_cwd_on_path()
     raise SystemExit(main())

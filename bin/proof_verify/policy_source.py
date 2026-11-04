@@ -10,7 +10,8 @@ changes a verdict rule, state, reason code or exit code. Precedence, first match
                               (A file whose name starts with ``preset:`` is named ``./preset:...``.)
 3. ``PROOF_POLICY``           an environment variable naming a policy file by an ABSOLUTE path (empty = unset;
                               a relative path is refused, exit 2, since it would be read from the working
-                              directory).
+                              directory; on Windows it needs a drive and a root, ``C:\\...``, or a UNC share,
+                              so a drive-relative ``\\x`` or ``C:x`` is refused too).
 4. none                       the built-in default policy, exactly as before discovery existed.
 
 Step 3 is the only *discovery*. ``--no-policy-discovery`` (or ``PROOF_NO_POLICY_DISCOVERY=1``; only ``1``, ``0``
@@ -32,12 +33,15 @@ from __future__ import annotations
 import os
 import re
 
+from . import _spec_loader
 from .verify import PolicyError, loads
 
 ENV_POLICY = "PROOF_POLICY"
 ENV_NO_DISCOVERY = "PROOF_NO_POLICY_DISCOVERY"
 PRESET_PREFIX = "preset:"
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}", re.ASCII)
+#: the path rules PROOF_POLICY is judged by: None = this OS's; True / False force Windows / POSIX (for tests).
+_WINDOWS: bool | None = None
 
 
 class PolicyMismatch(PolicyError):
@@ -126,11 +130,15 @@ def resolve(flag_value: str | None, *, no_discovery: bool = False):
     if off:
         return None, {"kind": "default", **ignored}
     if env:
-        if not os.path.isabs(env):
+        if not _spec_loader.is_absolute_file_path(env, windows=_WINDOWS):
             # a relative path resolves against the working directory, which may be an unpacked archive whose
-            # sender planted the file: that would bring back the folder lookup this module refuses
+            # sender planted the file: that would bring back the folder lookup this module refuses. On Windows
+            # os.path.isabs accepts a drive-relative `\x` or `/x` (Python 3.12 and earlier), read from the root of
+            # the CURRENT drive; the rule is a drive and a root, or a UNC share (_spec_loader.is_absolute_file_path).
             err = PolicyUsageError(f"{ENV_POLICY} must be an absolute path (a relative one would be read from the "
-                                   f"working directory, which a bundle's sender can fill): got {env!r}")
+                                   f"working directory, which a bundle's sender can fill; on Windows give a drive "
+                                   f"and a root, C:\\..., or a UNC \\\\server\\share\\... path: \\x and C:x depend on "
+                                   f"the current drive or its working directory): got {env!r}")
             err.source = {"kind": "env", "path": env}
             raise err
         source = {"kind": "env", "path": os.path.abspath(env)}
