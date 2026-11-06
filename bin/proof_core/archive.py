@@ -26,6 +26,7 @@ ARCHIVE_RENEWAL_SCHEMA = "evidence.archive.renewal.v1"
 _MAX_STAMP_TOKENS = 4
 _MAX_STAMPS = 64
 _MAX_DIGESTS = 256
+_MAX_TOKENS = 64          # TT-13: no bundle carries more tokens, so no archive binds more
 
 
 def _parse(der: bytes):
@@ -43,20 +44,51 @@ def entry_digest(entry: dict) -> str:
     return "sha256:" + hashlib.sha256(canon({k: v for k, v in entry.items() if k != "timestamps"})).hexdigest()
 
 
-def archive_object(bundle: dict, attestations=()) -> bytes:
+def signoff_token_ids(bundle: dict, attestations=()) -> list[str]:
+    """SPEC 10.8.3 AR-8 (spec 1.3): `object.attestation_timestamps`, the token_id of every timestamp token on every
+    sign-off whose entry digest is in ``attestations``, unique and sorted by code point. Raises ValueError for a token
+    with no token_id (a receiver could not bind it, so the archive would not cover that sign-off)."""
+    listed = set(attestations)
+    ids: set[str] = set()
+    for i, e in enumerate(bundle.get("attestations", [])):
+        if not (isinstance(e, dict) and entry_digest(e) in listed):
+            continue
+        for j, t in enumerate(e.get("timestamps", [])):
+            try:
+                ids.add(_token_id_of_text(t["token"]))
+            except Exception as exc:          # the verifier's Malformed, or a token that is not a TT-2 entry
+                raise ValueError(f"sign-off {i} token {j} has no token_id, so no archive can bind it: {exc} "
+                                 "(SPEC 10.8.3 AR-8)") from exc
+    if len(ids) > _MAX_TOKENS:
+        raise ValueError(f"an archive binds at most {_MAX_TOKENS} sign-off tokens (SPEC 10.8.1 AR-2)")
+    return sorted(ids)
+
+
+def archive_object(bundle: dict, attestations=(), *, bind_signoff_tokens: bool = True) -> bytes:
     """SPEC 10.8.3: AO = canon_1({schema, bundle_sha256, signatures: [every E signature hex], timestamps: [token_id of
-    each seal token], attestations}). ``attestations`` are the entry digests the archive lists (sorted here)."""
+    each seal token], attestations[, attestation_timestamps]}). ``attestations`` are the entry digests the archive
+    lists (sorted here). Spec 1.3: whenever it lists one, AO also carries `attestation_timestamps`
+    (`signoff_token_ids`, possibly empty), so the archive binds the listed sign-offs' tokens and a receiver under
+    `require_archive` can rely on them (13.4.3 row 21). An archive without the member (the spec 1.2 form) covers no
+    listed sign-off, so the member is never omitted; a spec 1.2 verifier reads it as malformed.
+    ``bind_signoff_tokens`` False forms the spec 1.2 object, which binds none: for test vectors only."""
     if not isinstance(bundle.get("signature"), dict) or "signature" not in bundle["signature"]:
         raise ValueError("the bundle has no seal signature yet: archive only a finished record (SPEC 10.8.9)")
     sigs = [bundle["signature"]["signature"]] + [b["signature"] for b in bundle.get("signatures", [])]
     ids = [_token_id_of_text(e["token"]) for e in bundle.get("timestamps", [])]
-    return canon({"schema": ARCHIVE_OBJECT_SCHEMA, "bundle_sha256": bundle["bundle_sha256"], "signatures": sigs,
-                  "timestamps": ids, "attestations": sorted(set(attestations))})
+    obj = {"schema": ARCHIVE_OBJECT_SCHEMA, "bundle_sha256": bundle["bundle_sha256"], "signatures": sigs,
+           "timestamps": ids, "attestations": sorted(set(attestations))}
+    if bind_signoff_tokens and obj["attestations"]:
+        # spec 1.3: present, even empty, whenever a sign-off is listed: without it no listed sign-off is covered
+        obj["attestation_timestamps"] = signoff_token_ids(bundle, attestations)
+    return canon(obj)
 
 
-def archive_imprint(bundle: dict, attestations=()) -> bytes:
-    """The 32-byte imprint of chain 0 stamp 0 (AR-9): SHA-256(AO). Send it to the TSA."""
-    return hashlib.sha256(archive_object(bundle, attestations)).digest()
+def archive_imprint(bundle: dict, attestations=(), *, bind_signoff_tokens: bool = True) -> bytes:
+    """The 32-byte imprint of chain 0 stamp 0 (AR-9): SHA-256(AO). Send it to the TSA. Add every timestamp token
+    to the listed sign-offs first: a token added later is not bound, and a receiver under `require_archive` then
+    rejects (13.4.3 row 21)."""
+    return hashlib.sha256(archive_object(bundle, attestations, bind_signoff_tokens=bind_signoff_tokens)).digest()
 
 
 def renewal_imprint(bundle: dict) -> bytes:
@@ -86,10 +118,13 @@ def _stamp(tokens: list[bytes], want: bytes, what: str) -> dict:
     return {"format": "rfc3161", "tokens": out}
 
 
-def add_archive(bundle: dict, tokens: list[bytes], attestations=()) -> dict:
+def add_archive(bundle: dict, tokens: list[bytes], attestations=(), *, bind_signoff_tokens: bool = True) -> dict:
     """Return a COPY of the v4 ``bundle`` with a new `archive`: chain 0 holds one stamp of ``tokens`` (DER RFC 3161
     tokens over `archive_imprint(bundle, attestations)`, normally from different TSAs). ``attestations`` are the entry
-    digests of the sign-offs the archive covers; each must be present in `attestations`. Raises ValueError."""
+    digests of the sign-offs the archive covers; each must be present in `attestations`. Spec 1.3: the archive also
+    binds those sign-offs' timestamp tokens (`object.attestation_timestamps`, 10.8.3 AR-8); ``bind_signoff_tokens``
+    False omits that member (the spec 1.2 form, which a receiver under `require_archive` rejects; test vectors only).
+    Raises ValueError."""
     if "archive" in bundle:
         raise ValueError("the bundle already has an archive: renew it (renew_archive) or drop it to start a new one")
     if len(set(attestations)) > _MAX_DIGESTS:
@@ -98,10 +133,14 @@ def add_archive(bundle: dict, tokens: list[bytes], attestations=()) -> dict:
     missing = sorted(set(attestations) - present)
     if missing:
         raise ValueError(f"the archive would list sign-off(s) not present in the bundle: {missing} (SPEC 10.8.3 AR-8)")
-    stamp = _stamp(list(tokens), archive_imprint(bundle, attestations), "archived-object (AR-9)")
+    stamp = _stamp(list(tokens), archive_imprint(bundle, attestations, bind_signoff_tokens=bind_signoff_tokens),
+                   "archived-object (AR-9)")
     b = copy.deepcopy(bundle)
-    b["archive"] = {"schema": ARCHIVE_SCHEMA, "object": {"attestations": sorted(set(attestations))},
-                    "chains": [{"hash": "sha256", "stamps": [stamp]}]}
+    obj = {"attestations": sorted(set(attestations))}
+    if bind_signoff_tokens and obj["attestations"]:
+        # spec 1.3: present, even empty, whenever a sign-off is listed (a spec 1.2 verifier reads it as malformed)
+        obj["attestation_timestamps"] = signoff_token_ids(bundle, attestations)
+    b["archive"] = {"schema": ARCHIVE_SCHEMA, "object": obj, "chains": [{"hash": "sha256", "stamps": [stamp]}]}
     return b
 
 

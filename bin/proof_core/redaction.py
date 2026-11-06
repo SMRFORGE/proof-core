@@ -90,7 +90,7 @@ def _redact_v4_impl(bundle: dict, sections: list[str], items: list[str], profile
     return out
 
 
-def redact_bundle(bundle: dict, *, withhold=(), withhold_items=(), profile=None) -> dict:
+def redact_bundle(bundle: dict, *, withhold=(), withhold_items=(), profile=None, _allow_result_withheld=False) -> dict:
     """Return a disclosure-safe redacted copy of `bundle` with each named section's contents
     withheld. The seal and the original signature are untouched, so the result still verifies.
 
@@ -101,7 +101,13 @@ def redact_bundle(bundle: dict, *, withhold=(), withhold_items=(), profile=None)
 
     Args:
         bundle: a signed evidence bundle (evidence.envelope.v3).
-        withhold: section names to withhold (subset of WITHHOLDABLE).
+        withhold: section names to withhold (subset of WITHHOLDABLE). In a v4 (canon 3) bundle, withholding
+            ``"result"`` keeps the seal but makes the statistical band uncheckable, so every receiver decision
+            rejects the copy (SPEC v4 13.4.3 row 22, spec 1.3, fail closed). It is refused unless
+            ``_allow_result_withheld`` is true; keep part of a v4 result back with committed items and
+            ``withhold_items`` instead.
+        _allow_result_withheld: produce a v4 copy with its result section withheld anyway (one every receiver
+            rejects; for test vectors and demonstrations).
         profile: optional dialect profile; supplies the dialect's own ``redaction_schema`` tag. None/default
             uses the neutral literal.
 
@@ -113,6 +119,11 @@ def redact_bundle(bundle: dict, *, withhold=(), withhold_items=(), profile=None)
             names no committed item.
     """
     names = sorted({str(w) for w in withhold})
+    if _is_v4(bundle) and "result" in names and not _allow_result_withheld:
+        raise ValueError("withholding the result section of a v4 bundle makes every receiver reject the copy "
+                         "(SPEC v4 13.4.3 row 22, spec 1.3: its band cannot be checked); seal the parts to keep back "
+                         "as committed items and withhold those with withhold_items, or pass "
+                         "_allow_result_withheld=True (private: test vectors only) for a copy that is meant to be rejected")
     if _is_v4(bundle):
         return _redact_v4(bundle, names, sorted({str(p) for p in withhold_items}), profile)
     if withhold_items:

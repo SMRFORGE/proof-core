@@ -1,7 +1,8 @@
 # CI for the proof-core Claude Code plugin. bin/proof_core and bin/proof_verify are vendored verbatim from
 # gitlab.com/proof-core/proof-core (the plugin cannot pip-install at load time). Gates:
 #   vendored  -- bin/ is byte-identical to upstream at the commit VENDORED.md records (blocking)
-#   smoke     -- the vendored packages import and the CLIs start from bin/ with no install (blocking)
+#   smoke     -- the vendored packages import, the CLIs start from bin/ with no install, and the behaviour the
+#                docs describe holds (tools/check_behaviour.py) (blocking)
 #   freshness -- the recorded commit is the latest proof-core release tag (warning only)
 workflow:
   rules:
@@ -38,6 +39,7 @@ smoke:
     - PYTHONPATH=bin python -c "import proof_core, proof_verify; print('proof_core', proof_core.__version__)"
     - PYTHONPATH=bin python -P -m proof_verify --help > /dev/null
     - PYTHONPATH=bin python -P -m proof_core --help > /dev/null   # the entry point SKILL.md documents
+    - python -P tools/check_behaviour.py   # the behaviour SKILL.md / README describe (envelopes, reproduce exit 7)
 
 freshness:
   stage: check

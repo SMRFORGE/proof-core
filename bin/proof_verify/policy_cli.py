@@ -457,9 +457,14 @@ def explain(policy: Any, *, pubkey: str | None = None, allow_self_verify: bool =
         oe = m["require_order"] and m["require_order_eligible"]
         lines.append("  4. every sign-off the policy relies on (every sign-off eligible for a role in "
                      "require_roles" + (", and, under rule OE, every eligible verifier review an approval cites"
-                                        if oe else "") + ") is covered by the archive; missing coverage information "
-                     "fails closed (row 21 archive_not_covering_signoffs)"
-                     + ("." if roles or oe else ". This policy requires no role, so it relies on no sign-off."))
+                                        if oe else "") + ") is covered by the archive, together with its timestamp "
+                     "tokens, by an archive in the spec 1.3 form (attestation_timestamps present); missing coverage "
+                     "information fails closed"
+                     + ("" if roles or oe else " (this policy requires no role, so it relies on no sign-off)")
+                     + "; and the archive is prompt: its t0 is at most "
+                     f"{m.get('max_archive_lag_s', 3600)} s (max_archive_lag_s) after the latest signed_at among "
+                     "every valid sign-off under a pinned non-demo key or a pinned roster person, relied on or not "
+                     "(relative to what each signer declared) (row 21 archive_not_covering_signoffs).")
         if len(m["tsas"]) < n:
             warnings.append(f"require_archive needs stamps from {n} distinct pinned TSA(s) but {len(m['tsas'])} "
                             "are pinned: this policy accepts nothing (row 18)")
@@ -474,8 +479,10 @@ def explain(policy: Any, *, pubkey: str | None = None, allow_self_verify: bool =
 
     # -- the statistical band (rows 22 and 24)
     lines = [("A v4 bundle whose sealed statistical band (reproduce_tolerance of kind \"stat\") breaks a rule of "
-              "13.4.3 \"The statistical band\" is refused (row 22 reproduce_tolerance_unusable), under every policy."),
-             ("A bundle with no statistical band, or one whose band cannot be checked (withheld or committed), is not "
+              "13.4.3 \"The statistical band\" is refused (row 22 reproduce_tolerance_unusable), under every policy, "
+              "and so (spec 1.3, fail closed) is a v4 bundle whose result section is withheld, since its band cannot "
+              "be checked."),
+             ("A bundle with no statistical band, or one whose band's quantity or sigma is a committed item, is not "
               "refused by row 22.")]
     if m["require_reproduce_tolerance"]:
         lines.append("A declared reproduction is required (require_reproduce_tolerance, row 24 "
@@ -483,8 +490,8 @@ def explain(policy: Any, *, pubkey: str | None = None, allow_self_verify: bool =
                      "reproduces in its sealed result core, either exactly {\"kind\": \"exact\"} (a deterministic "
                      "result, reproduce compares exactly; the producer sets Result.reproduce_tolerance to it) or a "
                      "sound statistical band (kind \"stat\"). A bundle with no reproduce_tolerance, any other "
-                     "object, or a band that cannot be checked (withheld or committed) is refused; an unusable band is "
-                     "row 22 alone. A v3 bundle is never checked by this row. A producer seals with "
+                     "object, or a band whose quantity or sigma is a committed item is refused; an unusable band "
+                     "and a withheld v4 result are row 22 alone. A v3 bundle is never checked by this row. A producer seals with "
                      "`reproduce_tolerance=exact_tolerance()` for a deterministic result, or a stat band "
                      "(`stat_tolerance(...)`) for a stochastic one; nothing declares exact automatically.")
     else:
