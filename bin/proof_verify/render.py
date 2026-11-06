@@ -104,7 +104,14 @@ def claims_lines(rep: dict, bundle: Any) -> list[str]:
     t = rep.get("reproduce_tolerance") or {}
     if t.get("state") == "unusable":
         why = "; ".join(E(str(p)) for p in t.get("problems") or [])
-        out.append(f"reproduce_tolerance: the sealed statistical band is UNUSABLE ({why}); reproduce compares exactly")
+        if any(str(p).startswith("the result section is withheld") for p in t.get("problems") or []):
+            # spec 1.3: the core is not here, so there may be no band at all, and reproduce has nothing to compare
+            out.append("reproduce_tolerance: UNUSABLE because the result section is withheld: whether it declares a "
+                       "band cannot be checked, so the decision rejects it under every policy (SPEC 13.4.3 row 22, "
+                       "spec 1.3); disclose the result, or withhold parts of it as committed items")
+        else:
+            out.append(f"reproduce_tolerance: the sealed statistical band is UNUSABLE ({why}); reproduce compares "
+                       "exactly")
     return out
 
 

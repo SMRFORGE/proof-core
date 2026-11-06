@@ -46,8 +46,10 @@ class SealedFunction:
 
     def __init__(self, fn: Callable[[dict], dict], *, capability: str, engine: str, engine_version: str,
                  fidelity: Fidelity, verdict: Verdict, caveats: tuple[str, ...],
-                 data_library: tuple[str, str] | None, profile=None):
+                 data_library: tuple[str, str] | None, profile=None, canon_version: int = 3):
         self._fn = fn
+        #: the envelope it mints: 3 = evidence.envelope.v4 (the default, as build_bundle), 1 = the v3 envelope
+        self.canon_version = canon_version
         self.capability = capability
         self.engine = engine
         self.engine_version = engine_version
@@ -80,7 +82,8 @@ class SealedFunction:
         result = Result(capability=self.capability, fidelity=self.fidelity, verdict=self.verdict,
                         outputs=outputs, caveats=self.caveats)
         return build_bundle(case, result, engine=self.engine, engine_version=self.engine_version,
-                            data_library=self.data_library, profile=self.profile)
+                            data_library=self.data_library, profile=self.profile,
+                            canon_version=self.canon_version)
 
     def __call__(self, inputs: dict) -> dict:
         return self.seal(inputs)
@@ -100,16 +103,19 @@ def sealed(*, capability: str, engine: str, engine_version: str,
            fidelity: Fidelity = Fidelity.SCREENING, verdict: Verdict = Verdict.PASS,
            caveats: tuple[str, ...] = (),
            data_library: tuple[str, str] | None = None,
-           profile=None) -> Callable[[Callable[[dict], Any]], SealedFunction]:
+           profile=None, canon_version: int = 3) -> Callable[[Callable[[dict], Any]], SealedFunction]:
     """Decorator: wrap a pure, DETERMINISTIC ``inputs -> outputs`` function as a ``SealedFunction`` (see the
     module docstring). ``capability``, ``engine`` and ``engine_version`` are required; the rest default to a
     screening/pass leaf with no caveats. Reproduction is an EXACT result-core match; a stochastic producer
     (which must record its ``rng_seed``) is out of scope -- seal it with ``build_bundle`` directly.
 
     ``profile`` (optional) is the on-disk DIALECT this function seals and re-derives under; a branded
-    consumer passes its own ``proof_core.profile.Profile``. ``None`` is the neutral dialect, byte-unchanged."""
+    consumer passes its own ``proof_core.profile.Profile``. ``None`` is the neutral dialect, byte-unchanged.
+
+    ``canon_version`` selects the envelope, as ``build_bundle``: 3 (the default) mints ``evidence.envelope.v4``;
+    1 mints the frozen ``evidence.envelope.v3``."""
     def deco(fn: Callable[[dict], Any]) -> SealedFunction:
         return SealedFunction(fn, capability=capability, engine=engine, engine_version=engine_version,
                               fidelity=fidelity, verdict=verdict, caveats=tuple(caveats),
-                              data_library=data_library, profile=profile)
+                              data_library=data_library, profile=profile, canon_version=canon_version)
     return deco

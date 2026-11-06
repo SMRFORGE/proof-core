@@ -42,7 +42,10 @@ def _attestation_message(bundle_sha256: str, role: str, name: str, timestamp: st
 
 
 def make_attestation(bundle_sha256: str, role: str, name: str, sk: bytes, *, timestamp: str | None = None) -> dict:
-    """Build a single sign-off over `bundle_sha256` under the approver's private key `sk`."""
+    """Build a single v1 sign-off over `bundle_sha256` under the approver's private key `sk`.
+
+    For an `evidence.envelope.v3` bundle only (it sees just the digest, so it cannot check the envelope itself):
+    append it with `attest_bundle`, which refuses a v4 bundle; a v4 bundle takes `add_signoff` (sign-offs v2)."""
     ts = timestamp or datetime.datetime.now(datetime.UTC).isoformat()
     pk = signing.publickey(sk)
     sig = signing.sign(_attestation_message(bundle_sha256, role, name, ts), sk, pk)
@@ -63,10 +66,19 @@ def attest_bundle(bundle: dict, role: str, name: str, sk: bytes, *, timestamp: s
     The approver signs the sealed bundle digest together with their role, name and timestamp. The decision
     seal (the producer `signature`) is left untouched, so the sign-off is additive: several approvers can
     countersign the same sealed decision (maker-checker), and `verify_bundle`'s integrity+origin verdict over
-    the decision is unchanged. Raises if the bundle carries no `bundle_sha256` to sign."""
+    the decision is unchanged. Raises if the bundle carries no `bundle_sha256` to sign.
+
+    This is the v1 sign-off (`evidence.attestation.v1`), for an `evidence.envelope.v3` bundle only. A v4 bundle
+    (canon 3, the default mint) takes sign-offs v2: `add_signoff(bundle, signer, role=, meaning=, statement=,
+    printed_name=, signer_id=)`; a v1 entry on a v4 bundle never verifies, so this raises instead."""
     digest = bundle.get("bundle_sha256")
     if not isinstance(digest, str) or not digest:
         raise ValueError("cannot attest a bundle with no bundle_sha256 (seal it first)")
+    sums = bundle.get("sha256sums")
+    if isinstance(sums, dict) and sums.get("canon_version") == 3:
+        raise ValueError("attest_bundle makes a v1 sign-off, which an evidence.envelope.v4 bundle (canon 3) does not "
+                         "accept (it would fail verify): use proof_core.add_signoff(bundle, signer, role=..., "
+                         "meaning=..., statement=..., printed_name=..., signer_id=...), the v4 sign-off")
     b = copy.deepcopy(bundle)
     b.setdefault("attestations", []).append(make_attestation(digest, role, name, sk, timestamp=timestamp))
     return b

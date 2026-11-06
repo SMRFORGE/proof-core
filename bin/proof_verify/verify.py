@@ -430,11 +430,16 @@ _POLICY_DEFAULTS: dict[str, Any] = {
     "require_order": True, "require_signoff_timestamps": False, "allow_self_verify": False, "originator_keys": [],
     "originator_signer_ids": [], "max_attest_lag_s": 86400, "allow_ess_v1": False, "require_full_copy_review": False,
     "require_order_eligible": False, "require_reproduce_tolerance": False, "ignore_unrecognised_signoffs": False,
+    "max_archive_lag_s": 3600,
 }
 #: SPEC 13.4.1 (spec 1.1): the opt-in members added after spec 1.0. Each is in the effective policy only when it is
 #: true (step 5 drops it at its default `false`), so every policy that leaves it off keeps the policy_sha256 it had
 #: under spec 1.0, and the members form of `evaluate` may omit it (a members object written for 1.0 still evaluates).
 _POLICY_OPT_IN = ("require_order_eligible", "require_reproduce_tolerance", "ignore_unrecognised_signoffs")
+#: SPEC 13.4.1 (spec 1.3): members added after spec 1.0 that step 5 drops at their default, so every policy that leaves
+#: them there keeps its policy_sha256 and a members object written before may omit them: the opt-in members, and
+#: `max_archive_lag_s` (13.4.3 row 21, the prompt-archive bound; default 3600).
+_POLICY_DROP_AT_DEFAULT = (*_POLICY_OPT_IN, "max_archive_lag_s")
 
 
 def _same_json(a: Any, b: Any) -> bool:
@@ -568,10 +573,12 @@ _POLICY_SHAPES = {
     "require_order_eligible": lambda v: isinstance(v, bool),
     "require_reproduce_tolerance": lambda v: isinstance(v, bool),
     "ignore_unrecognised_signoffs": lambda v: isinstance(v, bool),
+    "max_archive_lag_s": lambda v: _json_int(v, 0, 31_622_400),
 }
 #: The members whose type is "JSON integer" (SPEC 2): a whole double such as `1.0` is the same value as `1`, so it is
 #: normalized to the integer before the policy is hashed (13.4.1: policies with the same meaning have the same digest).
-_POLICY_INT_MEMBERS = frozenset({"origin_quorum", "min_seal_tsas", "min_archive_tsas", "max_attest_lag_s"})
+_POLICY_INT_MEMBERS = frozenset({"origin_quorum", "min_seal_tsas", "min_archive_tsas", "max_attest_lag_s",
+                                 "max_archive_lag_s"})
 #: Members this release EVALUATES at a non-default value: `min_envelope` (13.4.3 row 2), the origin members of 7.13
 #: (`origin_quorum`, `require_seal_suites`, `suites`, `hashes`) and the sign-off members of 13.4.4 (`roster`,
 #: `require_roles`, `require_order`, `allow_self_verify`, `originator_keys`, `originator_signer_ids`) and the
@@ -583,7 +590,7 @@ _POLICY_EVALUATED = frozenset({"min_envelope", "origin_quorum", "require_seal_su
                                "originator_signer_ids", "tsas", "min_seal_tsas", "require_signoff_timestamps",
                                "max_attest_lag_s", "allow_ess_v1", "require_full_copy_review", "require_archive",
                                "min_archive_tsas", "require_order_eligible", "require_reproduce_tolerance",
-                               "ignore_unrecognised_signoffs"})
+                               "ignore_unrecognised_signoffs", "max_archive_lag_s"})
 
 
 def _check_member_combination(m: dict, where: str = "policy") -> None:
@@ -680,8 +687,8 @@ def policy_sha256(members: dict, pin_set: dict[str, bool]) -> str:
                            key=lambda p: p["person_id"])
     eff["pins"] = [{"key_id": k, "demo": pin_set[k], **({"label": labels[k]} if k in labels else {})}
                    for k in sorted(pin_set)]
-    for m in _POLICY_OPT_IN:          # step 5 (spec 1.1): an opt-in member is in the effective policy only when true
-        if eff.get(m) is False:
+    for m in _POLICY_DROP_AT_DEFAULT:   # step 5 (spec 1.1, 1.3): such a member is in the effective policy only when it
+        if m in eff and _same_json(eff[m], _POLICY_DEFAULTS[m]):    # differs from its default
             del eff[m]
     return _sha(_canon(eff))
 
@@ -769,7 +776,11 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
 
     The verdict must be in THIS verifier's own shape (`classify_bundle`'s member names): one in another
     implementation's shape (for example @proof-core/verify's camelCase `canonVersion`, `reproduceTolerance`), or one
-    missing a member the decision reads, is refused with PolicyError, never read with rows silently skipped."""
+    missing a member the decision reads, is refused with PolicyError, never read with rows silently skipped.
+
+    13.4.2 (spec 1.3): a verdict is not portable across rule changes. It carries no rules or spec version, and a
+    verdict recorded by an older verifier can carry the same `policy_sha256`; after an upgrade, re-classify the
+    bundle, never re-evaluate a stored verdict."""
     _check_verdict_shape(rep)
     if not isinstance(members, dict):
         raise TypeError("evaluate: the members form is a dict of every policy member, defaults filled in")
@@ -777,7 +788,7 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
     if unknown:          # as @proof-core/verify refuses (TypeError)
         raise TypeError(f"evaluate: unknown policy member(s) {unknown}")
     # the spec 1.1 opt-in members may be omitted (a members object written for spec 1.0 still evaluates)
-    members = {**{k: _POLICY_DEFAULTS[k] for k in _POLICY_OPT_IN if k not in members}, **members}
+    members = {**{k: _POLICY_DEFAULTS[k] for k in _POLICY_DROP_AT_DEFAULT if k not in members}, **members}
     missing = sorted(k for k in _POLICY_DEFAULTS if k not in members)
     if missing:          # the members form needs every member, defaults filled in (as @proof-core/verify refuses)
         raise TypeError(f"evaluate: the members form needs every policy member, defaults filled in; missing {missing}")
@@ -786,6 +797,9 @@ def evaluate(rep: dict, members: dict, pin_set: dict[str, bool] | None = None) -
     for k in _POLICY_DEFAULTS:
         if not _POLICY_SHAPES[k](members[k]):
             raise PolicyError(f'evaluate: policy member "{k}" has a wrong type or a value out of range')
+    # an integer member is held as an int from here on, exactly as `_policy_members` holds it: 86400.0 is 86400 for
+    # the policy digest and for every row that reads it (as @proof-core/verify, where the two are one number)
+    members = {k: (int(v) if k in _POLICY_INT_MEMBERS else v) for k, v in members.items()}
     # the roster shape above only checks "a list of objects"; its person objects are read by key below (and by
     # policy_sha256), so validate them in full as a policy file's roster is: `[{}]` is malformed, not a KeyError
     try:
@@ -874,7 +888,15 @@ def archive_reliance_reasons(rep: dict, members: dict) -> list[str]:
     """SPEC 13.4.3 rows 20 and 21: what `require_archive` also needs of a `valid` archive (10.8.6). Row 20,
     `archive_not_continuous`: `continuous_at_as_of` is not true. Row 21, `archive_not_covering_signoffs`: some sign-off
     the policy relies on, an entry eligible (13.4.4) for a role in `require_roles`, is not covered by the archive (its
-    entry digest is in `not_covered`, or the verdict reports none for it). A non-`valid` archive is row 18's alone."""
+    entry digest is in `not_covered` or, spec 1.3, in `tokens_not_covered`: the archive does not bind its timestamp
+    tokens; or the verdict reports neither for it); or, spec 1.3, the archive is not prompt: its `t0` is
+    later than the LATEST `signed_at` among the PINNED entries plus `max_archive_lag_s` (default 3600). The pinned
+    entries are every `valid` entry under a receiver-pinned non-demo key or a pinned roster person
+    (`_pinned_anchor`), relied on or not: a re-mint long after the last of them could follow the deletion of a token
+    that contradicts one (row 9 reads every valid entry), so it is not prompt and rejects, while a review and an
+    approval hours apart are covered by one archive minted promptly after the approval. An entry under an unpinned
+    or demo key never anchors the window, whatever its `signed_at`, and `signed_at` is what each signer declared. A
+    non-`valid` archive is row 18's alone."""
     dims = rep.get("dims", {})
     a = rep.get("archive") if isinstance(rep.get("archive"), dict) else {}
     if not members.get("require_archive") or dims.get("archive") != "valid" or a.get("state") != "valid":
@@ -886,15 +908,45 @@ def archive_reliance_reasons(rep: dict, members: dict) -> list[str]:
     entries = ([x for x in (signoffs.get("entries") or []) if isinstance(x, dict)]
                if rep.get("canon_version") == 3 else [])
     nc = a.get("not_covered") if isinstance(a.get("not_covered"), list) else None
+    # spec 1.3: a relied-on entry is covered only with its tokens (10.8.3 AR-8, `tokens_not_covered`); a verdict
+    # without the array shows no coverage (fail closed)
+    tnc = a.get("tokens_not_covered") if isinstance(a.get("tokens_not_covered"), list) else None
     # spec 1.2: under rule OE the eligible review each approval cites is relied on too, whether or not require_roles
     # names verifier (13.4.3 "What require_archive requires" item 4)
     cited = _oe_cited(entries, members)
     relied = [x for x in entries if any(_eligible(x, r, members) for r in set(members.get("require_roles") or []))
               or (cited is not None and isinstance(x.get("entry_sha256"), str) and x["entry_sha256"] in cited
                   and _eligible(x, "verifier", members))]
-    if any(nc is None or not isinstance(x.get("entry_sha256"), str) or x["entry_sha256"] in nc for x in relied):
+    lag = members.get("max_archive_lag_s", 3600)
+    # spec 1.3 (Chris: anchor on all valid pinned entries): every relied-on entry is pinned, so the window over the
+    # pinned entries covers the relied-on ones too, and a late archive rejects whether or not one is relied on
+    anchors = [x for x in entries if _pinned_anchor(x)]
+    if (relied and any(nc is None or tnc is None or not isinstance(x.get("entry_sha256"), str)
+                       or x["entry_sha256"] in nc or x["entry_sha256"] in tnc for x in relied)) or (
+            anchors and not _archive_prompt(a.get("t0"), [x.get("signed_at") for x in anchors], lag)):
         out.append("archive_not_covering_signoffs")
     return out
+
+
+def _pinned_anchor(x: dict) -> bool:
+    """SPEC 13.4.3 row 21 (spec 1.3, prompt archive): does the v2 entry ``x`` anchor the prompt window? A `valid`
+    entry under a receiver-pinned non-demo key (`roster.status` `pinned_key`) or a pinned roster person
+    (`pinned_person`), relied on or not. An entry under an unpinned or demo key never anchors it: anyone can append
+    one."""
+    return x.get("state") == "valid" and (x.get("roster") or {}).get("status") in ("pinned_key", "pinned_person")
+
+
+def _archive_prompt(t0: Any, signed_ats: list, lag: Any) -> bool:
+    """SPEC 13.4.3 row 21 (spec 1.3, prompt archive): the archive's t0 (stamp 0's time, which a renewal keeps) is no
+    later than the latest of `signed_ats` (the pinned entries' `signed_at`) + `lag` seconds, as exact instants.
+    Anything unreadable, any one `signed_at` included, is not prompt (fail closed)."""
+    try:
+        sa = max(_tsp.utc_instant(x)[0] for x in signed_ats)
+        secs = _tsp.utc_instant(t0)[0]
+        frac = t0[19:-1].lstrip(".").rstrip("0") if t0[19:20] == "." else ""
+        return isinstance(lag, int) and not isinstance(lag, bool) and (secs, frac) <= (sa + lag, "")
+    except (TypeError, ValueError, IndexError):
+        return False
 
 
 def _normalize_floats(obj: Any) -> Any:
@@ -2556,7 +2608,10 @@ _TOL_PLACEHOLDER_SEED = 0
 #: SPEC 13.5 `claims_not_checked`: sealed producer claims only a re-run (reproduce) can check, never verify.
 _CLAIMS_PROVENANCE = ("code_version", "data_library", "deterministic", "engine", "engine_version", "produced_by",
                       "reproduce")
-_CLAIMS_CORE = ("fidelity", "verdict")
+#: `caveats` too: a sealed caveat is producer prose ("validated against experiment", "independently certified") that
+#: neither verify nor reproduce re-derives (reproduce only checks that the sealed bundle keeps every caveat the fresh
+#: run declares), so it is listed as a claim nobody checked rather than riding a pass unmentioned.
+_CLAIMS_CORE = ("caveats", "fidelity", "verdict")
 
 
 def _tol_number(v: Any) -> float | None:
@@ -2590,11 +2645,11 @@ def stat_band_outputs(core: Any) -> Any:
     return next(iter(res.values()))
 
 
-def stat_band_problem(tol: Any, outputs: Any) -> str | None:
-    """SPEC 14 item 7, the ONE definition of a usable statistical band, shared by the verifier (13.4.3 row 22), the
-    reproducer (proof_core.certify falls back to an exact match) and the producer (the mint refuses to seal one):
-    None when ``tol`` (a `kind: "stat"` reproduce_tolerance) is usable against ``outputs``, else why not. The
-    placeholder seed is the caller's check (it reads provenance)."""
+def stat_band_object_problem(tol: Any) -> str | None:
+    """SPEC 13.4.3 "The statistical band" item 3, the rules on the tolerance object alone (quantity and sigma_key
+    strings, not self-referential, `derived`, `sigmas`): None when they hold, else why not. They never read an
+    output value, so they are checked before the committed-item clause (spec 1.3): a committed quantity or sigma
+    never hides a band that breaks one of them."""
     if not isinstance(tol, dict):
         return "the tolerance is not an object"
     q, sk = tol.get("quantity"), tol.get("sigma_key")
@@ -2612,6 +2667,18 @@ def stat_band_problem(tol: Any, outputs: Any) -> str | None:
         return "sigmas must be a finite JSON number (not a string or a boolean)"
     if not 0 < sigmas <= TOL_MAX_SIGMAS:
         return f"sigmas must be greater than 0 and at most {TOL_MAX_SIGMAS:g}"
+    return None
+
+
+def stat_band_problem(tol: Any, outputs: Any) -> str | None:
+    """SPEC 14 item 7, the ONE definition of a usable statistical band, shared by the verifier (13.4.3 row 22), the
+    reproducer (proof_core.certify falls back to an exact match) and the producer (the mint refuses to seal one):
+    None when ``tol`` (a `kind: "stat"` reproduce_tolerance) is usable against ``outputs``, else why not. The
+    placeholder seed is the caller's check (it reads provenance)."""
+    why = stat_band_object_problem(tol)
+    if why is not None:
+        return why
+    q, sk = tol["quantity"], tol["sigma_key"]
     if not (isinstance(outputs, dict) and q in outputs and sk in outputs):
         return "the outputs of the result's one capability lack the quantity or the sigma_key"
     val, sig = _tol_number(outputs[q]), _tol_number(outputs[sk])
@@ -2625,7 +2692,8 @@ def stat_band_problem(tol: Any, outputs: Any) -> str | None:
 
 
 #: SPEC 13.4.3 row 24 (spec 1.1): the `reproduce_tolerance` states that show how a v4 bundle reproduces: `exact`
-#: (declared deterministic), `sound` (a usable statistical band) and `unusable` (declared, but row 22 rejects it).
+#: (declared deterministic), `sound` (a usable statistical band) and `unusable` (declared, or hidden in a withheld
+#: v4 result, spec 1.3, but row 22 rejects it, so row 24 never adds its own code).
 _TOL_DECLARED_STATES = frozenset({"exact", "sound", "unusable"})
 #: SPEC 13.4.3 "The statistical band" (spec 1.1): the one declaration of an exact (deterministic) reproduction.
 TOL_EXACT = {"kind": "exact"}
@@ -2633,23 +2701,37 @@ TOL_EXACT = {"kind": "exact"}
 #: cannot be checked (`not_checked`). The `problems` entry of exactly that case; 13.7 item 4 notes it
 #: (NOTE_TOLERANCE_COMMITTED).
 TOL_COMMITTED_PROBLEM = "the quantity or the sigma is a committed item"
+#: SPEC 13.4.3 "The statistical band" item 1 (spec 1.3, fail closed): the problem of a v4 bundle whose result section
+#: is withheld. Whether the withheld core declares a band, and whether that band is usable, cannot be checked, so the
+#: band is `unusable` and row 22 rejects under every policy: withholding never turns a rejected band into an accept.
+TOL_RESULT_WITHHELD_PROBLEM = ("the result section is withheld, so a band it declares cannot be checked (a v4 bundle "
+                               "fails closed, SPEC 13.4.3 row 22)")
 
 
-def tolerance_report(bundle: Any, profile=None) -> dict:
+def tolerance_report(bundle: Any, profile=None, *, v4: bool | None = None) -> dict:
     """SPEC 14 item 7 / 13.5 `reproduce_tolerance`: {state, problems} for the sealed result core's tolerance. `exact`
     (spec 1.1): the core declares exactly `{"kind": "exact"}`, an exact reproduction; `none`: neither that nor a
-    statistical band (`kind` is not "stat"); `not_checked`: the result (or the band's quantity or sigma, as an
-    item) is withheld, or the provenance is; `sound`; `unusable`: `stat_band_problem` names a problem, or the seal
-    holds the profile's placeholder seed. The reproducer reads the band the same way and falls back to an exact match
-    on an unusable one; for a v4 bundle the decision rejects (13.4.3 row 22)."""
+    statistical band (`kind` is not "stat"); `not_checked`: the band's quantity or sigma is a committed item, the
+    provenance is withheld, or (``v4`` false: v3 input) the result is; `sound`; `unusable`: `stat_band_problem` names
+    a problem, the seal holds the profile's placeholder seed, or (``v4``, spec 1.3) the result section is withheld, so
+    a declared band cannot be checked. ``v4`` None (the default) reads it from the bundle's sealed canon_version
+    (canon 3 is v4). The reproducer reads the band the same way and falls back to an exact match on an unusable
+    one; for a v4 bundle the decision rejects (13.4.3 row 22)."""
+    if v4 is None:
+        v4 = _citing_canon_version(bundle) == 3
     core, prov = _sealed_section(bundle, "result"), _sealed_section(bundle, "provenance")
     if core is _END:
+        if v4:
+            return {"state": "unusable", "problems": [TOL_RESULT_WITHHELD_PROBLEM]}
         return {"state": "not_checked", "problems": ["the result section is withheld"]}
     tol = core.get("reproduce_tolerance") if isinstance(core, dict) else None
     if isinstance(tol, dict) and _same_json(tol, TOL_EXACT):
         return {"state": "exact", "problems": []}    # spec 1.1: exactly {"kind": "exact"}, an exact reproduction
     if not (isinstance(tol, dict) and tol.get("kind") == "stat"):
         return {"state": "none", "problems": []}
+    why = stat_band_object_problem(tol)                    # spec 1.3: before the committed clause, which reads outputs
+    if why is not None:
+        return {"state": "unusable", "problems": [why]}
     outputs = stat_band_outputs(core)
     if isinstance(outputs, dict) and any(isinstance(outputs.get(k), dict) and "$committed" in outputs[k]
                                          for k in (tol.get("quantity"), tol.get("sigma_key")) if isinstance(k, str)):
@@ -3644,11 +3726,15 @@ def _signoffs_finish(ctx: dict, as_of: str, archive: dict | None) -> dict:
         x["state"] = "invalid" if x["problems"] else ("valid" if x["_supported"] else "not_checked")   # step 8
         if x["state"] == "not_checked":
             x["problems"] = [f"not checked (suite {x['alg']} not supported by this verifier)"]
-    # step 10, distinctness: the originator key set and the originator signer ids
+    # step 10, distinctness: the originator key set and the originator signer ids. Under ignore_unrecognised_signoffs
+    # (spec 1.3, 13.4.4), only an originator entry that is valid and recognised (a non-demo pin, or a roster key)
+    # contributes: a stranger's entry, valid under its own key or not checked, never makes a review self-verification
+    ignore = members.get("ignore_unrecognised_signoffs") is True
     orig_keys = set(_seal_signer_ids(b)) | set(members.get("originator_keys") or [])
     orig_ids = set(members.get("originator_signer_ids") or [])
     for x in entries:
-        if x["_shape_ok"] and x["role"] == "originator":
+        if x["_shape_ok"] and x["role"] == "originator" and (not ignore or _recognised_originator(x, pins, roster,
+                                                                                                  holder)):
             orig_keys.add(x["key_id"])
             orig_ids.add(x["signer_id"])
     orig_persons = {holder[k]["person_id"] for k in orig_keys if k in holder}
@@ -3695,6 +3781,16 @@ def _signoffs_finish(ctx: dict, as_of: str, archive: dict | None) -> dict:
     else:
         state = "ok" if entries else "none"
     return {"state": state, "checked": True, "problems": [], "entries": entries}
+
+
+def _recognised_originator(x: dict, pins: dict, roster: Any, holder: dict) -> bool:
+    """SPEC 10.3.8 step 10 under `ignore_unrecognised_signoffs` (spec 1.3): an originator entry counts toward the
+    originator key and signer-id sets only when it is `valid` (step 8) and its key is recognised, the roster status
+    step 12 gives it is `pinned_key` or `pinned_person`: pinned by a non-demo pin, or a roster person's key."""
+    kid = x.get("key_id")
+    if x.get("state") != "valid" or kid in _DEMO_KEY_IDS or pins.get(kid) is True:
+        return False
+    return bool(roster and kid in holder) or kid in pins
 
 
 def _eligible(x: dict, r: str, members: dict) -> bool:
@@ -3866,10 +3962,10 @@ AR_NOT_CHECKED_AFTER_UNVERIFIED = "not checked (after an unverified stamp)"
 AR_STAMP0_UNVERIFIED = "chain 0 stamp 0 is unverified: no pinned TSA anchors the archive (AR-14)"
 
 
-def _archive_out(state: str, problems=(), not_covered=(), chains=()) -> dict:
+def _archive_out(state: str, problems=(), not_covered=(), chains=(), tokens_not_covered=()) -> dict:
     return {"state": state, "t0": None, "t0_tsas": None, "min_tsas": None, "valid_until": None,
-            "continuous_at_as_of": None, "not_covered": list(not_covered), "chains": list(chains),
-            "problems": list(problems)}
+            "continuous_at_as_of": None, "not_covered": list(not_covered),
+            "tokens_not_covered": list(tokens_not_covered), "chains": list(chains), "problems": list(problems)}
 
 
 def _archive_structure_problem(ar: Any) -> str | None:
@@ -3879,13 +3975,20 @@ def _archive_structure_problem(ar: Any) -> str | None:
     if ar["schema"] != _ARCHIVE_SCHEMA:
         return f"archive schema must be {_ARCHIVE_SCHEMA!r} (AR-1)"
     obj = ar["object"]
-    if not (isinstance(obj, dict) and set(obj) == {"attestations"}):
-        return "archive object must be an object with exactly the key attestations (AR-2)"
+    if not (isinstance(obj, dict) and set(obj) in ({"attestations"}, {"attestations", "attestation_timestamps"})):
+        return ("archive object must be an object with the key attestations and, optionally, attestation_timestamps "
+                "(AR-2)")
     att = obj["attestations"]
     if not (isinstance(att, list) and len(att) <= _AR_MAX_DIGESTS and all(_is_digest(x) for x in att)):
         return f"archive object.attestations must be an array of 0 to {_AR_MAX_DIGESTS} well-formed digests (AR-2)"
     if any(not att[i] < att[i + 1] for i in range(len(att) - 1)):
         return "archive object.attestations must be unique and sorted by code point (AR-2)"
+    ats = obj.get("attestation_timestamps", [])
+    if not (isinstance(ats, list) and len(ats) <= _tsp.MAX_TOKENS and all(_is_digest(x) for x in ats)):
+        return (f"archive object.attestation_timestamps must be an array of 0 to {_tsp.MAX_TOKENS} well-formed "
+                "digests (AR-2)")
+    if any(not ats[i] < ats[i + 1] for i in range(len(ats) - 1)):
+        return "archive object.attestation_timestamps must be unique and sorted by code point (AR-2)"
     chains = ar["chains"]
     if not (isinstance(chains, list) and 1 <= len(chains) <= _AR_MAX_CHAINS):
         return f"archive chains must be an array of 1 to {_AR_MAX_CHAINS} chains (AR-3)"
@@ -3937,8 +4040,50 @@ def _present_entry_digests(bundle: dict) -> list[str]:
     return out
 
 
-def _archive_object(bundle: dict, listed: list[str]) -> tuple[bytes | None, str | None]:
-    """AR-7: (AO, None), or (None, the problem) when a seal token has no token_id."""
+def _entry_token_ids(entry: Any) -> list[str | None]:
+    """SPEC 10.8.3 AR-8 (spec 1.3): the token_id of each token in a sign-off entry's `timestamps`, in order, None for a
+    token that has none (not a TT-2 entry, or not a well-formed token). A `timestamps` member that is not an array
+    is one token with no token_id."""
+    if not isinstance(entry, dict) or "timestamps" not in entry:
+        return []
+    ts = entry["timestamps"]
+    if not isinstance(ts, list):
+        return [None]
+    out: list[str | None] = []
+    for e in ts:
+        try:
+            ok = isinstance(e, dict) and set(e) == {"format", "token"} and e["format"] == "rfc3161"
+            out.append(_tsp.parse_token_text(e["token"]).token_id if ok else None)
+        except (_tsp.Malformed, TypeError, ValueError):
+            out.append(None)
+    return out
+
+
+def _signoff_token_coverage(bundle: dict, listed: list[str], bound: list[str] | None) -> tuple[list[str], list[str]]:
+    """SPEC 10.8.3 AR-8 (spec 1.3): (tokens_not_covered, removed). ``bound`` is `object.attestation_timestamps`, or
+    None when the archive has no such member. A listed entry's tokens are covered when every one has a token_id in
+    ``bound``; `tokens_not_covered` lists, in order and once each, the digest of every listed entry with a token that
+    is not. When ``bound`` is None (the spec 1.2 form) it lists EVERY listed entry, with tokens or not (spec 1.3, fail
+    closed): that form binds no token, and a token-less entry under it cannot be told from one whose tokens were all
+    deleted, so it shows no coverage. `removed` lists the bound token_ids that no token of a listed entry has: a
+    token the archive binds was removed."""
+    atts = bundle.get("attestations")
+    seen: set[str] = set()
+    out: list[str] = []
+    for e in atts if isinstance(atts, list) else []:
+        d = _entry_sha256(e) if isinstance(e, dict) else None
+        if d is None or d not in listed:
+            continue
+        ids = _entry_token_ids(e)
+        seen.update(t for t in ids if t is not None)
+        if (bound is None or any(t is None or t not in bound for t in ids)) and d not in out:
+            out.append(d)
+    return out, [t for t in (bound or []) if t not in seen]
+
+
+def _archive_object(bundle: dict, listed: list[str], bound: list[str] | None = None) -> tuple[bytes | None, str | None]:
+    """AR-7: (AO, None), or (None, the problem) when a seal token has no token_id. ``bound`` (spec 1.3) is
+    `object.attestation_timestamps`, a member of AO only when the archive carries it."""
     ids: list[str] = []
     if "timestamps" in bundle:
         ts = bundle["timestamps"]
@@ -3953,10 +4098,12 @@ def _archive_object(bundle: dict, listed: list[str]) -> tuple[bytes | None, str 
                 return None, f"seal token {i} has no token_id ({exc}) (AR-7)"
     blocks = [bundle.get("signature")] + (bundle.get("signatures") if isinstance(bundle.get("signatures"), list)
                                            else [])
-    ao = _canon({"schema": _ARCHIVE_OBJECT_SCHEMA, "bundle_sha256": bundle.get("bundle_sha256"),
-                 "signatures": [blk.get("signature") if isinstance(blk, dict) else None for blk in blocks],
-                 "timestamps": ids, "attestations": list(listed)})
-    return ao, None
+    obj = {"schema": _ARCHIVE_OBJECT_SCHEMA, "bundle_sha256": bundle.get("bundle_sha256"),
+           "signatures": [blk.get("signature") if isinstance(blk, dict) else None for blk in blocks],
+           "timestamps": ids, "attestations": list(listed)}
+    if bound is not None:
+        obj["attestation_timestamps"] = list(bound)
+    return _canon(obj), None
 
 
 def _stamp_end(acc: list[dict], pins: dict[str, dict], members: dict) -> tuple[str | None, str | None]:
@@ -4012,16 +4159,21 @@ def _archive_dimension(bundle: Any, tok: dict, members: dict, as_of: str) -> dic
                 return _archive_out("malformed", [f"chain 0 stamp {k} token {j} is malformed: {exc} (AR-5)"])
         parsed.append(row)
     listed = ar["object"]["attestations"]                                           # step 3
+    bound = ar["object"].get("attestation_timestamps")
     present = _present_entry_digests(b)
     not_covered = [d for d in present if d not in listed]
-    ao, why = _archive_object(b, listed)
+    tokens_nc, removed = _signoff_token_coverage(b, listed, bound)
+    ao, why = _archive_object(b, listed, bound)
     problems = [why] if why else []
     excised = [d for d in listed if d not in present]
     if excised:
         problems.append(f"the archive lists {len(excised)} sign-off(s) not present in attestations, the first "
                         f"{excised[0]}: a listed sign-off was excised (AR-8)")
+    if removed:
+        problems.append(f"the archive binds {len(removed)} sign-off timestamp token(s) that no listed sign-off "
+                        f"carries, the first {removed[0]}: a bound token was removed (AR-8)")
     if problems:
-        return _archive_out("broken", problems, not_covered)
+        return _archive_out("broken", problems, not_covered, (), tokens_nc)
     pins = {p["id"]: p for p in tok["tsas"]}                                        # step 4
     imprint = hashlib.sha256(ao).digest()
     reports: list[list[dict]] = []
@@ -4069,17 +4221,17 @@ def _archive_dimension(bundle: Any, tok: dict, members: dict, as_of: str) -> dic
     classes_k = [r["class"] for r in rows]
     if "malformed" in classes_k:                                                    # AR-14
         k = classes_k.index("malformed")
-        return _archive_out("malformed", [f"chain 0 stamp {k} has a malformed token (AR-5)"], not_covered, chains)
+        return _archive_out("malformed", [f"chain 0 stamp {k} has a malformed token (AR-5)"], not_covered, chains, tokens_nc)
     if "invalid" in classes_k:
         k = classes_k.index("invalid")
-        return _archive_out("broken", [f"chain 0 stamp {k} is invalid (AR-14)"], not_covered, chains)
+        return _archive_out("broken", [f"chain 0 stamp {k} is invalid (AR-14)"], not_covered, chains, tokens_nc)
     if gaps:
-        return _archive_out("broken", gaps, not_covered, chains)
+        return _archive_out("broken", gaps, not_covered, chains, tokens_nc)
     if m1 == 0:
-        return _archive_out("not_checked", [AR_STAMP0_UNVERIFIED], not_covered, chains)
+        return _archive_out("not_checked", [AR_STAMP0_UNVERIFIED], not_covered, chains, tokens_nc)
     first, last = rows[0], rows[m1 - 1]
     u, d = last["_end"]
-    out = _archive_out("valid", [], not_covered, chains)
+    out = _archive_out("valid", [], not_covered, chains, tokens_nc)
     out.update(t0=first["time"], t0_tsas=first["_ntsas"], min_tsas=min(r["_ntsas"] for r in rows[:m1]),
                valid_until={"trusted_until": u, "distrusted_after": d},
                continuous_at_as_of=(u is None or as_of <= u) and (d is None or as_of < d), _t0=first["_t"],
@@ -4414,10 +4566,11 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
         notes = notes + [NOTE_SIGNOFF_TIMESTAMPS_NOT_REQUIRED]
     if origin_basis != "current":
         notes = notes + [NOTE_ORIGIN_ARCHIVE_RESCUE]
-    # SPEC 13.5 / 14 item 7: the sealed statistical band, as a verifier can check it (row 22). 13.7 item 4 (spec 1.2):
-    # a v4 band that cannot be checked because its quantity or sigma is a committed item is noted, since only
-    # require_reproduce_tolerance (row 24) rejects it
-    tolerance = (tolerance_report(bundle, profile) if integrity_ok else
+    # SPEC 13.5 / 14 item 7: the sealed statistical band, as a verifier can check it (row 22); a v4 bundle whose result
+    # section is withheld fails closed as `unusable` (spec 1.3). 13.7 item 4 (spec 1.2): a v4 band that cannot be
+    # checked because its quantity or sigma is a committed item is noted, since only require_reproduce_tolerance
+    # (row 24) rejects it
+    tolerance = (tolerance_report(bundle, profile, v4=cv == 3) if integrity_ok else
                  {"state": "not_checked", "problems": ["integrity does not hold"]})
     if cv == 3 and tolerance["state"] == "not_checked" and tolerance["problems"] == [TOL_COMMITTED_PROBLEM]:
         notes = notes + [NOTE_TOLERANCE_COMMITTED]
@@ -4974,9 +5127,21 @@ LINK_CYCLE = "cycle"
 #: INCOMPLETE (get a newer verifier), never a tamper FAIL -- the same distinction the single-bundle verdict
 #: makes. Without this the walker would collapse a legitimate newer-canon upstream into `FAIL`/"tampered".
 LINK_UNSUPPORTED_CANON = "unsupported-canon"
+#: SPEC 9.3 (spec 1.4): a reproduction record whose evaluated sign-off set is not the supplied upstream's: the record
+#: describes another copy of the same seal. Rank 1 (incomplete): never a pass, never a tamper FAIL.
+LINK_STALE = "stale"
 
 #: Chain verdicts.
 CHAIN_VERIFIED = "verified"
+#: A link's state rests on the upstream's seal, its origin under the root's trust inputs and the consumed value; the
+#: upstream's own sign-offs and accept decision are NOT applied to the link (SPEC-v4 9.3: "The decision of 13.4.2
+#: belongs to the root alone; the walk does not apply it to an upstream"), so a link's detail says so -- an upstream a
+#: reviewer signed off as rejected still walks `verified`. The v4 citation is given only on a canon-3 (v4) link; the
+#: v3 SPEC has no such sentence, so a v3 link says the fact without it.
+CHAIN_LINK_NOT_APPLIED = ("; the upstream's own sign-offs and decision are not applied to this link (verify the "
+                          "upstream on its own to see them)")
+CHAIN_LINK_NOT_APPLIED_V4 = ("; the upstream's own sign-offs and decision are not applied to this link (SPEC-v4 9.3: the "
+                             "decision belongs to the root; verify the upstream on its own to see them)")
 CHAIN_INTEGRITY_ONLY = "integrity-only"
 CHAIN_INCOMPLETE = "incomplete"
 CHAIN_FAIL = "fail"
@@ -4994,6 +5159,7 @@ _LINK_RANK = {
     LINK_UNRESOLVED: 1,
     LINK_CONSUMED_UNVERIFIABLE: 1,
     LINK_UNSUPPORTED_CANON: 1,          # fail-FORWARD: incomplete (get a newer verifier), not a tamper FAIL
+    LINK_STALE: 1,                      # the record evaluated another copy: incomplete, never a pass
     LINK_FAIL: 0,
     LINK_CONSUMED_MISMATCH: 0,
     LINK_CROSS_CAPABILITY_MISMATCH: 0,
@@ -5094,12 +5260,24 @@ def _candidate_rank(bundle: dict, judge: dict) -> tuple[int, int, int]:
     return (int(rep["integrity_ok"]), int(isinstance(res, dict) and "value" in res), int(rep["origin_ok"]))
 
 
-def index_upstreams(datas, *, profile=None, policy=None, pins=None, as_of: str | None = None) -> dict[str, str]:
+class ConflictingCopies(tuple):
+    """SPEC 9.3 (spec 1.4): the supplied, intact copies of ONE seal whose unsealed decision members (sign-offs, time
+    tokens, archive: `UNSEALED_DECISION_MEMBERS`) differ. The seal cannot tell them apart, so the index never picks one
+    (that would make the verdict depend on which copy was supplied first, or let the copy without a signed rejection
+    win on origin): `index_upstreams` maps the seal to this tuple of the copies, and any link to it is `stale`."""
+    __slots__ = ()
+
+
+def index_upstreams(datas, *, profile=None, policy=None, pins=None,
+                    as_of: str | None = None) -> dict[str, str | ConflictingCopies]:
     """Index candidate upstream bundles, each given as its BYTES or text, by their RECOMPUTED seal (a convenience to
     build a `resolve` from: `index_upstreams(...).get`, which returns the upstream's text). An unreadable candidate is
-    skipped. When two copies share a seal, the intact copy with its `result` present (then: signed under the pin)
-    wins; among equals the FIRST seen wins. Pass the same `policy` / `pins` / `as_of` as to `verify_chain`, so the
-    copy that wins is the one with origin under the receiver's trust inputs."""
+    skipped. When two copies share a seal and every intact one carries the same unsealed decision members, the intact
+    copy with its `result` present (then: signed under the pin) wins; among equals the FIRST seen wins (they differ in
+    nothing the decision reads). When intact copies of one seal carry DIFFERENT unsealed decision members, the seal
+    maps to a `ConflictingCopies` of their texts, never to one of them: `verify_chain` reads every link to it as
+    `stale`. Pass the same `policy` / `pins` / `as_of` as to `verify_chain`, so the copy that wins is the one with
+    origin under the receiver's trust inputs."""
     texts = {}
     parsed = []
     for d in datas:
@@ -5109,28 +5287,38 @@ def index_upstreams(datas, *, profile=None, policy=None, pins=None, as_of: str |
             continue
         texts[id(b)] = d if isinstance(d, str) else bytes(d).decode("utf-8")
         parsed.append(b)
-    return {seal: texts[id(b)] for seal, b in _index_upstreams_parsed(parsed, profile=profile, policy=policy,
-                                                                      pins=pins, as_of=as_of).items()}
+    out: dict[str, str | ConflictingCopies] = {}
+    for seal, b in _index_upstreams_parsed(parsed, profile=profile, policy=policy, pins=pins, as_of=as_of).items():
+        out[seal] = ConflictingCopies(texts[id(c)] for c in b) if isinstance(b, ConflictingCopies) else texts[id(b)]
+    return out
 
 
 def _index_upstreams_parsed(bundles, *, profile=None, policy=None, pins=None,
                             as_of: str | None = None) -> dict[str, dict]:
     """PRIVATE: `index_upstreams` over objects the caller parsed (see `_classify_parsed`)."""
     judge = {"profile": profile, "policy": policy, "pins": pins, "as_of": as_of}
-    index: dict[str, dict] = {}
-    ranks: dict[str, tuple[int, int, int]] = {}
+    groups: dict[str, list[dict]] = {}
     for b in bundles:
         seal = _seal_of(b)
-        if seal is None:
+        if seal is not None:
+            groups.setdefault(seal, []).append(b)
+    index: dict[str, Any] = {}
+    for seal, copies in groups.items():
+        if len(copies) == 1:
+            index[seal] = copies[0]
             continue
-        if seal not in index:
-            index[seal] = b
+        ranked = [(_candidate_rank(b, judge), b) for b in copies]
+        intact = [b for rank, b in ranked if rank[0]]
+        # SPEC 9.3 (spec 1.4): the unsealed decision members are outside the seal; intact copies that disagree on them
+        # are not interchangeable, so none is picked (a tampered copy is no copy of this seal and never conflicts)
+        if len({evaluated_signoffs_sha256(b) for b in intact}) > 1:
+            index[seal] = ConflictingCopies(intact)
             continue
-        if seal not in ranks:
-            ranks[seal] = _candidate_rank(index[seal], judge)
-        rank = _candidate_rank(b, judge)
-        if rank > ranks[seal]:
-            index[seal], ranks[seal] = b, rank
+        best = ranked[0]
+        for cand in ranked[1:]:
+            if cand[0] > best[0]:
+                best = cand
+        index[seal] = best[1]
     return index
 
 
@@ -5176,6 +5364,11 @@ def _citing_canon_version(citing: Any) -> int | None:
     if problem is None and not newer and version in _CANON:
         return version
     return None
+
+
+def _not_applied(citing_cv) -> str:
+    """The link-detail tail: the upstream's decision is not applied (with the SPEC-v4 9.3 citation on a v4 link only)."""
+    return CHAIN_LINK_NOT_APPLIED_V4 if citing_cv == 3 else CHAIN_LINK_NOT_APPLIED
 
 
 def _consumed_verdict(link: dict, up: dict, own_inputs: Any, citing_cv: int | None = 1) -> tuple[str, str] | None:
@@ -5338,14 +5531,19 @@ def verify_chain(data: bytes | str, resolve, *, profile=None, consumes_of=None, 
     with _int_digits():
         root = parse_bundle(data)
 
-        def resolve_parsed(seal):
-            up = resolve(seal)
-            if up is None:
-                return None
+        def parsed(up):
             try:
                 return parse_bundle(up)
             except (ValueError, RecursionError, TypeError):
                 return {}
+
+        def resolve_parsed(seal):
+            up = resolve(seal)
+            if up is None:
+                return None
+            if isinstance(up, ConflictingCopies):
+                return ConflictingCopies(parsed(u) for u in up)
+            return parsed(up)
         return _verify_chain_parsed(root, resolve_parsed, profile=profile, consumes_of=consumes_of, policy=policy,
                                     pins=pins, as_of=as_of, max_depth=max_depth, max_visited=max_visited)
 
@@ -5411,6 +5609,86 @@ def _verify_chain_parsed(bundle: Any, resolve, *, profile=None, consumes_of=None
     return report
 
 
+#: the bundle members OUTSIDE the seal that the decision reads: the sign-offs (attestations), the trusted-time tokens
+#: and the archive. Editing them never breaks the seal (a signed rejection can be appended to a sealed bundle), so a
+#: record of the decision binds their digest (`evaluated_signoffs_sha256`).
+UNSEALED_DECISION_MEMBERS = ("attestations", "timestamp", "timestamps", "archive")
+#: the capability of proof-core's sealed reproduction record (proof_core.certify.REPRODUCTION_CAPABILITY): its outputs
+#: name the subject seal and the digest of the subject's unsealed decision members it evaluated
+REPRODUCTION_RECORD_CAPABILITY = "proof:reproduction-record"
+
+
+def evaluated_signoffs_sha256(bundle: Any) -> str | None:
+    """sha256 of canon_1 of the unsealed decision members the bundle carries ({} when none), or None when it is not a
+    JSON object. Order-sensitive on purpose: a copy with the same sign-offs reordered reads as a different decision,
+    which fails closed; the entries are never sorted."""
+    if not isinstance(bundle, dict):
+        return None
+    return _sha(_canon({k: bundle[k] for k in UNSEALED_DECISION_MEMBERS if k in bundle}))
+
+
+def _record_outputs(citing: Any) -> Any:
+    """The record outputs sealed in the citing bundle's result (`result.result["proof:reproduction-record"]`), or None
+    when the result is withheld or holds no such member."""
+    core = _sealed_section(citing, "result")
+    res = core.get("result") if isinstance(core, dict) else None
+    return res.get(REPRODUCTION_RECORD_CAPABILITY) if isinstance(res, dict) else None
+
+
+def is_reproduction_record(citing: Any) -> bool:
+    """SPEC 9.3 (spec 1.4): is the citing bundle a reproduction record? Yes when either of its sealed sections marks it:
+    its inputs capability is `proof:reproduction-record`, or its result core's `result` map has a member of that name
+    (present, even as null). Either marker is enough. A `derived_from` link role is NOT a marker: a role is a free
+    producer identifier (SPEC 9.1 item 6), so an ordinary bundle may name a link `reproduced`. False also when the
+    result is withheld and the inputs do not mark it: the status is then undetermined, and the walk fails closed on
+    it (`_record_signoffs_verdict`), so withholding the result can never unmark a record."""
+    if _sealed_capability(citing) == REPRODUCTION_RECORD_CAPABILITY:
+        return True
+    core = _sealed_section(citing, "result")
+    res = core.get("result") if isinstance(core, dict) else None
+    return isinstance(res, dict) and REPRODUCTION_RECORD_CAPABILITY in res      # present, even as null, marks it
+
+
+def _record_signoffs_verdict(citing: Any, target: str, up: dict) -> tuple[str, str] | None:
+    """SPEC 9.3 (spec 1.4, D-3): a reproduction record (`is_reproduction_record`) states, under its seal, the
+    subject it evaluated (`subject_bundle_sha256`) and the digest of the subject's unsealed decision members it
+    evaluated (`subject_evaluated_signoffs_sha256`). Every link of a record is checked, and is `stale` (rank 1,
+    incomplete: never a pass) when the record's outputs cannot be read (result withheld or malformed), when they do
+    not name this link's seal as the subject (the record cites no subject), when the binding is missing, null or not
+    a `sha256:` digest (the record does not bind its evaluated sign-offs: a record minted before the binding existed
+    reads stale too), or when the supplied upstream's own unsealed members do not digest to it (the record describes
+    another copy of the subject, e.g. a clean one where this one carries a signed rejection). Never a tamper FAIL: a
+    record or upstream whose seal fails is caught earlier, as FAIL. FAIL CLOSED on an undetermined status: a citing
+    bundle whose result is withheld and whose inputs do not mark it a record (inputs capability renamed, or withheld
+    too) may still be a record whose only marker, the result member, is hidden; every one of its links is `stale`
+    ("record status cannot be determined: result withheld"), never a pass, in every canon. None when the citing
+    bundle is known to be no record, or the binding holds."""
+    if not is_reproduction_record(citing):
+        if _sealed_section(citing, "result") is _END:
+            return (LINK_STALE, ("record status cannot be determined: result withheld (the citing bundle may be a "
+                                 "reproduction record whose binding is hidden; its links are never a pass)"))
+        return None
+    outs = _record_outputs(citing)
+    if not isinstance(outs, dict):
+        return (LINK_STALE, ("the reproduction record's binding cannot be read (its result is withheld or holds no "
+                             f"{REPRODUCTION_RECORD_CAPABILITY!r} object): a record whose binding is unreadable is "
+                             "never a pass"))
+    subject = outs.get("subject_bundle_sha256")
+    if subject != target:
+        return (LINK_STALE, (f"the reproduction record cites no subject on this link: its subject_bundle_sha256 is "
+                             f"{_shown(subject)}, not this link's seal"))
+    sealed = outs.get("subject_evaluated_signoffs_sha256")
+    if not _is_digest(sealed):
+        return (LINK_STALE, ("the reproduction record does not bind its evaluated sign-offs "
+                             f"(subject_evaluated_signoffs_sha256 is {_shown(sealed)}, not a sha256: digest)"))
+    got = evaluated_signoffs_sha256(up)
+    if sealed != got:
+        return (LINK_STALE, (f"the reproduction record evaluated a different sign-off / time-token / archive set than "
+                           f"the supplied upstream carries (record subject_evaluated_signoffs_sha256 {_shown(sealed)}, "
+                           f"supplied {got}): its verdict does not describe this copy"))
+    return None
+
+
 def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, report: dict,
           ranks: list[int], state: dict, max_depth: int, max_visited: int, consumes_of, judge: dict) -> None:
     _, prov = _sealed_provenance(citing)
@@ -5442,6 +5720,13 @@ def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, 
             _finish(entry, ranks, LINK_UNRESOLVED, "no supplied bundle has this seal")
             continue
         state["visited"].add(target)
+        if isinstance(up, ConflictingCopies):
+            # SPEC 9.3 (spec 1.4): any link, record or not: never pick one of the disagreeing copies
+            _finish(entry, ranks, LINK_STALE,
+                    (f"conflicting upstream copies: {len(up)} supplied copies of this seal carry different sign-off / "
+                     "time-token / archive sets; the walk does not pick one (supply only the copy this chain is "
+                     "about)"))
+            continue
         rep = state["classified"].get(target)           # one Ed25519 verify per DISTINCT upstream
         if rep is None:
             rep = state["classified"][target] = _classify_chain(up, **judge)
@@ -5465,13 +5750,15 @@ def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, 
             continue
         entry["upstream_capability"] = _sealed_capability(up)
         verdict = (_consumed_verdict(link, up, own_inputs, citing_cv) or _structural_verdict(link, up)
-                   or _consumes_verdict(citing_cap, up, allowed))
+                   or _consumes_verdict(citing_cap, up, allowed)
+                   or _record_signoffs_verdict(citing, target, up))
         if verdict is not None:
             _finish(entry, ranks, *verdict)
             continue
         signer_hex = (rep["signer"] or "").removeprefix("ed25519:")
         if rep["origin_ok"]:
-            _finish(entry, ranks, LINK_VERIFIED, "integrity + origin; consumed value matches on both ends")
+            _finish(entry, ranks, LINK_VERIFIED, "integrity + origin; consumed value matches on both ends"
+                    + _not_applied(citing_cv))
         else:
             _finish(entry, ranks, LINK_INTEGRITY_ONLY,
                     # the verdict's own origin problem names the real reason (a quorum short, an aged suite, no
@@ -5479,7 +5766,7 @@ def _walk(citing: dict, citing_seal: str, depth: int, path: frozenset, resolve, 
                     ((f"untampered, but origin NOT established: {rep['origin_problems'][0]} (signed by "
                       f"{rep['signer']})") if rep.get("origin_problems") else
                      f"untampered, but signed by {key_label(signer_hex)} -- origin NOT established")
-                    + "; a production-signed downstream does not launder it")
+                    + "; a production-signed downstream does not launder it" + _not_applied(citing_cv))
         if rep["chain"] == "unknown":
             _note(report, state, f"upstream {target} has its provenance withheld: its own derived_from "
                                  "links (if any) are invisible, so the chain beyond it is unknown")

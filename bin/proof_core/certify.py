@@ -22,6 +22,13 @@ finish (a composed capability whose sub-steps are not available, or a missing da
 different thing -- `certify_bundle` catches it and reports `reproduce_error`, and it must not be read
 as a result-core mismatch (a possible forgery). `reproduced` is true ONLY on a genuine match.
 
+ONE GATE. Whether the bundle is accepted is never decided here: `reproduce_bundle`, `certify_bundle` and
+`seal_certification` ask `proof_verify.gate.gate` -- the SAME decision `proof-verify` makes for the same bytes and the
+same receiver trust inputs (`policy`, `pins`, `as_of`, `profile`) -- and report it as `gate`. `verified` is that
+gate's pass (proof-verify exit 0: intact, signed under a non-demo pin of the receiver, every sign-off valid, accepted
+by the receiver's policy), never a looser integrity-and-origin reading. A bundle verify rejects (a signed rejection,
+a forged sign-off, an aged suite under the receiver's policy) is never `verified` and never `certified`.
+
 REPRODUCE CHECKS INTEGRITY FIRST. The library API refuses to re-derive a bundle whose INTEGRITY fails
 (a hash/seal problem, or a signature that is invalid under the bundle's own key -- edited, forged,
 malformed): the report then carries `unverified: True` and `reproduced: False`, so a `reproduced` read
@@ -138,6 +145,31 @@ ENV_INFORMATIONAL = ("data_index_sha256",)
 ENV_RUN_CONTROLS = ("samples", "iterations", "warmup", "batch_seed", "rng_seed", "seed")
 #: Top-level sealed-provenance pins compared hard.
 ENV_TOP_PINS = ("data_library", "data_library_sha256", "rng_seed", "produced_by")
+
+
+#: Why a re-derived result is still NOT `reproduced` (the same names in the library report, proof-reproduce's
+#: `shortfalls` and the Adapter): `reproduced` is True only when the result core and claim re-derive
+#: (`result_rederived`) AND none of these applies.
+SHORTFALL_GATE = "gate_not_passed"                     # proof-verify would not exit 0 under the receiver's trust inputs
+SHORTFALL_INPUTS = "inputs_not_identical"              # the re-run did not use the sealed inputs
+SHORTFALL_ENVIRONMENT = "environment_mismatch"         # a sealed environment pin differs
+SHORTFALL_ENV_UNVERIFIABLE = "environment_unverifiable"  # the sealed or fresh data environment was never pinned
+
+
+def reproduction_shortfalls(report: dict) -> list[str]:
+    """The shortfalls of a reproduce report, in a fixed order. `environment_unverifiable` is not counted for an
+    outputs-only reproducer (proof-reproduce --command), which cannot capture its environment by construction and
+    is never a full reproduction anyway (`claims_not_rederived`)."""
+    out = []
+    if report.get("verified") is not True:
+        out.append(SHORTFALL_GATE)
+    if report.get("inputs_identical") is not True:
+        out.append(SHORTFALL_INPUTS)
+    if report.get("environment_mismatch"):
+        out.append(SHORTFALL_ENVIRONMENT)
+    if report.get("environment_unverifiable") and report.get("outputs_only") is not True:
+        out.append(SHORTFALL_ENV_UNVERIFIABLE)
+    return out
 
 
 class ReproduceError(RuntimeError):
@@ -606,7 +638,33 @@ def _sealed_provenance_of(bundle: dict):
     return block.get("value") if isinstance(block, dict) else None
 
 
-def reproduce_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None) -> dict:
+def _gate_fields(data, profile, policy, pins, as_of) -> tuple[dict, object]:
+    """The ONE gate's decision on ``data`` (`proof_verify.gate.gate`) and the verify fields every report carries."""
+    from proof_verify.gate import gate
+    from proof_verify.verify import pinned_key_is_demo
+
+    decision = gate(data, policy, pins, as_of, profile=profile)
+    ver = decision.report
+    return {
+        # the gate's pass, exactly proof-verify's exit 0 for these bytes under these trust inputs (never a separate,
+        # looser integrity-and-origin reading): a rejected or integrity-only bundle is never `verified`
+        "verified": decision.passed,
+        "integrity_ok": ver["integrity_ok"],
+        "origin_ok": ver["origin_ok"],
+        # surfaced so a consumer sees WHY origin is unproven: while the pin is the public demo identity
+        # origin_ok is False even for a pin-signed bundle, so `verified`/`certified` are never origin.
+        # an `unreadable` verdict (SPEC 13.1) carries no signer and no pin facts: read them with .get so
+        # unreadable bytes give the not-attempted report below, never a KeyError
+        "pinned_key_is_demo": ver.get("pinned_key_is_demo", pinned_key_is_demo()),
+        "signer": ver.get("signer"),
+        "verify_problems": ver["problems"],
+        # the whole decision: proof-verify's single-bundle exit code, the rejecting reasons, the policy digest
+        "gate": decision.summary(),
+    }, decision
+
+
+def reproduce_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None, policy=None, pins=None,
+                     as_of: str | None = None) -> dict:
     """Check INTEGRITY, then re-derive `bundle` by running its capability on its recorded inputs; compare.
 
     `runner` is the consumer-injected reproduce harness (contract.ReproduceRunner): the domain-agnostic
@@ -620,6 +678,10 @@ def reproduce_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None
     pinned key MUST pass its `Profile` here, or the integrity check inside falls back to the neutral
     dialect and the bundle is never re-derived (the proven integration blocker this closes). `profile=None`
     (the default) resolves to the neutral dialect, so every existing call is byte- and behaviour-identical.
+
+    `policy` / `pins` / `as_of` are the RECEIVER's trust inputs, handed to the one gate (`proof_verify.gate.gate`)
+    exactly as `proof-verify` uses them (None / None: the single-pin path under the module pin). The report's `gate`
+    is that decision and `verified` is its pass; a malformed policy raises PolicyError before anything is run.
 
     Returns a report: {capability, reproduced (result core re-derives), inputs_identical (the re-run
     used the sealed inputs, not substituted ones), reproduce_detail, claim_drift (sealed fidelity / verdict /
@@ -639,27 +701,11 @@ def reproduce_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None
     ``bundle_bytes(b)``). A parsed object raises TypeError, so no re-serialization path hides the duplicate keys of
     the bytes a reviewer received.
     """
-    from proof_verify.verify import (  # the independent verifier (no kernel import)
-        classify_bundle,
-        pinned_key_is_demo,
-    )
-
     from .envelope import received_bundle
     data, bundle = received_bundle(data, "reproduce_bundle")
-    ver = classify_bundle(data, profile=profile)     # the verifier reads the bytes (SPEC 4)
-    verify_fields = {
-        "verified": ver["integrity_ok"] and ver["origin_ok"],   # integrity + origin, as verify_bundle
-        "integrity_ok": ver["integrity_ok"],
-        "origin_ok": ver["origin_ok"],
-        # surfaced so a consumer sees WHY origin is unproven: while the pin is the public demo identity
-        # origin_ok is False even for a pin-signed bundle, so `verified`/`certified` are never origin.
-        # an `unreadable` verdict (SPEC 13.1) carries no signer and no pin facts: read them with .get so
-        # unreadable bytes give the not-attempted report below, never a KeyError
-        "pinned_key_is_demo": ver.get("pinned_key_is_demo", pinned_key_is_demo()),
-        "signer": ver.get("signer"),
-        "verify_problems": ver["problems"],
-    }
-    if not ver["integrity_ok"]:
+    # the verifier reads the bytes (SPEC 4), through the ONE gate proof-verify itself uses
+    verify_fields, _decision = _gate_fields(data, profile, policy, pins, as_of)
+    if not verify_fields["integrity_ok"]:
         # best-effort capability name for the report; the bundle may be arbitrarily malformed here
         # (verify already returned a closed verdict on it), so never trust its shape
         manifest = bundle.get("manifest") if isinstance(bundle, dict) else None
@@ -670,6 +716,8 @@ def reproduce_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None
         return {
             "capability": capability,
             "reproduced": False,
+            "result_rederived": False,
+            "shortfalls": [],
             "inputs_identical": False,          # never re-run, so the sealed inputs were not re-derived
             "unverified": True,
             **verify_fields,
@@ -752,9 +800,13 @@ def _reproduce_compare(bundle, runner, spec, capability, orig_core, run_inputs, 
     except ValueError:
         inputs_identical = False
     environment = _compare_environment(sealed_prov, fresh_prov, profile=profile)
-    return {
+    report = {
         "capability": capability,
-        "reproduced": result_match,
+        # `reproduced` is the ONE reproduction verdict, the same rule as proof-reproduce's exit 0 (filled in below):
+        # the result core and claim re-derive AND the gate passes AND the sealed inputs were used AND the
+        # environment is pinned and matches. The raw comparison alone is `result_rederived`.
+        "reproduced": False,
+        "result_rederived": result_match,
         "inputs_identical": inputs_identical,   # the re-run used the sealed inputs, not substituted ones
         "unverified": False,                    # integrity held, so the re-derivation was attempted
         **verify_fields,
@@ -777,16 +829,24 @@ def _reproduce_compare(bundle, runner, spec, capability, orig_core, run_inputs, 
         # the certification record; a transient re-derivation.
         "fresh_bundle": fresh,
     }
+    shortfalls = reproduction_shortfalls(report)
+    report["shortfalls"] = shortfalls if result_match else []
+    report["reproduced"] = bool(result_match and not outputs_only and not shortfalls)
+    return report
 
 
-def certify_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None) -> dict:
+def certify_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None, policy=None, pins=None,
+                   as_of: str | None = None) -> dict:
     """VERIFY + REPRODUCE, returning an attestation record (evidence.certification.v1).
 
     `runner` is the consumer-injected reproduce harness (see `reproduce_bundle`).
     `profile` (optional, duck-typed, additive) selects the on-disk dialect for the integrity/origin check
     and the re-derivation; `profile=None` (the default) is the neutral dialect, byte/behaviour-unchanged.
 
-    `certified` is true iff the bundle verifies under the pinned key (integrity AND origin) AND its
+    `policy` / `pins` / `as_of` are the receiver's trust inputs for the one gate (see `reproduce_bundle`).
+
+    `certified` is true iff the bundle passes the ONE gate (`verified`: proof-verify's exit 0 under the receiver's
+    trust inputs -- integrity, origin under the receiver's pins, valid sign-offs, an accepting decision) AND its
     result core re-derives from the open engine AND the re-run honored the SEALED inputs
     (`inputs_identical`: a runner that substitutes inputs or ignores a sealed threshold never certifies)
     AND the re-run's environment matches the sealed pins (no `environment_mismatch`, no
@@ -799,19 +859,25 @@ def certify_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None) 
     is False.
     """
     from proof_verify.verify import (  # the independent verifier (no kernel import)
-        classify_bundle,
         pinned_key_fingerprint,
         pinned_key_is_demo,
     )
 
     from .envelope import received_bundle
     data, bundle = received_bundle(data, "certify_bundle")   # bytes or text (SPEC 4); a parsed object: TypeError
-    ver = classify_bundle(data, profile=profile)     # the verifier reads the bytes (SPEC 4)
+    if as_of is None:
+        # ONE evaluation instant for this gate and the one reproduce_bundle runs below (never straddle trusted_until)
+        from proof_verify.verify import utc_now
+        as_of = utc_now()
+    gate_fields, decision = _gate_fields(data, profile, policy, pins, as_of)   # the ONE gate (SPEC 4: the bytes)
+    ver = decision.report
     record = {
         # a dialect brands its own certification-record schema; None/default -> the neutral tag.
         "schema": getattr(profile, "certification_schema", None) or CERTIFICATION_SCHEMA,
         "bundle_sha256": bundle.get("bundle_sha256") if isinstance(bundle, dict) else None,
-        "verified": ver["integrity_ok"] and ver["origin_ok"],   # integrity + origin (verify_bundle's ok)
+        # the ONE gate's pass (proof-verify exit 0 under the receiver's trust inputs), never a looser reading
+        "verified": decision.passed,
+        "gate": gate_fields["gate"],
         "verify_problems": ver["problems"],
         # the two halves of `verified`, separately: an intact record signed under a non-pinned key is
         # integrity_ok / not origin_ok -- re-derivable, but never certified (origin is unproven)
@@ -836,6 +902,8 @@ def certify_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None) 
         # `reproduced_bundle_sha256` off a redacted-inputs / unavailable-capability record would KeyError.
         "capability": None,
         "reproduced": False,
+        "result_rederived": False,
+        "shortfalls": [],
         "inputs_identical": False,
         "reproduce_detail": {},
         "claim_drift": {},
@@ -850,10 +918,12 @@ def certify_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None) 
     }
     environment_ok = False
     try:
-        repro = reproduce_bundle(data, runner, profile=profile)
+        repro = reproduce_bundle(data, runner, profile=profile, policy=policy, pins=pins, as_of=as_of)
         record.update({
             "capability": repro["capability"],
             "reproduced": repro["reproduced"],
+            "result_rederived": repro["result_rederived"],
+            "shortfalls": repro["shortfalls"],
             "inputs_identical": repro["inputs_identical"],
             "reproduce_detail": repro["reproduce_detail"],
             "claim_drift": repro["claim_drift"],
@@ -873,7 +943,8 @@ def certify_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None) 
         # the re-run started but could not finish (composed capability missing a sub-step, missing data
         # dependency, ...). This is NOT a result-core mismatch -> `reproduced` stays unknown, never a
         # silent False that reads like a forgery.
-        record.update({"reproduced": None, "reproduce_error": f"{type(exc).__name__}: {exc}"})
+        record.update({"reproduced": None, "result_rederived": None,
+                       "reproduce_error": f"{type(exc).__name__}: {exc}"})
 
     # A MATERIAL metadata drift (the fresh re-run's result self-declares a different verdict or fidelity
     # tier than the sealed core) must not ride under certified:True -- a downgrade would otherwise sit in a
@@ -884,7 +955,8 @@ def certify_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None) 
     # unsigned report, not a profile knob.
     metadata_conflict = _material_metadata_conflict(record.get("reproduce_detail"))
     record["metadata_conflict"] = metadata_conflict
-    # an outputs-only reproduction (the claim fields were copied, not re-derived) never certifies
+    # an outputs-only reproduction (the claim fields were copied, not re-derived) never certifies; `verified` is the
+    # ONE gate's pass, so a bundle proof-verify rejects is never certified (certified = gate AND reproduced AND ...)
     record["certified"] = bool(
         record["verified"] and record.get("reproduced") and not record.get("outputs_only")
         and record.get("inputs_identical") and environment_ok and not metadata_conflict
@@ -893,9 +965,15 @@ def certify_bundle(data: bytes | str, runner: ReproduceRunner, *, profile=None) 
 
 
 def seal_certification(data: bytes | str, runner: ReproduceRunner, *, role: str = "reproduced",
-                       profile=None, canon_version: int | None = None) -> dict:
+                       profile=None, canon_version: int | None = None, policy=None, pins=None,
+                       as_of: str | None = None) -> dict:
     """Run certify over `bundle` and SEAL the reproduction verdict into its OWN signed evidence bundle,
     cryptographically CHAINED to the subject via the existing `derived_from` mechanism.
+
+    `policy` / `pins` / `as_of` are the receiver's trust inputs for the ONE gate (see `certify_bundle`): the record's
+    `certified` is never True for a subject that gate does not pass, and the record carries the gate's verdict
+    (`verified`, `gate_exit_code`, `gate_reasons`), so no signed `certified: true` is minted for a bundle proof-verify
+    rejects.
 
     `canon_version` (ADR-054) selects the record's canon; None (default) uses the SUBJECT's sealed canon. A
     record may not use a LOWER canon than its subject (the mint refuses a v1 link to a v2 upstream).
@@ -935,7 +1013,7 @@ def seal_certification(data: bytes | str, runner: ReproduceRunner, *, role: str 
         raise ValueError(  # noqa: TRY004 -- a redacted/malformed subject is a value precondition, not a caller type bug
             "cannot seal a reproduction record: the subject must carry its sealed result core "
             "and sha256sums to bind to (a subject with its result redacted cannot be sealed)")
-    record = certify_bundle(data, runner, profile=profile)
+    record = certify_bundle(data, runner, profile=profile, policy=policy, pins=pins, as_of=as_of)
     reproduced = record.get("reproduced")
     # the subject's capability scopes the binding pointer /result/<cap>; the walker cross-checks it against
     # the upstream's sealed kind, so take it from the reproduce record and confirm it keys the result map.
@@ -958,11 +1036,27 @@ def seal_certification(data: bytes | str, runner: ReproduceRunner, *, role: str 
     outputs = {
         "subject_bundle_sha256": subject_seal,
         "subject_capability": record.get("capability"),
-        "reproduced": reproduced,                       # True / False / None (could not be attempted)
+        # True only by proof-reproduce's exit-0 rule (gate AND re-derived AND inputs identical AND environment ok);
+        # False / None (could not be attempted). The raw result-core comparison alone is `result_rederived`.
+        "reproduced": reproduced,
+        "result_rederived": record.get("result_rederived"),
+        "shortfalls": list(record.get("shortfalls") or []),
         "inputs_identical": record.get("inputs_identical"),
         "environment_ok": bool((record.get("environment") or {}).get("ok")),
-        "certified": record.get("certified"),
+        "certified": record.get("certified") is True and record.get("verified") is True,
         "mode": (record.get("reproduce_detail") or {}).get("mode"),
+        # the ONE gate's verdict on the subject (proof-verify's single-bundle exit code under the trust inputs used)
+        "verified": record.get("verified") is True,
+        "gate_exit_code": (record.get("gate") or {}).get("exit_code"),
+        "gate_reasons": list((record.get("gate") or {}).get("reasons") or []),
+        # WHAT produced that gate verdict, so the record cannot be re-presented for the same subject seal under other
+        # trust inputs or with other sign-offs (a signed rejection appended after a clean-copy record was minted):
+        # the policy digest, the evaluation instant, the effective pin set's digest, and the digest of the subject's
+        # unsealed decision members (sign-offs, time tokens, archive) as evaluated -- see proof_verify.gate
+        "gate_policy_sha256": (record.get("gate") or {}).get("policy_sha256"),
+        "gate_as_of": (record.get("gate") or {}).get("as_of"),
+        "gate_pins_sha256": (record.get("gate") or {}).get("pins_sha256"),
+        "subject_evaluated_signoffs_sha256": (record.get("gate") or {}).get("evaluated_signoffs_sha256"),
     }
     if record.get("reproduce_error"):
         outputs["reproduce_error"] = record["reproduce_error"]
@@ -974,9 +1068,10 @@ def seal_certification(data: bytes | str, runner: ReproduceRunner, *, role: str 
         caveats=(
             ("this record attests that a reproduction was RUN and what it returned; it does NOT attest that "
              "the subject's result is correct. Re-verify the subject independently by its sealed digest."),
-            ("the headline verdict reflects the RESULT-CORE match only (reproduced); inputs_identical, "
-             "environment_ok and certified are SEPARATE axes carried in this record's outputs -- read them, "
-             "not the verdict alone, to judge whether the re-run matched the sealed case and environment."),
+            ("the headline verdict is `reproduced`: pass only when the subject passed verify under the named trust "
+             "inputs (gate_policy_sha256, gate_as_of, gate_pins_sha256) AND its result re-derived from its sealed "
+             "inputs in a matching environment. It holds only for the subject carrying exactly the sign-offs whose "
+             "digest is subject_evaluated_signoffs_sha256; a copy carrying other sign-offs is a different decision."),
         ),
     )
     from proof_core import __version__

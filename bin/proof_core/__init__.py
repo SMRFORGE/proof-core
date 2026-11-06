@@ -21,7 +21,7 @@ sibling ``proof_verify`` package -- keep it separate so verification never trust
 The on-disk schema carries a domain-neutral ``evidence.*`` namespace (e.g. ``evidence.envelope.v3``);
 the spine is domain-agnostic and names nothing about any particular producer.
 """
-from .adapter import Adapter
+from .adapter import Adapter, Rerun
 from .attest import ATTESTATION_SCHEMA, add_signoff, attest_bundle, make_attestation, make_signoff
 from .certify import (
     REPRODUCTION_CAPABILITY,
@@ -47,7 +47,7 @@ from .testing import assert_integration
 
 #: Single source of truth for the version. pyproject derives the dist version from this
 #: (see [tool.setuptools.dynamic]). Independent of any consumer's version line.
-__version__ = "0.28.0"
+__version__ = "0.29.0"
 
 __all__ = [
     "ATTESTATION_SCHEMA",
@@ -59,6 +59,7 @@ __all__ = [
     "Profile",
     "ReproduceError",
     "ReproduceRunner",
+    "Rerun",
     "Result",
     "SealedFunction",
     "Verdict",

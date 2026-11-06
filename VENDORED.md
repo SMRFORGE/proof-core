@@ -5,9 +5,9 @@ packages from the open proof-core repository. They are NEVER edited in this
 plugin; fixes go upstream, then re-vendor.
 
 - **Upstream:** https://gitlab.com/proof-core/proof-core (MIT)
-- **Version:** 0.28.0
-- **main commit:** be8fa50 (tag v0.28.0)
-- **Vendored:** 2026-11-04
+- **Version:** 0.29.0
+- **main commit:** 3f21ff1e55d06b2f07339f395ec8ccb9fce0707e (tag v0.29.0)
+- **Vendored:** 2026-11-05
 
 ## Why vendored
 

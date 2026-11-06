@@ -7,7 +7,7 @@
 **Give a Claude Code agent three verbs: seal a result, verify a record, re-run it.** Not "trust us". Check us.
 
 Repo: `gitlab.com/proof-core/skill` · MIT · a Claude Code plugin with one Agent Skill · Python 3.11+ standard
-library · plugin v0.7.0 · vendors [proof-core](https://gitlab.com/proof-core/proof-core) 0.28.0 · no install,
+library · plugin v0.8.0 · vendors [proof-core](https://gitlab.com/proof-core/proof-core) 0.29.0 · no install,
 no network, no account
 
 ## What this is
@@ -79,7 +79,8 @@ flowchart LR
     B --> V["verify<br/>python -P -m proof_core verify<br/>offline, no producer code"]
     V -->|"exit 1: edited or malformed"| X["stop: do not trust it"]
     V -->|"exit 3 (demo key) or 0: unedited"| R["reproduce<br/>re-run your tool on the<br/>sealed inputs"]
-    R -->|"exit 0 (--runner)"| OK["the result re-derives<br/>(still not proven correct)"]
+    R -->|"exit 0 (--runner, production key)"| OK["the result re-derives<br/>(still not proven correct)"]
+    R -->|"exit 7 (e.g. demo key)"| PART7["numbers re-derive, but origin, inputs<br/>or environment not established:<br/>partial, NOT a pass"]
     R -->|"exit 3 (--command)"| PART["outputs match, sealed claims<br/>not re-derived: partial, NOT a pass"]
     R -->|"exit 1"| NR["it does not re-derive"]
 ```
@@ -88,10 +89,10 @@ What the plugin bundles:
 
 ```mermaid
 flowchart TB
-    subgraph plugin["proof-core plugin 0.7.0"]
+    subgraph plugin["proof-core plugin 0.8.0"]
         MAN[".claude-plugin/<br/>plugin.json, marketplace.json"]
         SKILL["skills/proof-core/SKILL.md<br/>when and how to seal, verify, reproduce"]
-        subgraph bin["bin/ (proof-core 0.28.0, verbatim, MIT)"]
+        subgraph bin["bin/ (proof-core 0.29.0, verbatim, MIT)"]
             PC["proof_core<br/>seal and reproduce"]
             PV["proof_verify<br/>the standalone verifier"]
         end
@@ -113,12 +114,17 @@ inside the bundle's folder.
 - **verify** a bundle offline: the hashes recompute and the signature checks. This is a standalone second
   implementation (`proof_verify`) that imports no producer code.
 - **reproduce** a bundle by re-running the work on its sealed inputs and confirming the result re-derives.
+  It decides acceptance through the same gate as verify, under the same trust inputs. Exit 0 needs that gate to
+  pass (a real pinned production key), the sealed inputs and a pinned, matching data environment. Under the
+  public demo key a re-run whose numbers match exits 7 (partial), never 0.
 
 ## Limits, stated plainly
 
 - **A seal proves the record is unaltered; `reproduce` is what shows it re-derives.** Sealing runs nothing.
   Only `reproduce` exit 0 shows the result re-derives from its sealed inputs; exit 3 (`--command`) means the
-  outputs matched but the sealed claims were not re-derived, a partial result and not a pass. Neither proves
+  outputs matched but the sealed claims were not re-derived, and exit 7 means the numbers re-derived but the
+  gate did not pass (the demo key, for one), other inputs were used, or the data environment was not pinned or
+  differs. Both are partial results, not a pass. Neither proves
   the result is correct, nor that the agent actually ran what it claims. Catching that needs independent
   reproduction by a party the producer does not control.
 - **The public build pins a demo key**, so verify reports "integrity-only" (exit 3). That is the normal result
@@ -167,11 +173,11 @@ flowchart LR
 
 | Repo | Use it to |
 |---|---|
-| [proof-core](https://gitlab.com/proof-core/proof-core) | v0.28.0, the Python kernel and verifier: seal, verify and reproduce any computed result (standard library only), envelope v3 and v4 |
+| [proof-core](https://gitlab.com/proof-core/proof-core) | v0.29.0, the Python kernel and verifier: seal, verify and reproduce any computed result (standard library only), envelope v3 and v4 |
 | [proof-core-kernel-js](https://gitlab.com/proof-core/proof-core-kernel-js) | v0.10.0 (`@proof-core/verify`), the JavaScript verifier: verify bundles in Node or a browser, with no dependencies |
 | [envelope-spec](https://gitlab.com/proof-core/envelope-spec) | v1.2.0, the spec and its corpus: the bundle format's written standard, JSON Schema, and 691 conformance vectors to test any verifier against |
 | [proof-mcp](https://gitlab.com/proof-core/proof-mcp) | v0.9.1, MCP receipts and an evidence server: receipt format v2 with a coverage section, code-mode receipts and loop receipts for ordinary tool-calling loops, MCP over stdio and streamable HTTP, async hosts, `proof-accept` to accept or reject a sealed run, and `proof-mcp serve`, an evidence MCP server |
-| [skill](https://gitlab.com/proof-core/skill) | v0.7.0, the Claude Code plugin: give an agent seal, verify and reproduce as a skill, with proof-core 0.28.0 bundled so it runs offline |
+| [skill](https://gitlab.com/proof-core/skill) | v0.8.0, the Claude Code plugin: give an agent seal, verify and reproduce as a skill, with proof-core 0.29.0 bundled so it runs offline |
 | [pytest-proof-core](https://gitlab.com/proof-core/pytest-proof-core) | v0.1.0, sealed test outcomes: seal each test's outcome and re-check it later in CI |
 | [pytest-proof-core-plugin](https://gitlab.com/proof-core/pytest-proof-core-plugin) | v0.3.0, sealed test outcomes for Claude Code: pytest-proof-core packaged as a plugin (it bundles proof-core 0.24.0) |
 

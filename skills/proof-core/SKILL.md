@@ -3,7 +3,7 @@ name: proof-core
 description: Seal a computed result into a tamper-evident, independently re-runnable evidence bundle, and verify or reproduce one. Use when an agent produces a result (a number, a decision, a test or evaluation outcome, a file digest) that someone downstream has to trust and may need to re-run or audit later. Seals the result with its inputs so a neutral party can re-derive it offline, with no account and no network. Not a correctness check and not a logger; it makes a result re-runnable and tamper-evident, nothing more.
 license: MIT
 metadata:
-  wraps: proof-core 0.28.0 (vendored, MIT)
+  wraps: proof-core 0.29.0 (vendored, MIT)
   offline: true
 ---
 
@@ -182,11 +182,33 @@ Never point at a runner inside the bundle's folder. If `--runner mypkg.module:..
 `No module named 'mypkg'`, your project isn't on `PYTHONPATH`: add its absolute path. Don't `cd` into
 the bundle folder to make it resolve.
 
-Exit codes: `0` reproduced (`--runner`: the numbers and the sealed claim re-derive), `1` not
-reproduced (or integrity failed, so it was never re-run), `2` usage / unreadable bundle, `3`
-outputs reproduced but the sealed claims NOT re-derived (`--command` only; a partial result,
-never a pass). `--json` emits a parseable verdict with the same
-`kind`/`exit_code`/`state` fields.
+Whether the bundle is accepted is `verify`'s decision: `reproduce` takes the same trust inputs
+(`--pubkey HEX`, `--policy FILE`, an absolute `PROOF_POLICY`, `--no-policy-discovery`,
+`--expect-policy sha256:HEX`, `--allow-self-verify`, `--as-of T`) and reports that decision as `gate`.
+
+Exit codes (gate on `exit_code`, never the `state` string):
+
+| code | meaning |
+|---|---|
+| 0 | reproduced (`--runner` only), and ONLY when all three hold: verify would exit 0 for this bundle under your trust inputs (a real pinned production key, never the demo key), the re-run used the sealed inputs, and the sealed data environment is pinned and matches. The numbers and the sealed claim re-derive. |
+| 1 | NOT reproduced: the numbers or the claim do not re-derive, or verify fails the bundle closed (edited, a signed rejection, an invalid sign-off). A bundle whose integrity fails is never re-run. |
+| 2 | usage error, unreadable bundle, unusable `--runner`, or a receiver policy that is malformed, unreadable or not the one `--expect-policy` names |
+| 3 | outputs reproduced, sealed claims NOT re-derived (`--command` only): a partial result, never a pass |
+| 4 | unsupported canon: never re-run; use a newer verifier |
+| 6 | unsupported signature suite: never re-run; use a newer verifier |
+| 7 | PARTIAL, not reproduced: the numbers re-derive, but the gate did not pass (e.g. the public demo key), the re-run used other inputs, or the data environment differs or was never pinned. `shortfalls` names which (`gate_not_passed`, `inputs_not_identical`, `environment_mismatch`, `environment_unverifiable`). Never a pass. |
+
+**Under the public demo key a re-run whose numbers match exits 7, not 0**: origin is not
+established, so it is not a reproduction. Report it as "the numbers re-derive (partial)", never as
+"reproduced". `--json` emits the verdict with `kind`/`exit_code`/`state`; `reproduced` is true only
+for exit 0, and `outputs_reproduced` is true whenever the numbers re-derived (also for exit 3 and 7).
+
+From Python (`proof_core.Adapter`): `reproduce` reports `reproduced` only for a full re-run that
+returns `proof_core.Rerun(outcome, verdict, outputs=..., data_library=(label, digest))` and passes
+the same rule as exit 0. A run that returns only the outcome re-derives only its digest:
+`outcome_reproduced`, never `reproduced`. Without `data_library` the environment is
+`environment_unverifiable` and never reproduced. `build_bundle`, `Adapter.seal` and `@sealed` mint
+v4 by default (`canon_version=1` for v3); `attest_bundle` is v3-only, use `add_signoff` on v4.
 
 ## The honest boundary (state this plainly)
 

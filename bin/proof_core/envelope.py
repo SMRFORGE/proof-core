@@ -564,7 +564,7 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
                  completeness: dict | None = None,
                  derived_from: list | None = None,
                  solver: dict | None = None,
-                 canon_version: int = 1,
+                 canon_version: int = 3,
                  profile=None,
                  cosigners: list | None = None) -> dict:
     # `profile` (domain-neutral, ADDITIVE) brands the on-disk dialect -- schema tags, the open-engine
@@ -575,7 +575,9 @@ def build_bundle(case: Case, result: Result, *, engine: str, engine_version: str
     # stays below, untouched by the profile -- a profile can never weaken the seal.
     from .profile import NEUTRAL
     p = profile or NEUTRAL
-    # canon_version selects the canonicalization (ADR-053): v1 (default, FROZEN) or v2 (strict JCS). All
+    # canon_version selects the canonicalization (ADR-053) and so the envelope: 3 (the default, evidence.envelope.v4,
+    # as `proof-seal` mints by default), 2 (strict JCS, v3 envelope) or 1 (FROZEN, evidence.envelope.v3: the explicit
+    # v3 option, `canon_version=1`). All
     # digests below use `_c`, INCLUDING a derived_from link's `consumed.sha256` (ADR-054: a link's consumed
     # digest is taken under the canon of the bundle that SEALS the link, so the chain walker re-derives it
     # under the citing bundle's sealed canon_version). Everything else is version-agnostic (signing, the

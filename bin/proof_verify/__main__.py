@@ -13,6 +13,7 @@ import sys
 # bundle reader shares them. Re-exported here (``cli._text_depth_ok``, ``cli.loads``) for callers/tests
 # that reach for them on the CLI module.
 from . import _spec_loader
+from . import gate as _gate
 from . import policy_source as _ps
 from .render import (
     RenderError,
@@ -282,25 +283,15 @@ def _attestation_gate(rep: dict, code: int) -> int:
 
 
 def _decision_rejects(rep: dict) -> list[str]:
-    """SPEC v4 draft 13.5: a decision reason other than `state_not_accepted` turns exit 0 or 3 into 1."""
-    decision = rep.get("decision") or {}
-    return [r for r in decision.get("reasons", []) if r != "state_not_accepted"]
+    """SPEC v4 draft 13.5: a decision reason other than `state_not_accepted` turns exit 0 or 3 into 1 (the gate's rule,
+    `proof_verify.gate.decision_rejects`)."""
+    return _gate.decision_rejects(rep)
 
 
 def _json_exit_code(rep: dict) -> int:
-    """The SAME exit code the prose path returns, computed purely (no printing). Integrity failure -> 1;
-    else integrity+origin -> 0 or integrity-only -> 3; then the attestation gate overrides a present-but-
-    INVALID human sign-off to 1 (exactly as ``_attestation_gate`` does for the prose branches)."""
-    if rep.get("state") == STATE_UNSUPPORTED_CANON:
-        return EXIT_UNSUPPORTED_CANON        # unsupported / use a newer verifier -- not an integrity failure
-    if rep.get("state") == STATE_UNSUPPORTED_ALG:
-        return EXIT_UNSUPPORTED_ALG          # an unimplemented signature suite -- not an integrity failure
-    if not rep["integrity_ok"]:
-        return EXIT_FAIL
-    code = EXIT_VERIFIED if rep["origin_ok"] else EXIT_INTEGRITY_ONLY
-    if not rep.get("attestations_ok", True) or _decision_rejects(rep):
-        return EXIT_FAIL
-    return code
+    """The SAME exit code the prose path returns, computed purely (no printing): the ONE gate's single-bundle code
+    (`proof_verify.gate.decision_exit_code`), which reproduce, certify and the Adapter read too."""
+    return _gate.decision_exit_code(rep)
 
 
 def _now_utc() -> str:
@@ -555,10 +546,16 @@ def _verify_text(path: str, bundle, rep: dict, chain: dict | None, ups: list | N
         return EXIT_FAIL
     # SPEC 13.5 "Human-readable headline": when the decision turns the exit into 1, the first line names the first
     # reason other than `state_not_accepted`; the verdict lines below then lose their "OK" mark.
+    # The exit code is decided FIRST, by the same rule as --json (the one gate's single-bundle code, then the chain
+    # walk), and the headline comes from that code: a failing or incomplete exit leads with FAIL / INCOMPLETE on
+    # stdout, never with "OK".
     hl = headline((rep.get("decision") or {}).get("reasons") or [])
+    base = _json_exit_code(rep)
+    code = _chain_gate(chain, base)
     lead = "OK  "
-    if hl is not None:
-        print(f"FAIL  {hl}: {path}")
+    top = _failing_headline(rep, chain, base, code, hl)
+    if top is not None:
+        print(f"{top}: {path}")
         lead = "    "
     if not rep["origin_ok"]:
         # untampered, but origin not established: say exactly that, calmly. The number is still
@@ -599,17 +596,20 @@ def _verify_text(path: str, bundle, rep: dict, chain: dict | None, ups: list | N
             print("    machine without the pinned signer's key).")
         print(f"    next:  proof-reproduce {path} --runner <your ReproduceRunner>   (or --command \"<cmd>\")")
         print("           re-derives the number from its sealed inputs (integrity holds, so it is safe to re-run)")
-        if hl is None:
+        if code == EXIT_INTEGRITY_ONLY:
             print(f"    exit {EXIT_INTEGRITY_ONLY}: NOT a production pass -- an automated origin gate must reject this.")
-        else:
+        elif hl is not None:
             print(f"    exit {EXIT_FAIL}: the receiver decision rejects this record ({hl}); see the first line.")
+        else:
+            print(f"    exit {code}: NOT a pass; see the first line.")
         _print_canon_note(bundle)
         _print_signoffs(rep, policy)
         _print_frontier(rep, walked=chain is not None)
         for line in claims_lines(rep, bundle) + decision_hint_lines(rep):
             print(f"    {line}")
         _print_chain(chain, len(ups or []))
-        return _chain_gate(chain, _attestation_gate(rep, EXIT_INTEGRITY_ONLY), announce=True)
+        _chain_gate(chain, _attestation_gate(rep, EXIT_INTEGRITY_ONLY), announce=True)   # the stderr notes
+        return code
     # origin_ok is True only under a real production pin (never under the demo pin), so reaching here
     # means a pinned-production-key signature over an intact bundle.
     print(f"{lead}verified (integrity + origin): {path}")
@@ -631,7 +631,49 @@ def _verify_text(path: str, bundle, rep: dict, chain: dict | None, ups: list | N
     for line in claims_lines(rep, bundle) + decision_hint_lines(rep):
         print(f"    {line}")
     _print_chain(chain, len(ups or []))
-    return _chain_gate(chain, _attestation_gate(rep, EXIT_VERIFIED), announce=True)
+    _chain_gate(chain, _attestation_gate(rep, EXIT_VERIFIED), announce=True)   # the stderr notes
+    return code
+
+
+def _stale_detail(chain: dict | None) -> str | None:
+    """The detail of the walk's first `stale` link (SPEC 9.3 spec 1.4: a reproduction record that does not describe
+    the supplied copy, or conflicting copies of one seal), or None when no link is stale."""
+    for ln in (chain or {}).get("links") or []:
+        if isinstance(ln, dict) and ln.get("state") == "stale":
+            return str(ln.get("detail") or "")
+    return None
+
+
+def _failing_headline(rep: dict, chain: dict | None, base: int, code: int, hl: str | None) -> str | None:
+    """The first stdout line when the exit code is not the bundle's own passing code, else None (the "OK" lead).
+
+    ``base`` is the single-bundle code (the one gate, `_json_exit_code`) and ``code`` the final one after the chain
+    walk (`_chain_gate`), so the headline is read off the SAME decision as the exit code:
+
+    * exit 1 leads with ``FAIL`` and names why: the decision's first rejecting reason (SPEC 13.5), an invalid or null
+      sign-off, or the derived_from chain that does not hold;
+    * exit 5 leads with ``INCOMPLETE`` (part of the chain was not walked);
+    * a chain whose weakest link is integrity-only caps exit 0 at 3, which leads with ``INTEGRITY-ONLY``."""
+    if code == EXIT_FAIL:
+        if hl is not None:
+            return f"FAIL  {hl}"
+        if base == EXIT_FAIL and not rep.get("attestations_ok", True):
+            if rep.get("attestations_null") is True:
+                return "FAIL  the bundle's attestations field is present but null (malformed)"
+            return "FAIL  a human sign-off on this bundle does not verify"
+        if base == EXIT_FAIL:
+            return "FAIL  the receiver decision rejects this bundle"
+        return "FAIL  the derived_from chain does not hold (see the chain walk below)"
+    if code == EXIT_CHAIN_INCOMPLETE:
+        stale = _stale_detail(chain)
+        if stale is not None:
+            return f"STALE  a derived_from link is stale (exit {EXIT_CHAIN_INCOMPLETE}, NOT a pass): {stale}"
+        return (f"INCOMPLETE  part of the derived_from chain was not walked (exit {EXIT_CHAIN_INCOMPLETE}, NOT a pass; "
+                "supply the missing earlier records)")
+    if code == EXIT_INTEGRITY_ONLY and base == EXIT_VERIFIED:
+        return (f"INTEGRITY-ONLY  this bundle verifies, but a record in its derived_from chain is integrity-only "
+                f"(exit {EXIT_INTEGRITY_ONLY}, NOT a production pass)")
+    return None
 
 
 #: The most withheld item paths the text output lists (the JSON lists every one).
@@ -738,6 +780,10 @@ def _chain_gate(chain: dict | None, code: int, *, announce: bool = False) -> int
         return EXIT_FAIL
     if c in (CHAIN_INCOMPLETE, CHAIN_UNKNOWN):
         if announce:
+            if _stale_detail(chain) is not None:
+                print(f"STALE  a derived_from link is stale -- exit {EXIT_CHAIN_INCOMPLETE}: NOT a pass.",
+                      file=sys.stderr)
+                return EXIT_CHAIN_INCOMPLETE
             print(f"INCOMPLETE  part of the derived_from chain was not walked -- exit {EXIT_CHAIN_INCOMPLETE}: "
                   "NOT a pass; supply the missing earlier records.", file=sys.stderr)
         return EXIT_CHAIN_INCOMPLETE
@@ -903,7 +949,6 @@ def _main(args: list[str]) -> int:
         else:
             print(f"error: {bad}", file=sys.stderr)
         return EXIT_UNREADABLE
-    pins = None
     # which policy (policy_source.py): --policy FILE > --policy preset:NAME > $PROOF_POLICY > the built-in default
     # (no folder is searched). Selection only; the policy found is then read exactly as --policy FILE always was.
     try:
@@ -914,27 +959,14 @@ def _main(args: list[str]) -> int:
     if note:
         print(note, file=sys.stderr)
     self_verify_only = policy is None and ns.allow_self_verify   # the policy below is the one --allow-self-verify builds
-    if policy is not None:
-        # SPEC 7.12 / 13.4.1 step 3: pins from outside the policy file -- the CLI's built-in demo pin and
-        # --pubkey -- are MERGED into it with the demo-wins rule, so a demo-signed bundle reads
-        # `integrity-only (demo pin)` under any policy.
-        # "the CLI's built-in demo pin" (13.4.1 step 3): every demo key of SPEC section 2 (the Ed25519 and the P-256
-        # demo key), as a demo pin, so a demo-signed bundle of either suite reads `integrity-only (demo pin)`.
-        pins = [dict(p) for p in BUILTIN_DEMO_PINS]
-        if ns.pubkey is not None:
-            pins.append({"legacy_raw_key": ns.pubkey, "demo": False})
-    if ns.allow_self_verify:
-        # SPEC 13.5: "`--allow-self-verify`: sets `allow_self_verify: true` in the effective policy, so
-        # `policy_sha256` reflects it". Without --policy: the default policy with that one member set, plus the
-        # out-of-policy pins the --policy path merges (the built-in demo pins and --pubkey).
-        if policy is None:
-            policy = {"schema": "evidence.receiver-policy.v1"}
-            pins = [dict(p) for p in BUILTIN_DEMO_PINS]
-            if ns.pubkey is not None:
-                pins.append({"legacy_raw_key": ns.pubkey, "demo": False})
-        if not isinstance(policy, dict):
-            return _policy_error(PolicyError("a receiver policy must be a JSON object"), ns.json, source)
-        policy = {**policy, "allow_self_verify": True}
+    # SPEC 7.12 / 13.4.1 step 3: pins from outside the policy file -- every built-in demo pin (SPEC section 2: the
+    # Ed25519 and the P-256 demo key, as demo pins) and --pubkey -- are MERGED into a policy with the demo-wins rule;
+    # SPEC 13.5 --allow-self-verify sets allow_self_verify in the effective policy (the default policy plus those pins
+    # when no policy is given). One helper, shared with proof-reproduce: `proof_verify.gate.trust_inputs`.
+    try:
+        policy, pins = _gate.trust_inputs(policy, ns.pubkey, allow_self_verify=ns.allow_self_verify)
+    except PolicyError as exc:
+        return _policy_error(exc, ns.json, source)
     if profile is not None:
         # a --profile origin pin is not a trust root under a receiver policy: refuse rather than drop it silently
         conflict = _profile_pin_conflict(profile, ns.profile, policy, pins, source, self_verify_only)
