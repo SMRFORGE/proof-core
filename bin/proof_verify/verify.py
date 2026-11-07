@@ -42,7 +42,7 @@ import threading
 from decimal import Decimal
 from typing import Any
 
-from . import _work
+from . import _spec_loader, _work
 from . import tsp as _tsp
 from ._work import WORK_BUDGET_LIMIT, WorkBudget, WorkBudgetExceeded  # noqa: F401 -- the TT-15 API
 
@@ -202,7 +202,25 @@ def _profile_value(profile, name, default):
     canonicalization, the hashing or the Ed25519 math -- only which schema strings and pinned key apply."""
     if profile is None:
         return default
-    return getattr(profile, name, default)
+    try:
+        return getattr(profile, name, default)
+    except (KeyboardInterrupt, SystemExit):
+        raise                           # the reviewer's own Ctrl-C; sys.exit() has its own guard in each CLI
+    except BaseException as exc:        # reviewer code: a property / __getattr__ that raises anything else
+        # RecursionError and MemoryError included: a profile fault is never a bundle verdict ("ran out of resources"),
+        # and the reason is built by describe_exception so a broken __str__ / type name cannot raise again here
+        raise ProfileReadError(
+            f"the profile's {name!r} could not be read: {_spec_loader.describe_exception(exc)}") from exc
+
+
+class ProfileReadError(Exception):
+    """A profile attribute read raised something other than AttributeError (a property, a ``__getattr__``; any
+    BaseException but KeyboardInterrupt and SystemExit): the profile is reviewer code, unusable as given, and no
+    verdict can be reached under it. Every profile read goes through :func:`_profile_value`, so a CLI catches this ONE
+    type and names the profile (proof-verify: usage, exit 2; proof-reproduce: "reproduction could not finish", exit 1)
+    instead of a traceback or a bundle verdict. ``SystemExit`` is not converted (the CLIs guard it separately).
+    Deliberately not a ValueError: a parse path's ``except ValueError`` must never read a failing profile as a
+    malformed bundle. Its message is always printable (``_spec_loader.describe_exception``)."""
 
 
 #: Origin problem for a profile whose pin is present but not 64 lowercase hex. A malformed pin can never be
@@ -2129,32 +2147,35 @@ def _check_signature(bundle: dict, bundle_sha256: str, problems: list[str],
     # verifier's module-global pin unchanged -- the neutral default -- so the deliberate single-pin design
     # is intact unless a caller opts a profile in. This never affects INTEGRITY (checked above under the
     # embedded key); it only decides which key counts as "origin".
-    if pin_set is not None:
-        # SPEC 7.12 (v3 input, E = [signature]): key_matches_pin iff the verified block's key id is in the pin set;
-        # the matched pin's EFFECTIVE demo flag decides demo-ness (7.4 "with a pin set of one entry the outcome is
-        # exactly the v3 outcome").
-        kid = key_id(alg, signer)
-        if kid not in pin_set:
-            origin_problems.append("signature key is not in the pin set")
-        elif sig_out is not None:
-            sig_out["pin_demo"] = pin_set[kid]
-            sig_out["pin_key_id"] = kid
-        return signer
-    profile_pin, malformed_pin = _profile_pin(profile)
-    if malformed_pin:
-        origin_problems.append(_MALFORMED_PIN_PROBLEM)
-    elif alg != "ed25519":
-        # Only the newer-canon branch (`v4_suites`) reaches here with a non-Ed25519 primary. The single-pin path's pin
-        # set is the module or profile Ed25519 pin plus the built-in demo pins (`_default_pin_set`), so the only
-        # non-Ed25519 keys it pins are the demo keys (SIG-28), always as demo pins.
-        if key_id(alg, signer) in _DEMO_KEY_IDS:
-            if sig_out is not None:
-                sig_out["pin_demo"] = True
-                sig_out["pin_key_id"] = key_id(alg, signer)
-        else:
-            origin_problems.append("signature is not under the pinned public key")
-    elif signer != (profile_pin or _PINNED_PUBKEY):
-        origin_problems.append("signature is not under the pinned public key")
+    # SPEC 7.12 (v3 input, E = [signature]): key_matches_pin iff the verified block's key id is in the EFFECTIVE pin
+    # set, and the matched pin's effective demo flag decides demo-ness (7.14). On the single-pin path (no policy, no
+    # caller pins) the effective pin set is the module or profile pin plus the built-in demo pins, as demo pins
+    # (`_default_pin_set`, 13.4.1 step 3) -- the set `policy_sha256` digests -- so the verdict is decided against the
+    # same set that is digested: `--pubkey OTHER` alone and `--policy P --pubkey OTHER` read a demo-signed bundle
+    # alike (`integrity-only (demo pin)`, key_matches_pin true, one policy_sha256).
+    single_kid = None
+    single_demo = False
+    if pin_set is None:
+        profile_pin, malformed_pin = _profile_pin(profile)
+        if malformed_pin:
+            origin_problems.append(_MALFORMED_PIN_PROBLEM)     # a malformed profile pin pins nothing
+            return signer
+        single_pin = profile_pin or _PINNED_PUBKEY
+        # the configured pin's own demo-ness, as the module reports it (`pinned_key_is_demo` is the one test seam)
+        single_demo = pinned_key_is_demo() if profile_pin is None else single_pin == _DEMO_PUBKEY
+        pin_set = _default_pin_set(single_pin, single_demo)
+        single_kid = key_id("ed25519", single_pin)
+        not_pinned = "signature is not under the pinned public key"
+    else:
+        not_pinned = "signature key is not in the pin set"
+    kid = key_id(alg, signer)
+    if kid not in pin_set:
+        origin_problems.append(not_pinned)
+    elif sig_out is not None:
+        # the matched pin's effective demo flag: a built-in demo pin is demo (SIG-28); the configured single pin
+        # reports its own demo-ness
+        sig_out["pin_demo"] = single_demo if kid == single_kid else pin_set[kid]
+        sig_out["pin_key_id"] = kid
     return signer
 
 
@@ -4466,11 +4487,15 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
     # path is byte/verdict-identical.
     profile_pin, _malformed = _profile_pin(profile)   # a malformed pin already failed origin in _check_signature
     profile_declares_demo = _profile_value(profile, "pin_is_demo", False)
+    # SPEC 7.14: the state reads the MATCHED pin's effective demo flag ("at least one verified S_sup block matches a
+    # demo pin"); `pin_is_demo = True` marks every entry as demo (7.12, informative). `demo_pin` below is what
+    # `pinned_key_is_demo` reports: under a pin set `pinned_key` is the matched pin, so its flag; on the single-pin
+    # path the configured pin's own flag, the one `_default_pin_set` digests (so `_verdict_pins` re-derives the set).
+    demo_match = bool(sig_info.get("pin_demo")) or profile_declares_demo
     if pin_set is not None:
-        # the matched pin's effective demo flag (SIG-28 and the demo-wins merge are applied in resolve_pins);
-        # `pin_is_demo = True` marks every entry as demo (7.12, informative).
+        # the matched pin's effective demo flag (SIG-28 and the demo-wins merge are applied in resolve_pins)
         effective_pin = None
-        demo_pin = bool(sig_info.get("pin_demo")) or profile_declares_demo
+        demo_pin = demo_match
     elif profile_pin is None:
         effective_pin = _PINNED_PUBKEY
         demo_pin = pinned_key_is_demo() or profile_declares_demo
@@ -4532,11 +4557,13 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
         if pin_set is None and _malformed:
             origin_problems.append(_MALFORMED_PIN_PROBLEM)
             pins_v4 = {}
-        signers, origin_ok, key_matches_pin, demo_pin, origin_basis = _v4_origin(
+        signers, origin_ok, key_matches_pin, demo_match, origin_basis = _v4_origin(
             v4_blocks, pins_v4, members, as_of, integrity_ok, profile_declares_demo, origin_problems, archive_out)
+        if pin_set is not None:
+            demo_pin = demo_match       # `pinned_key` is the matched pin under a pin set: report its flag
     else:
         origin_basis = "current"
-        if demo_pin and key_matches_pin:
+        if demo_match and key_matches_pin:
             origin_problems.append("pinned key is the public demo identity; origin cannot be established")
         origin_ok = integrity_ok and not origin_problems
         signers = _v3_signers(sig_info.get("primary"), eff_pins, integrity_ok, origin_ok, bool(demo_pin))
@@ -4552,7 +4579,7 @@ def _classify_bundle(bundle: dict, *, profile=None, policy=None, pins=None, as_o
             state = STATE_FAIL
     elif origin_ok:
         state = STATE_VERIFIED
-    elif demo_pin and key_matches_pin:
+    elif demo_match and key_matches_pin:
         state = STATE_INTEGRITY_ONLY_DEMO
     else:
         state = STATE_INTEGRITY_ONLY

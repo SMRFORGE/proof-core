@@ -169,7 +169,8 @@ def gate(bundle_bytes: bytes | str, policy: Any = None, pins: Any = None, as_of:
         # a profile's origin pin (pinned_pubkey / pinned_keys) is not a trust root under a receiver policy: refuse
         # rather than drop it silently, exactly as proof-verify refuses --profile with such a policy (exit 2)
         from .__main__ import _profile_pin_conflict
-        conflict = _profile_pin_conflict(profile, type(profile).__name__, policy, pins,
+        from ._spec_loader import safe_type_name
+        conflict = _profile_pin_conflict(profile, safe_type_name(profile), policy, pins,
                                          policy_source or {"kind": "flag", "path": "policy="}, False)
         if conflict is not None:
             raise _ps.PolicyUsageError(conflict)

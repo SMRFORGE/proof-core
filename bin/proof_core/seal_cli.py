@@ -39,27 +39,8 @@ ENVELOPE_CANON = {"v4": 3, "v3": 1}
 DEFAULT_ENVELOPE = "v4"
 
 
-def _resolve_profile(spec: str):
-    """Import a reviewer-named ``pkg.module:attr`` dialect Profile (a class is instantiated with no args; a
-    constructed Profile is used as-is). Reads ONLY the command-line ``spec``. Raises ValueError on failure.
-    Mirrors the resolver in ``reproduce_cli`` / ``proof_verify.__main__``."""
-    module_name, attr_path = _spec_loader.split_spec(spec, "--profile", "pkg.module:attr")
-    try:  # never the cwd: a module from the normal import path, or an absolute /abs/path/file.py
-        obj = _spec_loader.import_spec_module(module_name, "profile")
-    except ImportError as exc:
-        raise ValueError(f"cannot import profile module {module_name!r}: {exc}") from exc
-    except Exception as exc:
-        raise ValueError(
-            f"profile module {module_name!r} failed to import: {type(exc).__name__}: {exc}") from exc
-    for part in attr_path.split("."):
-        try:
-            obj = getattr(obj, part)
-        except AttributeError as exc:
-            raise ValueError(f"profile {spec!r} not found: {exc}") from exc
-    try:
-        return obj() if isinstance(obj, type) else obj
-    except Exception as exc:
-        raise ValueError(f"cannot construct profile {spec!r}: {type(exc).__name__}: {exc}") from exc
+#: one resolver behind every `--profile` (proof_verify/_spec_loader.py, stdlib only); the name is kept for callers
+_resolve_profile = _spec_loader.resolve_profile
 
 
 class _Once(argparse.Action):
@@ -123,8 +104,11 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _load_json_object(path: str, flag: str):
+    from proof_verify.verify import (
+        loads,  # the guarded reader: a duplicate key, NaN/Infinity, depth, size are refused
+    )
     with open(path, encoding="utf-8") as fh:
-        obj = json.load(fh)
+        obj = loads(fh.read())
     if not isinstance(obj, dict):
         # ValueError (not TypeError) on purpose: main() maps a bad JSON argument to exit 2 via
         # `except (OSError, ValueError)`, so this malformed-shape case must be a ValueError too.
@@ -140,6 +124,11 @@ def main(argv: list[str] | None = None) -> int:
         ns = _parser().parse_args(argv)
     except SystemExit as exc:  # argparse usage error (-> 2) or --help (-> 0)
         return int(exc.code) if exc.code is not None else 2
+    try:
+        signing.check_signing_seed()        # a malformed PROOF_SIGNING_SEED is a usage error, never a traceback
+    except signing.SigningSeedError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if (ns.data_label is None) != (ns.data_sha is None):
         print("error: --data-label and --data-sha must be given together", file=sys.stderr)
@@ -187,8 +176,16 @@ def main(argv: list[str] | None = None) -> int:
             profile=profile,
             canon_version=ENVELOPE_CANON[ns.envelope],
         )
-    except Exception as exc:  # noqa: BLE001 -- a bad tolerance/profile is a seal-time arg error, not a crash
-        print(f"error: could not seal: {type(exc).__name__}: {exc}", file=sys.stderr)
+    except SystemExit as exc:  # a --profile attribute that calls sys.exit() while sealing: no bundle, never exit 0
+        print(f"error: could not seal: the --profile called sys.exit({_spec_loader.exit_code_text(exc.code)})",
+              file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        raise                                   # the reviewer's own Ctrl-C
+    except BaseException as exc:  # noqa: BLE001 -- a bad tolerance/profile is a seal-time arg error, not a crash
+        # any BaseException (a custom one from the --profile included), described so a broken __str__ / type name
+        # cannot turn this guard into a traceback
+        print(f"error: could not seal: {_spec_loader.describe_exception(exc)}", file=sys.stderr)
         return 2
 
     text = json.dumps(bundle, sort_keys=True)

@@ -169,28 +169,8 @@ def _resolve_runner(spec: str) -> ReproduceRunner:
     return runner
 
 
-def _resolve_profile(spec: str):
-    """Import the reviewer-named ``pkg.module:attr`` dialect Profile and return it (a class is instantiated
-    with no args; an already-constructed Profile is used as-is). Duck-typed: the verifier reads a profile
-    attribute-only, so any object carrying the dialect fields works. Mirrors ``_resolve_runner`` -- it reads
-    ONLY the command-line ``spec``, never the bundle, and raises ValueError with a plain reason on failure."""
-    module_name, attr_path = _spec_loader.split_spec(spec, "--profile", "pkg.module:attr")
-    try:  # never the cwd (see _resolve_runner): a planted profile would pin the sender's key
-        obj = _spec_loader.import_spec_module(module_name, "profile")
-    except ImportError as exc:
-        raise ValueError(f"cannot import profile module {module_name!r}: {exc}") from exc
-    except Exception as exc:  # any import-time failure is a bad --profile arg, not a CLI crash
-        raise ValueError(
-            f"profile module {module_name!r} failed to import: {type(exc).__name__}: {exc}") from exc
-    for part in attr_path.split("."):
-        try:
-            obj = getattr(obj, part)
-        except AttributeError as exc:
-            raise ValueError(f"profile {spec!r} not found: {exc}") from exc
-    try:
-        return obj() if isinstance(obj, type) else obj
-    except Exception as exc:  # a Profile whose construction raises is a bad --profile arg, not a crash
-        raise ValueError(f"cannot construct profile {spec!r}: {type(exc).__name__}: {exc}") from exc
+#: one resolver behind every `--profile` (proof_verify/_spec_loader.py, stdlib only); the name is kept for callers
+_resolve_profile = _spec_loader.resolve_profile
 
 
 # --------------------------------------------------------------------------------------------------- #
@@ -305,7 +285,9 @@ class CommandRunner:
             out_path = os.path.join(workdir, "output.json")
             with open(in_path, "w", encoding="utf-8") as fh:
                 json.dump({"capability": capability, "inputs": inputs}, fh, sort_keys=True)
-            env = dict(os.environ)
+            # the child never inherits the producer's signing identity: it only recomputes outputs, and the parent
+            # re-mints the fresh bundle itself (`_rebuild_with_outputs`), so every PROOF_SIGNING_* variable is scrubbed
+            env = {k: v for k, v in os.environ.items() if not k.startswith("PROOF_SIGNING_")}
             env[ENV_INPUTS] = in_path
             env[ENV_OUTPUT] = out_path
             try:
@@ -613,12 +595,37 @@ def _reviewer_tolerance(args) -> tuple[dict | None, str | None]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from proof_verify.verify import safe_terminal_output
+    from proof_verify.verify import ProfileReadError, safe_terminal_output
 
     argv = list(sys.argv[1:] if argv is None else argv)
     # text mode: everything printed is escaped to printable ASCII (bundle text never reaches the terminal raw)
     with safe_terminal_output(enabled="--json" not in argv):
-        return _main(argv)
+        try:
+            return _main(argv)
+        except SystemExit as exc:
+            return _profile_escaped(argv, f"called sys.exit({_spec_loader.exit_code_text(exc.code)}) after it was "
+                                          "loaded", "SystemExit")
+        except ProfileReadError as exc:
+            return _profile_escaped(argv, f"failed after it was loaded ({exc})", type(exc).__name__)
+
+
+def _profile_escaped(argv: list[str], what: str, kind: str) -> int:
+    """A `--profile` attribute read AFTER the profile was loaded (the pin-conflict check, the gate, the re-run: a
+    property or a `__getattr__`) called sys.exit() (`what` names the call) or raised (a `ProfileReadError`, the one
+    type every verifier-side profile read raises). argparse's own SystemExit, a runner's, a profile's at import /
+    construction, and anything raised inside the re-run itself are all handled inside `_main`, so these are the two
+    that can reach here: the profile is reviewer code, and this process never ends with ITS status (exit 0, no
+    verdict) nor a traceback. A re-run that did not finish: exit 1, as the runner guard."""
+    try:
+        args = _parser().parse_args(argv)       # the same argv _main parsed: cannot fail here
+    except SystemExit:
+        args = None
+    msg = f"the --profile {what}; no verdict was reached"
+    if args is not None and args.json:
+        return _emit_json_error(args.bundle, "error", EXIT_NOT_REPRODUCED, error=f"{kind}: {msg}")
+    print(f"reproduce: {args.bundle if args is not None else '?'}", file=sys.stderr)
+    print(f"  reproduction could not finish: {msg}", file=sys.stderr)
+    return EXIT_NOT_REPRODUCED
 
 
 def _exit_code(report: dict) -> tuple[int, list[str]]:
@@ -672,6 +679,11 @@ def _main(argv: list[str]) -> int:
         args = _parser().parse_args(argv)
     except SystemExit as exc:  # argparse usage error (-> 2) or --help (-> 0)
         return int(exc.code) if exc.code is not None else EXIT_USAGE
+    from . import signing
+    try:
+        signing.check_signing_seed()        # the re-run re-mints under the seed backend: a malformed seed is a usage error
+    except signing.SigningSeedError as exc:
+        return _usage(args, str(exc))
 
     # the on-disk DIALECT to verify/reproduce under, named on the command line (never read from the bundle).
     profile = None
@@ -786,12 +798,34 @@ def _main(argv: list[str]) -> int:
         print(f"reproduce: {args.bundle}", file=sys.stderr)
         print(f"  cannot reproduce: {exc}", file=sys.stderr)
         return EXIT_NOT_REPRODUCED
-    except Exception as exc:  # noqa: BLE001 -- reproduction re-runs arbitrary producer/reviewer code
+    except SystemExit as exc:
+        # A runner that calls sys.exit() inside can_run()/run() (a script's main() wrapped as a runner, an
+        # argparse call, `sys.exit(0)` after printing), or a --profile attribute read during the re-run. SystemExit
+        # is a BaseException, so the Exception branch below never sees it, and uncaught it would end this process
+        # with the RUNNER's status, exit 0 with no verdict included. It is a re-run that did not finish, exactly as
+        # the branch below (and as the import and instantiation guards in _resolve_runner / _resolve_profile).
+        # What no in-process guard can catch is an in-process ESCAPE: os._exit() (from the runner, an atexit
+        # handler or a thread), a monkeypatched sys.exit, a signal to this process. Each ends the interpreter with
+        # no exception and no verdict. Run an untrusted runner in a subprocess (--command) if that matters.
+        who = "the runner or the --profile" if args.profile is not None else "the runner"
+        msg = (f"{who} called sys.exit({_spec_loader.exit_code_text(exc.code)}) during the re-run; "
+               "no verdict was reached")
         if args.json:
             return _emit_json_error(args.bundle, "error", EXIT_NOT_REPRODUCED,
-                                    error=f"{type(exc).__name__}: {exc}", integrity_ok=True, gate=decision.summary())
+                                    error=f"SystemExit: {msg}", integrity_ok=True, gate=decision.summary())
         print(f"reproduce: {args.bundle}", file=sys.stderr)
-        print(f"  reproduction could not finish: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"  reproduction could not finish: {msg}", file=sys.stderr)
+        return EXIT_NOT_REPRODUCED
+    except KeyboardInterrupt:
+        raise                                   # the reviewer's own Ctrl-C
+    except BaseException as exc:  # noqa: BLE001 -- reproduction re-runs arbitrary producer/reviewer code
+        # any BaseException (a custom one included), described so a broken __str__ / type name cannot raise again
+        reason = _spec_loader.describe_exception(exc)
+        if args.json:
+            return _emit_json_error(args.bundle, "error", EXIT_NOT_REPRODUCED,
+                                    error=reason, integrity_ok=True, gate=decision.summary())
+        print(f"reproduce: {args.bundle}", file=sys.stderr)
+        print(f"  reproduction could not finish: {reason}", file=sys.stderr)
         return EXIT_NOT_REPRODUCED
 
     # stash the sealed result core for the printer (read here, once, from the verified bundle)
