@@ -193,12 +193,15 @@ Exit codes (gate on `exit_code`, never the `state` string):
 | 0 | reproduced (`--runner` only), and ONLY when all three hold: verify would exit 0 for this bundle under your trust inputs (a real pinned production key, never the demo key), the re-run used the sealed inputs, and the sealed data environment is pinned and matches. The numbers and the sealed claim re-derive. |
 | 1 | NOT reproduced: the numbers or the claim do not re-derive, or verify fails the bundle closed (edited, a signed rejection, an invalid sign-off). A bundle whose integrity fails is never re-run. |
 | 2 | usage error, unreadable bundle, unusable `--runner`, or a receiver policy that is malformed, unreadable or not the one `--expect-policy` names |
-| 3 | outputs reproduced, sealed claims NOT re-derived (`--command` only): a partial result, never a pass |
+| 3 | outputs reproduced, sealed claims NOT re-derived (`--command` only): a partial result, never a pass. This is the best a `--command` re-run can reach, even under a production key with the gate passing; `--command` never exits 0. |
 | 4 | unsupported canon: never re-run; use a newer verifier |
 | 6 | unsupported signature suite: never re-run; use a newer verifier |
 | 7 | PARTIAL, not reproduced: the numbers re-derive, but the gate did not pass (e.g. the public demo key), the re-run used other inputs, or the data environment differs or was never pinned. `shortfalls` names which (`gate_not_passed`, `inputs_not_identical`, `environment_mismatch`, `environment_unverifiable`). Never a pass. |
 
-**Under the public demo key a re-run whose numbers match exits 7, not 0**: origin is not
+**Only `--runner` can reach exit 0**, and only with a production key pinned, the gate passing, the
+sealed inputs and a pinned, matching environment. A `--command` re-run exits 3 at best under a
+production key (it re-derives the outputs, not the sealed claims) and 7 under the demo key.
+**Under the public demo key a re-run whose numbers match exits 7, not 0**, with either flag: origin is not
 established, so it is not a reproduction. Report it as "the numbers re-derive (partial)", never as
 "reproduced". `--json` emits the verdict with `kind`/`exit_code`/`state`; `reproduced` is true only
 for exit 0, and `outputs_reproduced` is true whenever the numbers re-derived (also for exit 3 and 7).

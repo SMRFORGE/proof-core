@@ -4,6 +4,17 @@ All notable changes to the proof-core Claude Code plugin. Versions follow [Seman
 Each release re-vendors a proof-core release into `bin/` verbatim; the vendored code's own changes are listed in
 [proof-core's CHANGELOG](https://gitlab.com/proof-core/proof-core/-/blob/main/CHANGELOG.md).
 
+## [0.8.2] - 2026-11-07
+
+### Changed
+
+- SKILL.md and README: the `reproduce` exit-0 wording no longer reads as if a production key alone is enough.
+  Exit 0 needs `--runner`, the verify gate passing (a real pinned production key), the sealed inputs and a
+  pinned, matching data environment. A `--command` re-run never exits 0: it re-derives the outputs but not the
+  sealed claims, so it exits 3 at best under a production key and 7 under the demo key. The README flow diagram,
+  the reproduce bullet and the Limits section, and the SKILL.md exit table say so. No code or vendored-kernel
+  change; the vendored proof-core is still v0.29.0.
+
 ## [0.8.1] - 2026-11-07
 
 ### Other changes
