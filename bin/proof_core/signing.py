@@ -593,26 +593,48 @@ if _BACKEND not in ("seed", ""):
         "'seed' backend (keyless by design). Inject a hardware/HSM/KMS key with "
         "proof_core.use_signer(signer) in your own tree instead.")
 
+
+class SigningSeedError(ValueError):
+    """``PROOF_SIGNING_SEED`` is set but malformed. The seed backend then has NO identity: every signing or public-key
+    use raises this (never a fallback to the demo key), ``IS_DEMO_IDENTITY`` is False, and the CLIs report it as a
+    usage error (exit 2) before any work (``check_signing_seed``). Deferred from import so a CLI can say so cleanly
+    instead of ending in a module-level traceback."""
+
+
+def _parse_env_seed(value: str) -> tuple[bytes | None, str | None]:
+    """``(seed, None)`` for exactly 32 bytes of hex, else ``(None, why)``. A valid-hex-but-wrong-length seed is
+    refused too: it must never be SILENTLY accepted and then labeled a production identity (the worst case for the
+    key ceremony)."""
+    try:
+        seed = bytes.fromhex(value)
+    except ValueError:
+        return None, "PROOF_SIGNING_SEED must be 32 bytes of hex (64 hex chars); the value is not valid hex"
+    if len(seed) != 32:
+        return None, f"PROOF_SIGNING_SEED must be exactly 32 bytes (64 hex chars), got {len(seed)} bytes"
+    return seed, None
+
+
 _ENV_SEED = os.environ.get("PROOF_SIGNING_SEED")
 if _ENV_SEED:
-    # a real signing seed MUST be exactly 32 bytes of hex. Malformed hex used to crash the whole
-    # producer at import with a raw ValueError; a valid-hex-but-wrong-length seed was SILENTLY
-    # accepted and then labeled a production identity -- the worst case for the key ceremony.
-    try:
-        _SEED = bytes.fromhex(_ENV_SEED)
-    except ValueError as exc:
-        raise ValueError("PROOF_SIGNING_SEED must be 32 bytes of hex (64 hex chars); "
-                         "the value is not valid hex") from exc
-    if len(_SEED) != 32:
-        raise ValueError("PROOF_SIGNING_SEED must be exactly 32 bytes (64 hex chars), "
-                         f"got {len(_SEED)} bytes")
+    # a real signing seed MUST be exactly 32 bytes of hex. A malformed value leaves the backend with NO seed and the
+    # reason in SEED_ERROR: nothing can be signed and no public key is reported until it is fixed (fail loud, at the
+    # first use and at every CLI's start), and the process is never silently the demo identity.
+    _SEED, SEED_ERROR = _parse_env_seed(_ENV_SEED)
 else:
-    _SEED = _DEV_SEED
-IS_DEMO_IDENTITY = _SEED == _DEV_SEED
-_PK = publickey(_SEED)
+    _SEED, SEED_ERROR = _DEV_SEED, None
+IS_DEMO_IDENTITY = _SEED == _DEV_SEED                   # False for a malformed seed: no identity, never the demo one
+_PK = publickey(_SEED) if _SEED is not None else None
+
+
+def check_signing_seed() -> None:
+    """Raise ``SigningSeedError`` when ``PROOF_SIGNING_SEED`` is set but malformed; a no-op otherwise. Every
+    signing / public-key use of the seed backend calls it; the CLIs call it first, as a usage error."""
+    if SEED_ERROR is not None:
+        raise SigningSeedError(SEED_ERROR)
 
 
 def _raw_sign(msg: bytes) -> bytes:
+    check_signing_seed()
     return sign(msg, _SEED, _PK)
 
 
@@ -684,7 +706,10 @@ def signer_key_problems(signer, *, where: str) -> None:
 
 
 def _active_public_key() -> bytes:
-    return bytes(_ACTIVE_SIGNER.public_key()) if _ACTIVE_SIGNER is not None else _PK
+    if _ACTIVE_SIGNER is not None:
+        return bytes(_ACTIVE_SIGNER.public_key())
+    check_signing_seed()
+    return _PK
 
 
 def _active_sign(msg: bytes) -> bytes:

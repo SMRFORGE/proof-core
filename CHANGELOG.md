@@ -4,6 +4,42 @@ All notable changes to the proof-core Claude Code plugin. Versions follow [Seman
 Each release re-vendors a proof-core release into `bin/` verbatim; the vendored code's own changes are listed in
 [proof-core's CHANGELOG](https://gitlab.com/proof-core/proof-core/-/blob/main/CHANGELOG.md).
 
+## [0.9.0] - 2026-11-07
+
+Re-vendors proof-core **v0.30.0** (tag `v0.30.0`, commit `ca298fd35eff091537b88ce2ac64be98fd1aa90d`; was v0.29.0,
+`3f21ff1e`). proof-core 0.30.0 is a hardening release: the review-phase fail-closed fixes and six conformance
+vectors, with no `state`, exit code or `decision` change on the 787-vector corpus. The full list is in
+[proof-core's CHANGELOG](https://gitlab.com/proof-core/proof-core/-/blob/v0.30.0/CHANGELOG.md#0300---2026-11-07);
+what a plugin user sees:
+
+### Changed
+
+- **Vendored kernel 0.29.0 -> 0.30.0**, verbatim (`bin/proof_core`, `bin/proof_verify`; 8 files changed, no file
+  added or removed). Everything SKILL.md and README describe still holds: `tools/check_behaviour.py` passes
+  unchanged (v4 by default, `--envelope v3`, `reproduce --command` under the demo key is exit 7, never 0).
+- **`verify --pubkey HEX` with no policy decides against the effective pin set** (SPEC-v4 13.4.1 step 3: the
+  built-in demo pins merged, as demo pins, with `--pubkey`). A demo-signed v3 bundle under `--pubkey OTHER` is now
+  `integrity-only (demo pin)` with `key_matches_pin` true (was `integrity-only`, false); a demo-signed v4 bundle's
+  `matched_pins` names the demo key that matched and `pinned_key_is_demo` is false. Exit code (3) and `decision`
+  are unchanged, and the answer now agrees with `@proof-core/verify`.
+- **The bare `verify bundle.json` (no flags) reports `pinned_key_is_demo` true for every v4 bundle**: with no
+  policy and no `--pubkey` the pinned key IS the demo key, so the flag describes the pin, not whether the verified
+  block matched it. `state`, exit code and `decision` are unchanged on every corpus vector.
+- **Fail-closed on the surfaces the corpus does not drive.** A `reproduce --runner` that calls `sys.exit()` is exit
+  1 with `state: "error"`, never exit 0 without a verdict. A `--profile` that calls `sys.exit()` or raises on an
+  attribute read is a clean usage error (exit 2 in `verify` and `seal`, exit 1 in `reproduce`), never exit 0 and
+  never a verdict that blames the bundle. A malformed `PROOF_SIGNING_SEED` is `error: PROOF_SIGNING_SEED must be
+  ...`, exit 2, instead of an import-time traceback. The `reproduce --command` child no longer inherits any
+  `PROOF_SIGNING_*` variable. `seal` refuses the input files `verify` would refuse (duplicate key, `NaN`/`Infinity`,
+  pathological nesting, oversize), exit 2.
+- **Output changes with no exit-code change.** `verify --json` reports a bad `--pubkey` or `--profile` as
+  `{"error": "usage", ...}` on stdout like its other usage errors; the text verdict's whole-number note prints under
+  canon 3 (the v4 default) as well as canon 2 and names the bundle's canon.
+- **Corpus 781 -> 787**, no verdict change on any existing vector (the 11.5 envelope/canon pairing, 9.1's non-empty
+  `derived_from`, and stated limit L3 under `require_archive`, each pinned in isolation).
+- README family table refreshed to today's tags (`@proof-core/verify` v0.12.0, envelope-spec v1.5.0 with 787
+  vectors, proof-mcp v0.11.0, pytest-proof-core v0.2.0, pytest-proof-core-plugin v0.4.0 untagged).
+
 ## [0.8.2] - 2026-11-07
 
 ### Changed

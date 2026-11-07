@@ -34,6 +34,7 @@ from .verify import (  # noqa: F401 -- re-exported for backward-compatible acces
     CHAIN_NONE,
     CHAIN_UNKNOWN,
     DEMO_KEY_ID,
+    STATE_INTEGRITY_ONLY_DEMO,
     STATE_UNSUPPORTED_ALG,
     STATE_UNSUPPORTED_CANON,
     PolicyError,
@@ -143,13 +144,21 @@ def _withheld_items(rep: dict) -> list:
     return [e for e in paths if isinstance(e, dict)] if isinstance(paths, list) else []
 
 
+#: the canons whose number encoding is RFC 8785 / JCS (every number an IEEE-754 double): canon 2 (the v3 envelope's
+#: strict JCS, ADR-053) and canon 3 (the v4 default: JCS over the committed-item projection, SPEC v4 5.6.1). Under
+#: both, the seal covers numeric VALUES, not their spelling. Canon 1 (frozen) seals the spelling.
+_VALUE_SEALING_CANONS = frozenset({2, 3})
+
+
 def _print_canon_note(bundle) -> None:
-    """ADR-053/054: under canon_version 2 (JCS) the seal covers numeric VALUES, not their spelling, so say so
-    next to "UNEDITED" -- a reader must not infer that `1` vs `1.0` in the text was sealed."""
+    """ADR-053/054: under a JCS canon (2 or 3) the seal covers numeric VALUES, not their spelling, so say so
+    next to "UNEDITED" -- a reader must not infer that `1` vs `1.0` in the text was sealed. Text output only:
+    the JSON verdict's `notes` is the shared verifier contract (Python and JS agree on it) and does not carry
+    this presentation note."""
     sums = bundle.get("sha256sums") if isinstance(bundle, dict) else None
     cv = sums.get("canon_version") if isinstance(sums, dict) else None
-    if type(cv) is int and cv == 2:
-        print("    NOTE: canon v2 seals number VALUES: a whole number written 1, 1.0 or 1e0 verifies the same,")
+    if type(cv) is int and cv in _VALUE_SEALING_CANONS:
+        print(f"    NOTE: canon v{cv} seals number VALUES: a whole number written 1, 1.0 or 1e0 verifies the same,")
         print("          so 'UNEDITED' means no value changed, not that the text is byte-identical. A reader")
         print("          may get 2.0 where 2 was sealed; treat whole numbers as interchangeable.")
 
@@ -215,14 +224,22 @@ def _pins_text(rep: dict) -> str:
 
 def _matched_pins(rep: dict) -> list[str]:
     """The pin(s) the origin decision matched: under a pin set (--policy, --pubkey merged into it) the key id of every
-    verified seal signature whose key is pinned, in E order; on the single-pin path the one pin, when it matched."""
-    if rep.get("pin_set") is None:
-        pk = rep.get("pinned_key")
-        return [pk] if rep.get("key_matches_pin") and isinstance(pk, str) else []
+    verified seal signature whose key is pinned, in E order; on the single-pin path the one pin (its legacy
+    fingerprint) when it matched, else the built-in demo pin(s) that did (SPEC 7.12: the single-pin path's effective
+    pin set is that pin plus the built-in demo pins)."""
     out: list[str] = []
     for e in rep.get("signers") or []:
         if e.get("checked") and e.get("valid") and e.get("pinned") and e.get("key_id") not in out:
             out.append(e["key_id"])
+    if rep.get("pin_set") is None:
+        pk = rep.get("pinned_key")
+        if not rep.get("key_matches_pin") or not isinstance(pk, str):
+            return []
+        try:
+            pin_kid = key_id("ed25519", pk.removeprefix("ed25519:")) if pk.startswith("ed25519:") else None
+        except ValueError:
+            pin_kid = None
+        return [pk] if pin_kid in out or not out else out
     return out
 
 
@@ -562,7 +579,9 @@ def _verify_text(path: str, bundle, rep: dict, chain: dict | None, ups: list | N
         # checkable (by re-derivation, not by us). Two shapes: signed under the pin but the pin is the
         # public demo identity (proof-core's normal verdict today), or signed under some other key.
         signer_hex = (rep["signer"] or "").removeprefix("ed25519:")
-        if rep.get("pinned_key_is_demo") and rep.get("key_matches_pin"):
+        if rep.get("state") == STATE_INTEGRITY_ONLY_DEMO:
+            # a verified seal signature matched a DEMO pin (SPEC 7.14): the module pin, a policy's, or a built-in demo
+            # pin beside `--pubkey` / a profile pin (the single-pin path's effective pin set holds those too)
             print(f"{lead}integrity verified -- origin NOT established (demo pin): {path}")
             _print_withheld(bundle, rep)
             print(f"    every hash recomputes and the {_suite_signature(rep)} is valid under the pinned key, so")
@@ -809,32 +828,18 @@ def _print_chain(chain: dict | None, supplied: int) -> None:
     print("    that record's result. It does not judge whether the earlier computation was right.")
 
 
-def _resolve_profile(spec: str):
-    """Import the reviewer-named ``pkg.module:attr`` dialect Profile and return it (a class is instantiated
-    with no args; a constructed Profile is used as-is). Duck-typed and read attribute-only by the verifier,
-    so any object carrying the dialect fields works. This imports the CONSUMER's module, NEVER proof_core --
-    the verifier stays stdlib-only. Reads ONLY the command-line ``spec``, never the bundle. Raises ValueError
-    with a plain reason on failure, so main() can map it to a usage exit."""
-    module_name, attr_path = _spec_loader.split_spec(spec, "--profile", "pkg.module:attr")
-    # The current directory is NEVER added to the import path: a sender-planted `acme_profile.py` in an
-    # unpacked bundle folder would otherwise pin the sender's key and read as an origin pass. A module comes
-    # from the normal import path (PYTHONPATH / installed); a file is named by an absolute path, `/abs/path/file.py:attr`.
-    try:
-        obj = _spec_loader.import_spec_module(module_name, "profile")
-    except ImportError as exc:
-        raise ValueError(f"cannot import profile module {module_name!r}: {exc}") from exc
-    except Exception as exc:  # any import-time failure is a bad --profile arg, not a CLI crash
-        raise ValueError(
-            f"profile module {module_name!r} failed to import: {type(exc).__name__}: {exc}") from exc
-    for part in attr_path.split("."):
-        try:
-            obj = getattr(obj, part)
-        except AttributeError as exc:
-            raise ValueError(f"profile {spec!r} not found: {exc}") from exc
-    try:
-        return obj() if isinstance(obj, type) else obj
-    except Exception as exc:  # a Profile whose construction raises is a bad --profile arg, not a crash
-        raise ValueError(f"cannot construct profile {spec!r}: {type(exc).__name__}: {exc}") from exc
+#: one resolver behind every `--profile` (proof_verify/_spec_loader.py, stdlib only); the name is kept for callers
+_resolve_profile = _spec_loader.resolve_profile
+
+
+def _usage_error(msg: str, as_json: bool) -> int:
+    """A usage error (exit 2, no verdict), as every other usage path prints it: `{"error": "usage", "message"}` under
+    --json, else one `error:` line on stderr."""
+    if as_json:
+        print(json.dumps({"error": "usage", "message": msg}, sort_keys=True))
+    else:
+        print(f"error: {msg}", file=sys.stderr)
+    return EXIT_UNREADABLE
 
 
 def _profile_pin_conflict(profile, spec: str, policy, pins, source: dict, self_verify_only: bool) -> str | None:
@@ -846,9 +851,9 @@ def _profile_pin_conflict(profile, spec: str, policy, pins, source: dict, self_v
     integrity-only (exit 3) with no word why. The POLICY's pins win; this refuses (exit 2) unless every profile pin is
     already in the effective pin set with the same demo flag, i.e. nothing is dropped. A policy that cannot be
     evaluated is left to the normal path (its own exit 2)."""
-    from .verify import _profile_pin, resolve_pins
+    from .verify import _profile_pin, _profile_value, resolve_pins
     pin, malformed = _profile_pin(profile)
-    keys = getattr(profile, "pinned_keys", None)
+    keys = _profile_value(profile, "pinned_keys", None)      # every profile read: a raising read is ProfileReadError
     if pin is None and not malformed and keys is None:
         return None
     if policy is None or not isinstance(policy, dict):
@@ -875,13 +880,15 @@ def _profile_pin_conflict(profile, spec: str, policy, pins, source: dict, self_v
         pin_set, _ = effective_policy(policy, pins)
     except PolicyError:
         return None                     # a malformed policy: refused on the normal path, with its own reason
-    demo = bool(getattr(profile, "pin_is_demo", False))   # truthy = demo, as the verifier reads it
+    demo = bool(_profile_value(profile, "pin_is_demo", False))   # truthy = demo, as the verifier reads it
     # each entry exactly as the profile states it (resolve_pins requires a real boolean `demo`); pin_is_demo then
     # marks every entry demo, as on the verifier's own path
     entries = [{"legacy_raw_key": pin, "demo": False}] if pin is not None else keys
     try:
         wanted = {k: d or demo for k, d in resolve_pins(list(entries), where="--profile pinned_keys").items()}
-    except (PolicyError, TypeError):
+    except (KeyboardInterrupt, SystemExit):
+        raise                           # the reviewer's own Ctrl-C; sys.exit() has its guard in main()
+    except BaseException:  # noqa: BLE001 -- PolicyError / TypeError, or a reviewer pinned_keys whose iteration raises
         return head                     # a malformed profile pin set can never be a trust root either
     if pin_set is not None and all(pin_set.get(k) is d for k, d in wanted.items()):
         return None                     # every profile pin is already a trust root of the policy: nothing dropped
@@ -891,8 +898,23 @@ def _profile_pin_conflict(profile, spec: str, policy, pins, source: dict, self_v
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     # SPEC 4.2 item 8: reading, canonicalizing and printing never depend on PYTHONINTMAXSTRDIGITS
+    from .verify import ProfileReadError
     with safe_terminal_output(enabled="--json" not in args), _int_digits():
-        return _main(args)
+        try:
+            return _main(args)
+        except SystemExit as exc:
+            # a --profile attribute read AFTER the profile was loaded (the pin-conflict check, verification: a
+            # property, a __getattr__) called sys.exit(). argparse's SystemExit and a profile's at import /
+            # construction are handled inside _main, and this stdlib-only verifier raises none of its own, so this
+            # is reviewer code: an unusable --profile argument, a usage error with no verdict (exit 2, as the
+            # import-time guard), never the PROFILE's exit status with no verdict.
+            return _usage_error(f"the --profile called sys.exit({_spec_loader.exit_code_text(exc.code)}) after it "
+                                "was loaded; no verdict was reached", "--json" in args)
+        except ProfileReadError as exc:
+            # the same read raised something else (a RuntimeError...): every profile read goes through
+            # verify._profile_value, which raises this one type, so it is the profile, not this verifier
+            return _usage_error(f"the --profile failed after it was loaded ({exc}); no verdict was reached",
+                                "--json" in args)
 
 
 def _main(args: list[str]) -> int:
@@ -940,8 +962,7 @@ def _main(args: list[str]) -> int:
         try:
             profile = _resolve_profile(ns.profile)
         except ValueError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return EXIT_UNREADABLE
+            return _usage_error(str(exc), ns.json)
     bad = _ps.check_expect(ns.expect_policy)
     if bad:
         if ns.json:
@@ -980,8 +1001,7 @@ def _main(args: list[str]) -> int:
         try:
             pin_key(ns.pubkey)
         except (ValueError, TypeError) as exc:
-            print(f"error: --pubkey must be 64 lowercase hex characters: {exc}", file=sys.stderr)
-            return EXIT_UNREADABLE
+            return _usage_error(f"--pubkey must be 64 lowercase hex characters: {exc}", ns.json)
     if ns.expect_policy is not None and policy is not None:
         # checked before the bundle is read too, so not even an `unreadable` result is printed under another policy
         # (the verdict's own policy_sha256 is checked again in verify_path; without a policy file the default

@@ -75,6 +75,103 @@ def is_absolute_file_path(path: str, *, windows: bool | None = None) -> bool:
     return bool(drive) and rest[:1] in ("\\", "/")
 
 
+def resolve_profile(spec: str):
+    """Import the reviewer-named ``pkg.module:attr`` dialect Profile and return it (a class is instantiated with no
+    args; a constructed Profile is used as-is). Duck-typed: the verifier reads a profile attribute-only, so any object
+    carrying the dialect fields works, and this stdlib-only module imports the CONSUMER's module, never proof_core.
+    It reads ONLY the command-line ``spec``, never the bundle, and the current directory is never on the import path:
+    a sender-planted profile in an unpacked bundle folder would pin the sender's key and read as an origin pass. A
+    module comes from the normal import path (PYTHONPATH / installed); a file is named by an absolute path,
+    ``/abs/path/file.py:attr``. Every failure -- a module, attribute or class that calls ``sys.exit()``, or raises
+    anything at all (any BaseException but KeyboardInterrupt, which is the reviewer's own and propagates) -- is a
+    ValueError with a plain reason, which each CLI maps to a usage exit; the reason is built by
+    :func:`describe_exception`, so an exception whose ``__str__`` or type name is itself broken cannot turn the reason
+    into a second exception. The one resolver behind ``--profile`` in proof-verify, proof-reproduce and proof-seal."""
+    module_name, attr_path = split_spec(spec, "--profile", "pkg.module:attr")
+    try:
+        obj = import_spec_module(module_name, "profile")
+    except ImportError as exc:
+        raise ValueError(f"cannot import profile module {module_name!r}: {exception_text(exc)}") from exc
+    except KeyboardInterrupt:
+        raise
+    except SystemExit as exc:  # a module that calls sys.exit() at import is an unusable --profile arg, never our exit
+        raise ValueError(f"profile module {module_name!r} called sys.exit({exit_code_text(exc.code)}) at import") from exc
+    except BaseException as exc:  # any other import-time failure is a bad --profile arg, not a CLI crash
+        raise ValueError(f"profile module {module_name!r} failed to import: {describe_exception(exc)}") from exc
+    for part in attr_path.split("."):
+        try:
+            obj = getattr(obj, part)
+        except AttributeError as exc:
+            raise ValueError(f"profile {spec!r} not found: {exception_text(exc)}") from exc
+        except KeyboardInterrupt:
+            raise
+        except SystemExit as exc:  # a module __getattr__ / descriptor that calls sys.exit()
+            raise ValueError(f"reading profile {spec!r} called sys.exit({exit_code_text(exc.code)})") from exc
+        except BaseException as exc:  # a module __getattr__ / descriptor that raises anything else: a bad --profile arg
+            raise ValueError(f"reading profile {spec!r} failed: {describe_exception(exc)}") from exc
+    try:
+        return obj() if isinstance(obj, type) else obj
+    except KeyboardInterrupt:
+        raise
+    except SystemExit as exc:
+        raise ValueError(f"constructing profile {spec!r} called sys.exit({exit_code_text(exc.code)})") from exc
+    except BaseException as exc:  # a Profile whose construction raises is a bad --profile arg, not a crash
+        raise ValueError(f"cannot construct profile {spec!r}: {describe_exception(exc)}") from exc
+
+
+#: the most characters of reviewer-code text (an exception message, a type name, a sys.exit code) a message carries
+_TEXT_LIMIT = 200
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= _TEXT_LIMIT else text[:_TEXT_LIMIT] + "..."
+
+
+def safe_type_name(obj) -> str:
+    """``type(obj).__name__`` for a message, never a second exception: a metaclass whose ``__name__`` raises or is not
+    a string is named as such. Truncated."""
+    try:
+        name = type(obj).__name__
+        if not isinstance(name, str):
+            raise TypeError(name)           # one fallback for both shapes
+    except KeyboardInterrupt:
+        raise
+    except BaseException:  # noqa: BLE001 -- reviewer-code metaclass (any exception type); the message must still print
+        return "<type whose __name__ could not be read>"
+    return _clip(name)
+
+
+def exception_text(exc: BaseException) -> str:
+    """``str(exc)`` for a message, never a second exception: a ``__str__`` that raises (a RecursionError from one that
+    recurses included), or returns a non-string, is named as such; the text is truncated (a 5 MB message is 200
+    characters), so the message is always printable."""
+    try:
+        text = str(exc)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as inner:  # noqa: BLE001 -- reviewer-code __str__ (any exception type); must still print
+        return f"<str() raised {safe_type_name(inner)}>"
+    return _clip(text)
+
+
+def describe_exception(exc: BaseException) -> str:
+    """``TypeName: text`` of an exception raised by reviewer code (a profile, a runner), built so that formatting it
+    can never raise: see :func:`safe_type_name` and :func:`exception_text`."""
+    return f"{safe_type_name(exc)}: {exception_text(exc)}"
+
+
+def exit_code_text(code) -> str:
+    """``repr(code)`` of a SystemExit's code for a message, never a second exception: a code whose ``__repr__`` raises
+    is named by type, and a long one is truncated. (``sys.exit(x)`` accepts any object as ``x``.)"""
+    try:
+        text = repr(code)
+    except KeyboardInterrupt:
+        raise
+    except BaseException:  # noqa: BLE001 -- reviewer-code repr (any exception type); the message must still print
+        return f"<{safe_type_name(code)} whose repr raised>"
+    return _clip(text)
+
+
 def split_spec(spec: str, flag: str, form: str) -> tuple[str, str]:
     """Split ``spec`` at its LAST ``:`` (so a Windows ``C:\\...\\x.py:attr`` path works). ValueError (a usage error)
     if malformed, or if it names a file by a path that is not absolute."""
