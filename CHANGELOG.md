@@ -4,6 +4,14 @@ All notable changes to the proof-core Claude Code plugin. Versions follow [Seman
 Each release re-vendors a proof-core release into `bin/` verbatim; the vendored code's own changes are listed in
 [proof-core's CHANGELOG](https://gitlab.com/proof-core/proof-core/-/blob/main/CHANGELOG.md).
 
+## [0.8.1] - 2026-11-07
+
+### Other changes
+
+- The plugin icon (`.claude-plugin/icon.png`) is now the current proof-core mark, the same one proof-core.com
+  uses (white blades around a blue hexagon on navy). No code or vendored-kernel change; the vendored proof-core
+  is still v0.29.0.
+
 ## [0.8.0] - 2026-11-05
 
 Re-vendors proof-core **v0.29.0** (tag `v0.29.0`, commit `3f21ff1e55d06b2f07339f395ec8ccb9fce0707e`; was v0.28.0,
