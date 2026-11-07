@@ -7,7 +7,7 @@
 **Give a Claude Code agent three verbs: seal a result, verify a record, re-run it.** Not "trust us". Check us.
 
 Repo: `gitlab.com/proof-core/skill` · MIT · a Claude Code plugin with one Agent Skill · Python 3.11+ standard
-library · plugin v0.8.0 · vendors [proof-core](https://gitlab.com/proof-core/proof-core) 0.29.0 · no install,
+library · plugin v0.8.1 · vendors [proof-core](https://gitlab.com/proof-core/proof-core) 0.29.0 · no install,
 no network, no account
 
 ## What this is
