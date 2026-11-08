@@ -7,7 +7,7 @@
 **Give a Claude Code agent three verbs: seal a result, verify a record, re-run it.** Not "trust us". Check us.
 
 Repo: `gitlab.com/proof-core/skill` · MIT · a Claude Code plugin with one Agent Skill · Python 3.11+ standard
-library · plugin v0.9.0 · vendors [proof-core](https://gitlab.com/proof-core/proof-core) 0.30.0 · no install,
+library · plugin v0.9.1 · vendors [proof-core](https://gitlab.com/proof-core/proof-core) 0.30.0 · no install,
 no network, no account
 
 ## What this is
@@ -89,7 +89,7 @@ What the plugin bundles:
 
 ```mermaid
 flowchart TB
-    subgraph plugin["proof-core plugin 0.9.0"]
+    subgraph plugin["proof-core plugin 0.9.1"]
         MAN[".claude-plugin/<br/>plugin.json, marketplace.json"]
         SKILL["skills/proof-core/SKILL.md<br/>when and how to seal, verify, reproduce"]
         subgraph bin["bin/ (proof-core 0.30.0, verbatim, MIT)"]
@@ -180,7 +180,7 @@ flowchart LR
 | [proof-core-kernel-js](https://gitlab.com/proof-core/proof-core-kernel-js) | v0.12.0 (`@proof-core/verify`), the JavaScript verifier: verify bundles in Node or a browser, with no dependencies |
 | [envelope-spec](https://gitlab.com/proof-core/envelope-spec) | v1.5.0, the spec and its corpus: the bundle format's written standard, JSON Schema, and 787 conformance vectors to test any verifier against |
 | [proof-mcp](https://gitlab.com/proof-core/proof-mcp) | v0.11.0, MCP receipts and an evidence server: receipts for tool-calling loops, `proof-accept` to accept or reject a sealed run, and `proof-mcp serve`, an evidence MCP server |
-| [skill](https://gitlab.com/proof-core/skill) | v0.9.0, this repo: the Claude Code plugin: give an agent seal, verify and reproduce as a skill, with proof-core 0.30.0 bundled so it runs offline |
+| [skill](https://gitlab.com/proof-core/skill) | v0.9.1, this repo: the Claude Code plugin: give an agent seal, verify and reproduce as a skill, with proof-core 0.30.0 bundled so it runs offline |
 | [pytest-proof-core](https://gitlab.com/proof-core/pytest-proof-core) | v0.2.0, sealed test outcomes: seal each test's outcome and re-check it later in CI |
 | [pytest-proof-core-plugin](https://gitlab.com/proof-core/pytest-proof-core-plugin) | v0.4.0 in `plugin.json` (untagged), sealed test outcomes for Claude Code: pytest-proof-core 0.2.0 packaged as a plugin (it bundles proof-core 0.29.0) |
 
