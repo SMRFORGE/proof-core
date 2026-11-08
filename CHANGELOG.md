@@ -4,6 +4,22 @@ All notable changes to the proof-core Claude Code plugin. Versions follow [Seman
 Each release re-vendors a proof-core release into `bin/` verbatim; the vendored code's own changes are listed in
 [proof-core's CHANGELOG](https://gitlab.com/proof-core/proof-core/-/blob/main/CHANGELOG.md).
 
+## [0.9.1] - 2026-11-07
+
+### Changed
+
+- SKILL.md `verify`: says what each verdict establishes and does not, so an agent's report claims no more than
+  was checked. A plugin-guidance test (14 scenarios, Haiku 5.5 and Sonnet 5.5) found the same two overclaims in
+  every run: after exit 2 the agent opened the unreadable file, described it and predicted policy outcomes; and a
+  sign-off by "Alice" under an unpinned key was reported as "Alice reviewed this on 2026-11-05" (the `--json`
+  verdict carries no caveat; the text verdict does). Two paragraphs added after the exit table: what verify
+  establishes (integrity; origin for exit 0 only), what it never checks (`claims_not_checked`, correctness), the
+  exit-2 rule (report only the parser's `error`); and sign-offs and times (`state: valid` means the holder of
+  `key_id` signed; `printed_name` / `signer_id` are the signer's statement unless `roster.status` is
+  `pinned_person`; `signed_at` is stated, only `time.bound` is established). The exit-0 row says origin holds only
+  under a key you confirmed out of band; the exit-4 row says the header and its signature verify while the sections
+  cannot be recomputed. Reproduce wording unchanged. No code or vendored-kernel change; still proof-core v0.30.0.
+
 ## [0.9.0] - 2026-11-07
 
 Re-vendors proof-core **v0.30.0** (tag `v0.30.0`, commit `ca298fd35eff091537b88ce2ac64be98fd1aa90d`; was v0.29.0,

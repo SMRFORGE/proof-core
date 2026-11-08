@@ -94,13 +94,35 @@ Exit codes:
 
 | code | meaning |
 |---|---|
-| 0 | integrity + origin: a production origin pass (`production_origin_pass: true`) |
+| 0 | integrity + origin under the key YOU pinned (`--pubkey` / a policy): a production origin pass (`production_origin_pass: true`). Origin holds only if you confirmed that key id with its holder through another channel; the bundle cannot vouch for its own key |
 | 1 | FAIL: edited, forged, malformed, an invalid human sign-off, a receiver policy that rejects the bundle for another reason, or a failed chain walk |
-| 2 | the bundle could not be read, or a usage error |
+| 2 | the bundle could not be read (`state: unreadable`), or a usage error: nothing in the file was examined |
 | 3 | integrity-only: unaltered since signing, but origin NOT established (verify does not re-run anything) |
-| 4 | unsupported canon: sealed under an encoding this verifier does not know; NOT a pass, use a newer verifier |
+| 4 | unsupported canon: the sha256sums header and the signature over it verify (the header is unedited), but this verifier cannot recompute the inputs / result / provenance sections, so "untampered" is NOT established; NOT a pass, use a newer verifier |
 | 5 | chain incomplete or unknown, only with `--upstream`: an earlier bundle this one cites is missing or could not be checked; NOT a pass |
 | 6 | unsupported signature suite (`unsupported-alg`): NOT a pass, use a newer verifier |
+
+**What verify establishes, and what it does not.** When you report a verdict, name the facts.
+For exit 0 and 3 say integrity holds: every hash recomputes and the seal signature verifies, so
+the record is unedited since it was signed. For exit 0 only, add origin: under the pinned key.
+Then say what verify did NOT check: who produced it (exit 3), whether the result is correct
+(always; only `reproduce` re-derives anything), and the producer's own claims (`result.verdict`,
+`result.fidelity`, `result.caveats`, `provenance.*`, listed in `claims_not_checked`). Never call
+a verdict "authentic", "trustworthy" or "good to go". On exit 2, report only that the file could
+not be read and the parser's message (`error`): do not open the file and describe its contents,
+guess what the bundle would show if repaired, or say which policies it would pass or fail; no
+check ran. On exit 4, say what did verify (the header and its signature) and what could not be
+checked (the sections); do not call the bundle untampered.
+
+**Sign-offs and times.** `signoffs.entries[].state: valid` means only that the holder of the
+key `key_id` signed that statement over this seal. It does not show who the person is:
+`printed_name` and `signer_id` are what the signer typed, and unless `roster.status` is
+`pinned_person` nothing ties the key to a person. Report it as "a valid sign-off by the holder of
+key ...; the name 'Alice' is the signer's own statement", never as "Alice reviewed this".
+`signed_at` is the time the signer stated, not a checked time; the only established time is
+`time.bound` when `time.state` is `valid` ("existed no later than T", an RFC 3161 token
+checked against `--as-of`). The text verdict prints this caveat; the `--json` verdict does not,
+so carry it yourself.
 
 **Exit 3 is the normal result for the public build**, which pins a demo key anyone can
 sign under. It proves integrity, not origin; `production_origin_pass` is `false`. An
